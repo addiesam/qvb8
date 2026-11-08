@@ -1,0 +1,13 @@
+# Tested versions (NVIDIA DGX Spark, GB10 sm_121, CUDA 13.0, Python 3.12)
+# torch==2.14.0   (install separately with CUDA support, see README)
+triton==3.8.0
+transformers==5.17.0
+tokenizers==0.23.2
+accelerate==1.15.0
+safetensors==0.8.0
+numpy==2.5.3
+psutil==7.2.2
+pillow==12.3.0
+setuptools
+ninja
+# Optional: flash-attn is installed separately, see README

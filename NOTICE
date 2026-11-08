@@ -1,0 +1,14 @@
+QVB8 inference engine
+Copyright 2026 Sam, Chi Ngai (Dr. Addie Sam)
+
+The QVB8 certified-compression method is described in:
+  Sam, Chi Ngai. "Certified L∞-Bounded Compression for AI Models, I: The Contract and the Virtual-Band Index."
+  Zenodo, 2026. https://doi.org/10.5281/zenodo.23815007  (paper licensed CC BY-NC-ND 4.0)
+  Sam, Chi Ngai. "Certified L∞-Bounded Compression for AI Models, II: Compressing a Language Model's Weights, Key–Value Cache and Activations."
+  Zenodo, 2026. https://doi.org/10.5281/zenodo.23816044  (paper licensed CC BY-NC-ND 4.0)
+
+Model weights (Ripple-65B-Preview and its DFlash2 drafter, by Ricursive AI) are NOT part of this software and are
+distributed under their own license (Apache-2.0, see the model card).
+
+This software is provided "AS IS", without warranty of any kind, and the author accepts no liability for any
+damages arising from its use or from its output (Apache License 2.0, sections 7 and 8).

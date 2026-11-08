@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the papers below."
+title: "QVB8 inference engine"
+authors:
+  - family-names: "Sam"
+    given-names: "Chi Ngai"
+license: Apache-2.0
+repository-code: "https://github.com/addiesam/qvb8"
+preferred-citation:
+  type: article
+  title: "Certified L∞-Bounded Compression for AI Models, I: The Contract and the Virtual-Band Index"
+  authors:
+    - family-names: "Sam"
+      given-names: "Chi Ngai"
+  year: 2026
+  doi: "10.5281/zenodo.23815007"
+  url: "https://zenodo.org/records/23815007"
+references:
+  - type: article
+    title: "Certified L∞-Bounded Compression for AI Models, II: Compressing a Language Model's Weights, Key–Value Cache and Activations"
+    authors:
+      - family-names: "Sam"
+        given-names: "Chi Ngai"
+    year: 2026
+    doi: "10.5281/zenodo.23816044"
+    url: "https://zenodo.org/records/23816044"
