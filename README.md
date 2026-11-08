@@ -60,8 +60,8 @@ Download one target pack and one matching draft pack:
 | Ripple-65B-Preview | qvb8r | 1e-3 | 47 GB | [Ripple-65B-Preview-QVB8R-1e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8R-1e-3) |
 | Ripple-65B-Preview | qvb8 | 2e-3 | 49 GB | [Ripple-65B-Preview-QVB8-2e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8-2e-3) |
 | Ripple-65B-Preview | qvb8r | 2e-3 | 38 GB | [Ripple-65B-Preview-QVB8R-2e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8R-2e-3) |
-| DFlash2 draft model | qvb8 | 5e-3 | 4.2 GB | [Ripple-65B-Preview-DFlash2-QVB8-5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-DFlash2-QVB8-5e-3) |
-| DFlash2 draft model | qvb8r | 5e-3 | 3.3 GB | [Ripple-65B-Preview-DFlash2-QVB8R-5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-DFlash2-QVB8R-5e-3) |
+| DFlash2 draft model | qvb8 | 5e-3 | 4.1 GB | [Ripple-65B-Preview-DFlash2-QVB8-5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-DFlash2-QVB8-5e-3) |
+| DFlash2 draft model | qvb8r | 5e-3 | 3.4 GB | [Ripple-65B-Preview-DFlash2-QVB8R-5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-DFlash2-QVB8R-5e-3) |
 
 ```bash
 pip install -U huggingface_hub
