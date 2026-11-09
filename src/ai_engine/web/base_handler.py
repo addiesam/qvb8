@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from http.server import BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -58,6 +58,20 @@ def _cors_allowlist() -> tuple[bool, set[str]]:
     if raw == "*":
         return True, set()
     return False, {o.strip().rstrip("/") for o in raw.split(",") if o.strip()}
+
+
+class QVHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that reports a client which hung up before the reply was written (a health check that timed
+    out, a closed browser tab) as ONE log line, not a traceback. Any other error still prints its full traceback."""
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            print(f"[http] {client_address[0]}:{client_address[1]} closed the connection before the reply was sent "
+                  f"({type(exc).__name__})", flush=True)
+            return
+        super().handle_error(request, client_address)
 
 
 class QVHTTPHandler(BaseHTTPRequestHandler):

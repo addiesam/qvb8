@@ -171,6 +171,7 @@ exact near-tie, the choice can differ.
   list. The pack files are unchanged. In our test (QVB8-1e-3, fp16, DGX Spark, one prompt, greedy) decoding went from
   about 1.8 to about 5.7 tokens per second; bf16 is unchanged.
 - An fp16 run needs `escape_tables.json` in the pack folder; without it, the engine stops with an error at start-up.
+- The server log: a client that hangs up before the reply (for example a start-up health check) is one `[http] ...` line, not a traceback; an fp16 run no longer prints the bf16 GEMM count as if it were in use.
 
 **v1.0.0: First release**
 - QVB8 Inference Engine for Ripple-65B-Preview, with the QVB8 and QVB8R weight packs.

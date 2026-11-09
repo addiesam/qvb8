@@ -922,7 +922,11 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
         from qv_band.formats.qvb8.module import enable_bf16_gemm
         n_bf16, n_lin = enable_bf16_gemm(model)
         if verbose and n_lin:
-            print(f"[load] bf16 GEMM on {n_bf16}/{n_lin} QVB8 linears", flush=True)
+            if params.dtype == "fp16":
+                print(f"[load] --dtype fp16: the fp16 path runs; the bf16 GEMM ({n_bf16}/{n_lin} linears are bf16-certified) "
+                      f"is not used", flush=True)
+            else:
+                print(f"[load] bf16 GEMM on {n_bf16}/{n_lin} QVB8 linears", flush=True)
         if params.prefill_linear == "int8" and not dense:
             from ai_engine.generation.int8_prefill import install as _install_int8_prefill
             _install_int8_prefill(model, pack, verbose=verbose)

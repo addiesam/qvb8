@@ -51,7 +51,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from http.server import ThreadingHTTPServer
+from ai_engine.web.base_handler import QVHTTPServer
 
 from ai_engine.web.base_handler import QVHTTPHandler
 
@@ -2657,7 +2657,7 @@ def main():
     srv = None
     if _TP_IS_LEADER:
         try:
-            srv = ThreadingHTTPServer((args.host, args.port), Handler)
+            srv = QVHTTPServer((args.host, args.port), Handler)
         except OSError as exc:
             print(f"[serve] cannot bind {args.host}:{args.port}: {exc}",
                   file=sys.stderr, flush=True)
