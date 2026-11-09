@@ -157,6 +157,11 @@ this release.
 Speculative decoding is verified by the full model. In our tests, greedy output matched plain decoding; where two tokens are an
 exact near-tie, the choice can differ.
 
+## Update history
+
+**v1.0.0: First release**
+- QVB8 Inference Engine for Ripple-65B-Preview, with the QVB8 and QVB8R weight packs.
+
 ## Papers
 
 The certified compression method (every restored weight within error bound τ of the original) and its use on language models

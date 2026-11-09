@@ -10,8 +10,8 @@ Defaults (same as ripple_server.sh): pack RIPPLE_PACK, --drafter dflash (k = ful
 import os
 import sys
 
-PACK = os.environ.get("RIPPLE_PACK", "/mnt/backup/qvb8/Ripple-65B-Preview_qvb8_1e-3_bf16")
-DRAFT = os.environ.get("RIPPLE_DRAFT", "/mnt/backup/qvb8/Ripple-65B-Preview-DFlash2_qvb8_5e-3_bf16")
+PACK = os.environ.get("RIPPLE_PACK", "/mnt/backup/qvb8/Ripple-65B-Preview_qvb8_1e-3")
+DRAFT = os.environ.get("RIPPLE_DRAFT", "/mnt/backup/qvb8/Ripple-65B-Preview-DFlash2_qvb8_5e-3")
 
 
 def _with_defaults(argv: list[str]) -> list[str]:

@@ -433,13 +433,12 @@ def forward_gemv(ext, x2d, ids, min_s, nbits, bit_off, P, tau_s, esc_idx,
 def enable_bf16_gemm(model: nn.Module) -> tuple[int, int]:
     """Put every bf16-certified QVBandLinearV8 in `model` on the bf16 GEMM.
 
-    The one switch every loader of a bf16 model calls (diffusion
-    transformers, embedding, reranker): the policy is "bf16 source -> bf16
-    standard" (tech_doc/restore_precision_policy.md). Only modules whose pack
-    carries the bf16 certificate (header restore code 3) are switched; an
-    fp16-only pack stays on its certified fp16 path. Returns
-    (switched, packed_linears) so the caller can log a pack that was not
-    calibrated with --restore bf16.
+    The one switch every loader calls (diffusion transformers, embedding,
+    reranker, LLMs). Packs are calibrated for fp16 AND bf16 first; the dtype
+    that runs depends on the GPU (tech_doc/restore_precision_policy.md). Only
+    modules whose pack carries the bf16 certificate (header restore code 3)
+    are switched; an fp16-only pack stays on its certified fp16 path. Returns
+    (switched, packed_linears) so the caller can log a pack that is fp16-only.
     """
     from qv_band.formats.qvb8r.module import QVBandLinearV8R        # qvb8r: the same ids, rANS-coded; same bf16 policy
     n = tot = 0

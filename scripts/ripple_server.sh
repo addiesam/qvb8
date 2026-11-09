@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ripple-65B OpenAI-compatible server: qvb8 or qvb8r target pack + DFlash2 drafter pack.
-#   MODEL=/path/Ripple-65B-Preview_qvb8_1e-3_bf16 DRAFT=/path/Ripple-65B-Preview-DFlash2_qvb8_5e-3_bf16 \
+#   MODEL=/path/Ripple-65B-Preview_qvb8_1e-3 DRAFT=/path/Ripple-65B-Preview-DFlash2_qvb8_5e-3 \
 #     scripts/ripple_server.sh [start|stop|status|restart|log] [extra serve flags]
 #   port 8080. Log: scripts/logs/Ripple-65B.log.  Extra flags come last, so they win (e.g. --no-think).
 # Env: MODEL, DRAFT (required for start), PORT, PYTHON (default: python)

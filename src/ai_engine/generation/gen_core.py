@@ -908,8 +908,9 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
     if use_gpu:
         from qv_band.run.run_inference import load_qv_model
         model, tok = load_qv_model(model_dir, None if dense else pack, device=gpu_dev)
-        # bf16 model -> bf16 standard (qv_band tech_doc/restore_precision_policy.md):
-        # prefill linears (M > 8) of a --restore bf16 pack take the bf16 GEMM.
+        # Packs are calibrated for fp16 AND bf16 first (qv_band tech_doc/restore_precision_policy.md);
+        # the dtype that runs depends on the GPU (QV_MODEL_DTYPE=float16 on a V100).
+        # With bf16 activations, prefill linears (M > 8) of a bf16-certified pack take the bf16 GEMM.
         # Decode (M <= 8) is the GEMV kernels either way.
         from qv_band.formats.qvb8.module import enable_bf16_gemm
         n_bf16, n_lin = enable_bf16_gemm(model)

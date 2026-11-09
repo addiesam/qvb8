@@ -82,7 +82,7 @@ def _build_registry() -> None:
     # separate qv_band_fp8 repo -- this repo stays pure bf16 (QVB8).
 
     # "qvband" is QVB8's on-disk container name (pack/pack_qvband.py).
-    # QVB8 is the format version; fp16 is its one restore precision
+    # QVB8 is the format version; fp16 (and by default bf16 too) is its restore precision
     # within it, tagged in the pack's own header and dispatched
     # internally by QVBandLinearV8/QVBandEmbeddingV8's from_packfile.
     # Same classes as "qvb8", own `name` since FormatSpec.filename
