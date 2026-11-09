@@ -452,6 +452,8 @@ class GenParams:
 
     # process
     device: str = "auto"
+    # compute dtype of the model: "bf16" / "fp16" (--dtype), None = the model's own (its config). Chosen, never automatic.
+    dtype: str | None = None
     max_memory_gb: float = DEFAULTS.MEMORY_LIMIT_GB
     # torch intra-op threads when the model runs on CPU. None = the engine's
     # measured default (1, see load_model). An application passes its own
@@ -643,6 +645,7 @@ _ARG_FIELDS = (
     ("top_k",             "top_k",             DEFAULTS.TOP_K),
     ("top_p",             "top_p",             DEFAULTS.TOP_P),
     ("device",            "device",            "auto"),
+    ("dtype",             "dtype",             None),   # None = the model's own dtype
     ("max_memory_gb",     "max_memory_gb",     DEFAULTS.MEMORY_LIMIT_GB),
 )
 
@@ -711,6 +714,10 @@ def add_generation_args(ap, *, include_device_mem: bool = True) -> None:
              "the cost of more forward-pass overhead. (Previously "
              "QV_BAND_PREFILL_CHUNK env var only; still respected as the "
              "default when this flag is not passed.)")
+    ap.add_argument(
+        "--dtype", dest="dtype", choices=("bf16", "fp16"), default=None,
+        help="compute dtype of the model (default: the model's own, from its config). fp16 for a GPU without bf16 "
+             "(V100); an fp16+bf16 pack then needs its escape_tables.json. Never chosen automatically.")
     ap.add_argument(
         "--prefill-linear", dest="prefill_linear", choices=("qvb8", "int8"), default="qvb8",
         help="prefill linears (calls of >= 256 tokens): qvb8 = certified (default); int8 = opt-in int8 tensor cores on the "
@@ -907,9 +914,9 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
     t0 = time.time()
     if use_gpu:
         from qv_band.run.run_inference import load_qv_model
-        model, tok = load_qv_model(model_dir, None if dense else pack, device=gpu_dev)
+        model, tok = load_qv_model(model_dir, None if dense else pack, device=gpu_dev, dtype=params.dtype)
         # Packs are calibrated for fp16 AND bf16 first (qv_band tech_doc/restore_precision_policy.md);
-        # the dtype that runs depends on the GPU (QV_MODEL_DTYPE=float16 on a V100).
+        # the dtype that runs is the user's --dtype (fp16 on a V100).
         # With bf16 activations, prefill linears (M > 8) of a bf16-certified pack take the bf16 GEMM.
         # Decode (M <= 8) is the GEMV kernels either way.
         from qv_band.formats.qvb8.module import enable_bf16_gemm

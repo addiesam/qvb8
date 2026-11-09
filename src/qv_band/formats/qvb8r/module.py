@@ -91,6 +91,25 @@ class QVBandLinearV8R(nn.Module):
         blocks8 = QF.blocks_for(tiles, WPB)
         buf("blocks8", blocks8); buf("blocks16", QF.blocks_for(tiles, TC_WARPS))
         buf("min_s", d["min_s"]); buf("tau_s", d["tau_s"])
+        self.cert = d.get("cert", {})
+        self.bf16_certified = self.cert.get("restore") == "fp16+bf16"
+        # Two escape tables (formats/qvb8/escape_split.py): the file holds the bf16 table (the full list); the fp16 table
+        # comes ONLY from escape_tables.json (validated, nothing computed). fp16 paths (gemv, multi, tc, _chunked, dense
+        # fp16) use the fp16 table; _chunked_bf16 and dense(bf16) the bf16 one. No file on an fp16+bf16 pack: one table
+        # (the full list, exact values) and an fp16 forward refuses.
+        ei_b = d["esc_idx"].astype(np.int64)
+        ev_b = np.asarray(d["esc_val"], np.float32)
+        need = np.ones(len(ei_b), bool)
+        self.fp16_table_missing = False
+        self._where = str(path)
+        if self.bf16_certified:
+            from qv_band.formats.qvb8.escape_split import fp16_list_for, select_fp16
+            lst = fp16_list_for(path)
+            if lst is None:
+                self.fp16_table_missing = True
+            else:
+                need = select_fp16(ei_b, lst, str(path))
+        d = dict(d, esc_idx=ei_b[need], esc_val=ev_b[need], esc_delta=np.asarray(d["esc_delta"], np.float32)[need])
         ei = d["esc_idx"].astype(np.int64)
         # the kernel correction (fix_escapes) groups the escapes by output q (CSR, sorted by q then c): one thread per
         # (m, q) sums its group in this fixed order -- bit-reproducible, no atomics
@@ -104,6 +123,7 @@ class QVBandLinearV8R(nn.Module):
         band = ev - d["esc_delta"][o].astype(np.float32)
         buf("esc_delta16", ev - band.astype(np.float16).astype(np.float32))
         buf("esc_flat", ei); buf("esc_val", d["esc_val"])
+        buf("esc_flat_bf16", ei_b); buf("esc_val_bf16", ev_b)
         self.bias = None if bias is None else nn.Parameter(bias.detach().to(dev), requires_grad=False)
         # M > 16: chunks of whole blocks (~CHUNK_BYTES of decoded weight each) and the escapes inside each.
         # Per chunk: (first block, blocks, first sorted row, rows, [o0, o1) into chunk_orows, [e0, e1) into chunk_e*)
@@ -111,22 +131,33 @@ class QVBandLinearV8R(nn.Module):
         rows_per_block = [int(tiles[t0:t0 + n, 2].sum()) for _, t0, n in blocks8]
         first_row = [int(tiles[t0, 1]) for _, t0, n in blocks8]
         budget = max(1, self.CHUNK_BYTES // (2 * P)); self.chunks = []; b = 0
-        esc_sp = inv[ei // P] if len(ei) else np.zeros(0, np.int64)
-        orows, eflat, evals = [], [], []; o0 = e0 = 0
+        orows, spans = [], []; o0 = 0
         while b < len(blocks8):
             e, rows = b, 0
             while e < len(blocks8) and (e == b or rows + rows_per_block[e] <= budget):
                 rows += rows_per_block[e]; e += 1
             base = first_row[b]
-            sel = np.nonzero((esc_sp >= base) & (esc_sp < base + rows))[0]
             orows.append(d["perm"][base:base + rows].astype(np.int64))
-            eflat.append((esc_sp[sel] - base) * P + ei[sel] % P); evals.append(d["esc_val"][sel])
-            self.chunks.append((b, e - b, base, rows, o0, o0 + rows, e0, e0 + len(sel)))
-            o0 += rows; e0 += len(sel); b = e
-        buf("chunk_orows", np.concatenate(orows)); buf("chunk_eflat", np.concatenate(eflat).astype(np.int64))
-        buf("chunk_evals", np.concatenate(evals).astype(np.float32))
-        self.cert = d.get("cert", {})
-        self.bf16_certified = self.cert.get("restore") == "fp16+bf16"
+            spans.append((b, e - b, base, rows, o0, o0 + rows))
+            o0 += rows; b = e
+
+        def chunk_escapes(e_idx, e_val):
+            """Each chunk's escapes (flat in the chunk's sorted rows) and its [e0, e1) range."""
+            sp = inv[e_idx // P] if len(e_idx) else np.zeros(0, np.int64)
+            flat, vals, rng, e0 = [], [], [], 0
+            for (_, _, base, rows, _, _) in spans:
+                sel = np.nonzero((sp >= base) & (sp < base + rows))[0]
+                flat.append((sp[sel] - base) * P + e_idx[sel] % P); vals.append(e_val[sel])
+                rng.append((e0, e0 + len(sel))); e0 += len(sel)
+            return (np.concatenate(flat).astype(np.int64) if flat else np.zeros(0, np.int64),
+                    np.concatenate(vals).astype(np.float32) if vals else np.zeros(0, np.float32), rng)
+        f16, v16, r16 = chunk_escapes(ei, d["esc_val"])
+        fb, vb, rb = chunk_escapes(ei_b, ev_b)
+        self.chunks = [sp + r for sp, r in zip(spans, r16)]             # fp16 table ranges (_chunked)
+        self.chunks_bf16 = [sp + r for sp, r in zip(spans, rb)]         # bf16 table ranges (_chunked_bf16)
+        buf("chunk_orows", np.concatenate(orows))
+        buf("chunk_eflat", f16); buf("chunk_evals", v16)
+        buf("chunk_eflat_bf16", fb); buf("chunk_evals_bf16", vb)
 
     def rebuild_buffers(self) -> dict:
         """Disk mode: read this module's file again and return its buffers as host (pageable) tensors -- the same bytes a
@@ -147,7 +178,8 @@ class QVBandLinearV8R(nn.Module):
         return cls(QF.read(path, blob), bias=bias, device=device, path=path)
 
     # decode metadata: the kernels read these as fp32; a dtype cast (module.to(torch.bfloat16), pipe.to(...)) must never narrow them
-    _FP32_BUFFERS = ("min_s", "tau_s", "esc_val", "esc_delta", "esc_delta16", "chunk_evals")
+    _FP32_BUFFERS = ("min_s", "tau_s", "esc_val", "esc_delta", "esc_delta16", "chunk_evals",
+                     "esc_val_bf16", "chunk_evals_bf16")
 
     def _apply(self, fn, recurse=True):
         """module.to(...) / .half() / .bfloat16(): everything follows (a bias changes dtype), the fp32 metadata only changes DEVICE.
@@ -197,10 +229,10 @@ class QVBandLinearV8R(nn.Module):
         """bf16 GEMM, the bias fused into it (one rounding, as QVB8's cuBLASLt epilogue): the result already holds the bias."""
         y = torch.empty(x2.shape[0], self.out_features, device=x2.device, dtype=torch.bfloat16)
         bias = None if self.bias is None else self.bias.to(torch.bfloat16)
-        for b0, nb, base, rows, o0, o1, e0, e1 in self.chunks:
+        for b0, nb, base, rows, o0, o1, e0, e1 in self.chunks_bf16:
             W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 1, b0, nb, base, rows)
             if e1 > e0:
-                W.view(-1)[self.chunk_eflat[e0:e1]] = self.chunk_evals[e0:e1].to(torch.bfloat16)
+                W.view(-1)[self.chunk_eflat_bf16[e0:e1]] = self.chunk_evals_bf16[e0:e1].to(torch.bfloat16)
             y[:, self.chunk_orows[o0:o1]] = F.linear(x2, W, None if bias is None else bias[self.chunk_orows[o0:o1]])
         return y
 
@@ -248,6 +280,9 @@ class QVBandLinearV8R(nn.Module):
                 x2, out_dtype = x2.to(ad), ad
         if x2.shape[0] == 0:
             return x2.new_empty(*shp[:-1], self.out_features, dtype=out_dtype)
+        if self.fp16_table_missing and x2.dtype == torch.float16:
+            from qv_band.formats.qvb8.escape_split import fp16_missing_error
+            raise fp16_missing_error(self._where)
         path = self._PATHS[min(x2.shape[0], 17)]
         if self.bf16_gemm and self.bf16_certified and x2.dtype == torch.bfloat16 and x2.shape[0] > 8:
             path = "_chunked_bf16"
@@ -260,15 +295,19 @@ class QVBandLinearV8R(nn.Module):
         """The exact weight (Q, P) in `dtype` (escapes applied) -- for audits / re-packing, never on the hot path."""
         code = {torch.float16: 0, torch.bfloat16: 1}.get(dtype, 2)
         W = _load_ext().decode(*self._core(self.blocks8), self.in_features, code, 0, self.blocks8.shape[0], -1, 0)
-        if self.esc_flat.numel():
-            W.view(-1)[self.esc_flat] = self.esc_val.to(W.dtype)
+        if dtype == torch.float16 and self.fp16_table_missing:
+            from qv_band.formats.qvb8.escape_split import fp16_missing_error
+            raise fp16_missing_error(self._where)
+        ef, ev = (self.esc_flat_bf16, self.esc_val_bf16) if dtype == torch.bfloat16 else (self.esc_flat, self.esc_val)
+        if ef.numel():
+            W.view(-1)[ef] = ev.to(W.dtype)
         return W.to(dtype)
 
 
 class QVBandEmbeddingV8R(nn.Module):
     """Rows decoded on the CPU (C++/OpenMP); only the looked-up rows reach `device`."""
 
-    def __init__(self, d: dict, out_dtype=torch.bfloat16, device="cuda"):
+    def __init__(self, d: dict, out_dtype=torch.bfloat16, device="cuda", path: str | None = None):
         super().__init__()
         tab, tiles, words, off = QF.runtime_tables(d)
         Q, P = int(d["Q"]), int(d["P"])
@@ -277,18 +316,29 @@ class QVBandEmbeddingV8R(nn.Module):
         row_tile = np.empty(Q, np.int32)
         for t, (_, r0, nr) in enumerate(tiles):
             row_tile[r0:r0 + nr] = t
-        ei = d["esc_idx"].astype(np.int64); er = ei // P; o = np.argsort(er, kind="stable")
+        ei = d["esc_idx"].astype(np.int64)
+        ev = np.asarray(d["esc_val"], np.float32)
+        cert = d.get("cert", {})
+        # output dtype fixed here: the bf16 table for bf16 output, else the fp16 table (formats/qvb8/escape_split.py)
+        if out_dtype == torch.float16 and cert.get("restore") == "fp16+bf16":       # bf16 / fp32 output: the full list
+            from qv_band.formats.qvb8.escape_split import fp16_list_for, select_fp16, fp16_missing_error
+            lst = fp16_list_for(path)
+            if lst is None:
+                raise fp16_missing_error(str(path))
+            need = select_fp16(ei, lst, str(path))
+            ei, ev = ei[need], ev[need]
+        er = ei // P; o = np.argsort(er, kind="stable")
         ptr = np.zeros(Q + 1, np.int64); np.add.at(ptr, er + 1, 1); ptr = np.cumsum(ptr)
         C = lambda a: torch.from_numpy(np.array(a, copy=True, order="C"))
         self._c = (C(words.view(np.int32)), C(off), C(d["states"].view(np.int64)), C(tiles), C(tab.view(np.int32)),
                    C(inv), C(row_tile), C(d["min_s"]), C(d["tau_s"]), C(d["drow"].astype(np.int32)), C(ptr),
                    C((ei % P)[o].astype(np.int32)),
-                   C(d["esc_val"][o]))
+                   C(ev[o]))
 
     @classmethod
     def from_packfile(cls, path: str, *, out_dtype=torch.bfloat16, tau: float | None = None, device: str = "cuda",
                       blob: bytes | None = None):
-        return cls(QF.read(path, blob), out_dtype=out_dtype, device=device)
+        return cls(QF.read(path, blob), out_dtype=out_dtype, device=device, path=path)
 
     def extra_repr(self):
         return f"{self.num_embeddings}, {self.embedding_dim}, rows decoded on CPU"

@@ -15,7 +15,7 @@ launch() {
     --kv-cache qvb8 --kv-tau-threshold 0.1 --kv-residual 256 --kv-shadow 512MB \
     --prefill-chunk 8192 --prefill-linear qvb8 \
     --drafter dflash --draft-model "$DRAFT" --draft-pack dense --draft 15 --draft-ctx 4 \
-    --vision off --think "${EXTRA[@]}"
+    --vision off --think --dtype bf16 "${EXTRA[@]}"
 }
 . "$(dirname "${BASH_SOURCE[0]}")/lib/serve.sh"
 serve_main "$@"

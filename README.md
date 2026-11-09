@@ -46,11 +46,16 @@ identical to the original's, or correct. See the disclaimer at the end of this f
   This is the build that has been tested.
 - **Other GPUs:** the source is not tied to one GPU. The kernels compile for your GPU on first use (for example sm_120 on an
   RTX PRO 6000), but only the DGX Spark build is tested for Ripple.
-- **GPUs without bf16 support (for example the V100, sm_70):** bf16 is emulated there and slow, so run in fp16:
-  for example `QV_MODEL_DTYPE=float16 scripts/ripple_server.sh` (the same variable works in front of `scripts/ripple_chat.sh`). The packs below are
-  certified for both fp16 and bf16, so the error of every restored weight is less than tau in either dtype. On a GPU with
-  bf16 (A100, H100, RTX 30/40/50, DGX Spark) leave it unset: the engine runs bf16. fp16 tops out at 65504, so an activation
-  can overflow in fp16 where bf16 would not; compare a few answers against bf16 if you can.
+- **Compute dtype, `--dtype bf16|fp16`:** the launchers pass `--dtype bf16`; add `--dtype fp16` after it to run in fp16,
+  for example `scripts/ripple_server.sh start --dtype fp16` (the same flag works for `scripts/ripple_chat.sh`). Nothing
+  is chosen automatically. A GPU without bf16 support (for example the V100, sm_70) emulates bf16 and is slow, so run it
+  in fp16. On a GPU with bf16 (A100, H100, RTX 30/40/50, DGX Spark) both work: test which is faster on your card. The
+  packs below are certified for both fp16 and bf16, so the error of every restored weight is less than tau in either
+  dtype. fp16 tops out at 65504, so an activation can overflow in fp16 where bf16 would not; compare a few answers
+  against bf16 if you can.
+- **`escape_tables.json` (needed for fp16):** each pack folder on Hugging Face carries this small file next to
+  `manifest.json`. It holds the fp16 escape table: the few weights an fp16 decode must take from the stored originals.
+  An fp16 run without it stops at start-up and tells you to download it; a bf16 run does not need it.
   For the V100 the code has its own kernel paths (register-blocked GEMV, WMMA attention) and needs CUDA 12.x, because
   CUDA 13 dropped sm_70. The V100 path is verified on Qwen models, not yet on Ripple.
 - Python 3.10+ (tested 3.12) and the packages in `requirements.txt` (tested versions pinned).
@@ -158,6 +163,14 @@ Speculative decoding is verified by the full model. In our tests, greedy output 
 exact near-tie, the choice can differ.
 
 ## Update history
+
+**v1.0.1**
+- One switch for the compute dtype: `--dtype bf16|fp16` (replaces the `QV_MODEL_DTYPE` variable). The launchers set
+  the default; nothing is chosen automatically.
+- Two escape tables: an fp16 run reads only the fp16 table from `escape_tables.json`; a bf16 run reads the pack's full
+  list. The pack files are unchanged. In our test (QVB8-1e-3, fp16, DGX Spark, one prompt, greedy) decoding went from
+  about 1.8 to about 5.7 tokens per second; bf16 is unchanged.
+- An fp16 run needs `escape_tables.json` in the pack folder; without it, the engine stops with an error at start-up.
 
 **v1.0.0: First release**
 - QVB8 Inference Engine for Ripple-65B-Preview, with the QVB8 and QVB8R weight packs.

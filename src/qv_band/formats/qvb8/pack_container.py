@@ -45,7 +45,7 @@ def calc_method_of(blob: bytes) -> int:
     check for a legacy table pack without parsing twice."""
     return _unpack_header(blob)[5]
 
-def unpack_formula(blob: bytes, *, skip_bit_decode: bool=False) -> dict:
+def unpack_formula(blob: bytes, *, skip_bit_decode: bool=False, fp16_list=None, where: str="") -> dict:
     """Inverse of pack_formula. Returns a dict with Q, P, tau, max_err,
     source, min_s, tau_s, codes (Q,P) int64, esc_idx, esc_vals -- the
     latter two already MERGE the esc32 and esc8 pools back into one
@@ -94,7 +94,24 @@ def unpack_formula(blob: bytes, *, skip_bit_decode: bool=False) -> dict:
     s8 = np.frombuffer(blob, '<f4', count=Q, offset=cur).copy()
     cur += 4 * Q
     esc_idx, esc_vals = _combine_escapes(esc32_idx, esc32_vals, esc8_idx, esc8_codes, s8, P)
-    return dict(Q=Q, P=P, tau=tau, max_err=max_err, source=source, restore=restore, min_s=min_s, tau_s=tau_s, codes=codes, esc_idx=esc_idx, esc_vals=esc_vals, nbits=nbits, bit_off=bit_off, buf=buf)
+    # Two escape tables (escape_split.py). esc_idx/esc_vals: the FULL list on disk = the bf16 table.
+    # esc_idx_fp16/esc_vals_fp16: the fp16 table. Nothing is computed at load: for an fp16+bf16 pack it comes ONLY
+    # from escape_tables.json (fp16_list, validated against this file); without the list it is None and the caller
+    # decides (an fp16 run refuses). An fp16-only pack has one table.
+    if restore == 'fp16+bf16':
+        if fp16_list is None:
+            esc_idx_fp16 = esc_vals_fp16 = None
+        else:
+            from qv_band.formats.qvb8.escape_split import select_fp16
+            keep = select_fp16(esc_idx, fp16_list, where)
+            esc_idx_fp16, esc_vals_fp16 = esc_idx[keep], esc_vals[keep]
+    else:
+        esc_idx_fp16, esc_vals_fp16 = esc_idx, esc_vals
+    return dict(Q=Q, P=P, tau=tau, max_err=max_err, source=source, restore=restore, min_s=min_s, tau_s=tau_s, codes=codes,
+                esc_idx=esc_idx, esc_vals=esc_vals, esc_idx_fp16=esc_idx_fp16, esc_vals_fp16=esc_vals_fp16,
+                nbits=nbits, bit_off=bit_off, buf=buf)
+
+
 
 def _bit_offsets_from_nbits(nbits: np.ndarray, P: int) -> np.ndarray:
     """pack_bits_rows lays rows back to back with no padding between

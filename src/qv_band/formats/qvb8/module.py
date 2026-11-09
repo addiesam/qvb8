@@ -37,7 +37,7 @@ def _load_ext():
 
 
 
-FP32_METADATA = ("min_s", "tau_s", "esc_vals")
+FP32_METADATA = ("min_s", "tau_s", "esc_vals", "esc_vals_bf16")
 
 
 def apply_keeping_fp32_metadata(module: nn.Module, fn, recurse=True):
@@ -68,16 +68,24 @@ class QVBandLinearV8(nn.Module):
     # fp16-only pack it would put a few hundred weights at up to ~1.04 tau,
     # outside the certificate (tech_doc/restore_precision_policy.md, rule 1).
     bf16_certified = False
+    # True for an fp16+bf16 pack loaded without escape_tables.json: an fp16 forward raises (no fp16 table)
+    fp16_table_missing = False
     """y = x @ W^T (+ bias), W resident in VRAM ONLY as the bit-packed
     virtual-band index (+ min_s/tau_s/escapes) -- never a decoded weight.
     The fp32 value min_s + idx*tau_s is narrowed to fp16 (the one restore
     precision this format defines) and multiplied in the same kernel on every
     forward call, so nothing dense is cached in between. The certified bound is
     |fp16(min_s + idx*tau_s) - w| <= tau for every element, escapes included.
+
+    Two escape tables (formats/qvb8/escape_split.py):
+      esc_idx / esc_vals            the fp16 table -- every fp16 / fp32 path (GEMV, fp16 decode, experts)
+      esc_idx_bf16 / esc_vals_bf16  the bf16 table -- only the paths that round the weight to bf16
+                                    (mma with bf16 activations, decode_bf16). The same tensors when the pack
+                                    has no bf16-only escapes.
     """
 
     def __init__(self, *, min_s, nbits, bit_off, ids, Q, P, tau_s,
-                 esc_idx, esc_vals, bias=None):
+                 esc_idx, esc_vals, bias=None, esc_idx_bf16=None, esc_vals_bf16=None):
         super().__init__()
         self.in_features = int(P)
         self.out_features = int(Q)
@@ -91,12 +99,30 @@ class QVBandLinearV8(nn.Module):
         self.register_buffer("ids", ids, persistent=False)
         # escapes sorted by flat position (q*P + c): the correction kernels add each output's escapes in this order,
         # one thread per output, so the result is bit-reproducible (qvb8_fix_escapes / qvb8_mma_fix_escapes)
-        if esc_idx.numel() > 1 and not bool((esc_idx[1:] >= esc_idx[:-1]).all()):
-            o = torch.argsort(esc_idx, stable=True); esc_idx, esc_vals = esc_idx[o].contiguous(), esc_vals[o].contiguous()
+        def _sorted(ei, ev):
+            if ei.numel() > 1 and not bool((ei[1:] >= ei[:-1]).all()):
+                o = torch.argsort(ei, stable=True); ei, ev = ei[o].contiguous(), ev[o].contiguous()
+            return ei, ev
+        esc_idx, esc_vals = _sorted(esc_idx, esc_vals)
+        if esc_idx_bf16 is None:
+            esc_idx_bf16, esc_vals_bf16 = esc_idx, esc_vals
+        else:
+            esc_idx_bf16, esc_vals_bf16 = _sorted(esc_idx_bf16, esc_vals_bf16)
         self.register_buffer("esc_idx", esc_idx, persistent=False)
         self.register_buffer("esc_vals", esc_vals, persistent=False)
+        self.register_buffer("esc_idx_bf16", esc_idx_bf16, persistent=False)
+        self.register_buffer("esc_vals_bf16", esc_vals_bf16, persistent=False)
         self.bias = None if bias is None else nn.Parameter(bias,
                                                            requires_grad=False)
+    def escapes(self, dtype=torch.float16):
+        """(esc_idx, esc_vals) for a decode that rounds the weight to `dtype`: the bf16 table for bf16, else fp16."""
+        if dtype == torch.bfloat16:
+            return self.esc_idx_bf16, self.esc_vals_bf16
+        if dtype == torch.float16 and self.fp16_table_missing:
+            from qv_band.formats.qvb8.escape_split import fp16_missing_error
+            raise fp16_missing_error(getattr(self, "_where", "QVBandLinearV8"))
+        return self.esc_idx, self.esc_vals
+
     def row_subset(self, rows: torch.Tensor) -> "QVBandLinearV8":
         """A linear holding only output rows `rows` (1-D LongTensor on this
         module's device), sharing this module's packed `ids` buffer.
@@ -110,20 +136,28 @@ class QVBandLinearV8(nn.Module):
         """
         rows = rows.to(self.min_s.device).long()
         P = self.in_features
-        esc_idx, esc_vals = self.esc_idx, self.esc_vals
-        if esc_idx.numel():
-            remap = torch.full((self.out_features,), -1, dtype=torch.long,
-                               device=rows.device)
-            remap[rows] = torch.arange(rows.numel(), device=rows.device)
+        remap = torch.full((self.out_features,), -1, dtype=torch.long,
+                           device=rows.device)
+        remap[rows] = torch.arange(rows.numel(), device=rows.device)
+
+        def sub(esc_idx, esc_vals):
+            if not esc_idx.numel():
+                return esc_idx, esc_vals
             q = esc_idx // P
             keep = remap[q] >= 0
-            esc_idx = remap[q[keep]] * P + esc_idx[keep] % P
-            esc_vals = esc_vals[keep]
-        return type(self)(
+            return remap[q[keep]] * P + esc_idx[keep] % P, esc_vals[keep]
+        esc_idx, esc_vals = sub(self.esc_idx, self.esc_vals)
+        same = self.esc_idx_bf16 is self.esc_idx
+        ei_b, ev_b = (None, None) if same else sub(self.esc_idx_bf16, self.esc_vals_bf16)
+        m = type(self)(
             min_s=self.min_s[rows], nbits=self.nbits[rows],
             bit_off=self.bit_off[rows], ids=self.ids,
             Q=int(rows.numel()), P=P, tau_s=self.tau_s[rows],
-            esc_idx=esc_idx, esc_vals=esc_vals, bias=None)
+            esc_idx=esc_idx, esc_vals=esc_vals, bias=None,
+            esc_idx_bf16=ei_b, esc_vals_bf16=ev_b)
+        m.bf16_certified = self.bf16_certified
+        m.fp16_table_missing = self.fp16_table_missing
+        return m
 
     @classmethod
     def from_packfile(cls, path: str, *, bias=None, tau: float | None = None,
@@ -135,6 +169,8 @@ class QVBandLinearV8(nn.Module):
                 blob = fh.read()
         dev = torch.device(device)
         b = None
+        esc_bf16 = (None, None)
+        fp16_missing = False
         if bias is not None:
             b = (bias.detach() if isinstance(bias, torch.Tensor)
                  else torch.tensor(bias)).to(dev)
@@ -152,11 +188,21 @@ class QVBandLinearV8(nn.Module):
                 raise NotImplementedError(
                     "qvb8 table (calc_method=1) packs are not read by "
                     "QVBandLinearV8; this is a pre-unification file, re-pack it.")
-            d = unpack_formula(blob, skip_bit_decode=True)
+            from qv_band.formats.qvb8.escape_split import fp16_list_for
+            d = unpack_formula(blob, skip_bit_decode=True, fp16_list=fp16_list_for(path), where=str(path))
             min_s, tau_s, nb, bit_off, buf = (
                 d["min_s"], d["tau_s"], d["nbits"], d["bit_off"], d["buf"])
             Q, P = d["Q"], d["P"]
-            esc_idx, esc_vals = d["esc_idx"], d["esc_vals"]
+            if d["esc_idx_fp16"] is None:
+                # fp16+bf16 pack without escape_tables.json: one table (the full list, exact values); an fp16 forward
+                # refuses (fp16_table_missing), a bf16 run is unchanged
+                esc_idx, esc_vals = d["esc_idx"], d["esc_vals"]
+                fp16_missing = True
+            else:
+                esc_idx, esc_vals = d["esc_idx_fp16"], d["esc_vals_fp16"]
+                if d["esc_idx_fp16"] is not d["esc_idx"]:
+                    esc_bf16 = (torch.from_numpy(d["esc_idx"].astype(np.int64)).to(dev),
+                                torch.from_numpy(d["esc_vals"].astype(np.float32)).to(dev))
         mod = cls(
             min_s=torch.from_numpy(min_s.astype(np.float32)).to(dev),
             nbits=torch.from_numpy(nb.astype(np.uint8)).to(dev),
@@ -165,8 +211,10 @@ class QVBandLinearV8(nn.Module):
             Q=Q, P=P, tau_s=torch.from_numpy(tau_s.astype(np.float32)).to(dev),
             esc_idx=torch.from_numpy(esc_idx.astype(np.int64)).to(dev),
             esc_vals=torch.from_numpy(esc_vals.astype(np.float32)).to(dev),
-            bias=b)
+            bias=b, esc_idx_bf16=esc_bf16[0], esc_vals_bf16=esc_bf16[1])
         mod.bf16_certified = blob[:4] == b"QVBD" and d.get("restore") == "fp16+bf16"
+        mod.fp16_table_missing = fp16_missing
+        mod._where = str(path)
         return mod
 
     def _apply(self, fn, recurse=True):
@@ -221,19 +269,23 @@ class QVBandLinearV8(nn.Module):
             #                 warp-per-row escape fix;
             #   general    -- 1 if any tile is outside the lean kernel's 4..12-bit widths (mixed, 1-3, 13-14 bits).
             # Held by the module, so they live and die with the weight.
-            n_esc = self.esc_idx.numel()
-            if n_esc:
-                rows = torch.div(self.esc_idx, self.in_features, rounding_mode="floor")
-                brk = torch.ones(n_esc, dtype=torch.bool, device=rows.device)
-                brk[1:] = rows[1:] != rows[:-1]
-                starts = torch.cat([brk.nonzero().view(-1),
-                                    torch.full((1,), n_esc, dtype=torch.int64, device=rows.device)]).contiguous()
-            else:
-                starts = torch.empty(0, dtype=torch.int64, device=self.ids.device)
+            # one escape-row index per table: the fp16 kernel mode corrects with the fp16 table, the bf16 mode with the bf16 one
             general = int(bool(((tile_nb < 4) | (tile_nb > 12)).any()))
-            self._mma_extra = (starts, general)
+            self._mma_extra = {False: (self._esc_row_starts(self.esc_idx), general),
+                               True: (self._esc_row_starts(self.esc_idx_bf16), general)}
         self._mma_cache = order
         return order
+
+    def _esc_row_starts(self, esc_idx):
+        """Start of each escaped row's run in the sorted esc_idx (+ final count), for the warp-per-row escape fix."""
+        n_esc = esc_idx.numel()
+        if not n_esc:
+            return torch.empty(0, dtype=torch.int64, device=self.ids.device)
+        rows = torch.div(esc_idx, self.in_features, rounding_mode="floor")
+        brk = torch.ones(n_esc, dtype=torch.bool, device=rows.device)
+        brk[1:] = rows[1:] != rows[:-1]
+        return torch.cat([brk.nonzero().view(-1),
+                          torch.full((1,), n_esc, dtype=torch.int64, device=rows.device)]).contiguous()
 
     def _rb_order(self, ext):
         """(perm, tile_nb) for ext.gemv_rb on GPUs without the mma path (sm_70),
@@ -282,6 +334,9 @@ class QVBandLinearV8(nn.Module):
                 x2d = x2d.to(ad)
                 out_dtype = ad
         M = x2d.shape[0]
+        if self.fp16_table_missing and x2d.dtype == torch.float16:
+            from qv_band.formats.qvb8.escape_split import fp16_missing_error
+            raise fp16_missing_error(getattr(self, "_where", "QVBandLinearV8"))
         # qvb8_forward's M>4 path calls qvb8_decode, whose CUDA host
         # wrapper reads float32 metadata/activations. A bf16 caller (Z-Image
         # text encoder, or any mixed-precision pipeline) otherwise reaches
@@ -316,13 +371,20 @@ class QVBandLinearV8(nn.Module):
         # with other activation dtypes it keeps the old route.
         # v1: up to 48 rows (a batched verify: up to 3 requests x 16 tokens) -- the kernel decodes each weight
         # once for all token groups; above 16 rows the alternative decodes the whole matrix to bf16 (~3x the traffic).
-        order = (self._mma_order(ext)
-                 if 8 <= M <= _MMA_MAX_M and (not self.bf16_certified or x2d.dtype == torch.bfloat16) else None)
+        # Kernel mode: bf16 (weights rounded to bf16) for a bf16-certified pack with bf16 activations, with the bf16
+        # escape table; otherwise fp16 mode with the fp16 table -- also for a bf16-certified pack run in fp16
+        # (--dtype fp16), whose fp16 certificate holds on its own.
+        # An fp16+bf16 pack takes the mma only with fp16 or bf16 activations (as before: the fp16 mode saturates X to
+        # fp16, so an fp32 stream keeps the GEMV / decode paths); an fp16 pack keeps its old route for any dtype.
+        bf16_mode = bool(self.bf16_certified) and x2d.dtype == torch.bfloat16
+        mma_ok = (not self.bf16_certified) or x2d.dtype in (torch.float16, torch.bfloat16)
+        order = self._mma_order(ext) if 8 <= M <= _MMA_MAX_M and mma_ok else None
         if order is not None:
-            starts, general = self._mma_extra
+            starts, general = self._mma_extra[bf16_mode]
+            ei, ev = (self.esc_idx_bf16, self.esc_vals_bf16) if bf16_mode else (self.esc_idx, self.esc_vals)
             y = ext.mma_multi(xk, self.ids, self.min_s, self.nbits, self.bit_off,
-                              self.in_features, self.tau_s, self.esc_idx, self.esc_vals, *order,
-                              bool(self.bf16_certified), starts, general)
+                              self.in_features, self.tau_s, ei, ev, *order,
+                              bf16_mode, starts, general)
             y = y.reshape(*orig[:-1], self.out_features)
             if self.bias is not None:
                 y = y + self.bias.to(y.dtype)
@@ -369,7 +431,7 @@ class QVBandLinearV8(nn.Module):
             # for an fp16-certified pack (357 of 1.5e9 weights over tau).
             W = ext.decode_bf16(self.ids, self.min_s, self.nbits,
                                 self.bit_off, self.in_features, self.tau_s,
-                                self.esc_idx, self.esc_vals)
+                                self.esc_idx_bf16, self.esc_vals_bf16)
             b = None if self.bias is None else self.bias.to(torch.bfloat16)
             y = F.linear(xk, W, b)
             return y.reshape(*orig[:-1], self.out_features)
@@ -490,7 +552,10 @@ def footprint_report(module) -> dict:
         n_lin += 1
         n_params += m.out_features * m.in_features
         ids += m.ids.numel() * m.ids.element_size()
-        for t in (m.esc_idx, m.esc_vals):
+        tabs = [m.esc_idx, m.esc_vals]
+        if m.esc_idx_bf16.data_ptr() != m.esc_idx.data_ptr():      # a separate bf16 table costs its own memory
+            tabs += [m.esc_idx_bf16, m.esc_vals_bf16]
+        for t in tabs:
             if torch.is_tensor(t):
                 n_esc += t.numel()
                 escapes += t.numel() * t.element_size()

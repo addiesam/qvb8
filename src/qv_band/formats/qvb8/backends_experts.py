@@ -38,6 +38,8 @@ def _unpack_blob(blob: bytes):
     if blob[:4] == b"QVBD":
         from qv_band.formats.qvb8.pack_container import unpack_formula
         d = unpack_formula(blob, skip_bit_decode=True)
+        # The sharded GEMV decodes in fp16/fp32. Blob only (no path, so no escape_tables.json): the pack's full list,
+        # exact values -- correct; an fp16 run of an fp16+bf16 pack is refused up front (require_fp16_tables).
         return (d["min_s"], d["tau_s"], d["nbits"], d["bit_off"], d["buf"],
                 d["Q"], d["P"], d["tau"], d["esc_idx"], d["esc_vals"])
     from qv_band.formats.qvb8.pack import unpack_tensor

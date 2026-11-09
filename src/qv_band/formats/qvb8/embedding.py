@@ -58,11 +58,22 @@ class QVBandEmbeddingV8(nn.Module):
                     "the formula has an embedding reader; stream this tensor "
                     "dense instead.")
             from qv_band.formats.qvb8.pack_container import unpack_formula
-            d = unpack_formula(blob, skip_bit_decode=True)
+            from qv_band.formats.qvb8.escape_split import fp16_list_for
+            d = unpack_formula(blob, skip_bit_decode=True, fp16_list=fp16_list_for(path), where=str(path))
             min_s, tau_s, nb, bit_off, buf = (
                 d["min_s"], d["tau_s"], d["nbits"], d["bit_off"], d["buf"])
             Q, P = d["Q"], d["P"]
-            esc_idx, esc_vals = d["esc_idx"], d["esc_vals"]
+            # The output dtype is fixed here, so one table is kept: the bf16 table for bf16 output, else the fp16 one
+            # (formats/qvb8/escape_split.py).
+            # bf16 output: the bf16 table. fp16 output: the fp16 table, from escape_tables.json (none -> error).
+            # fp32 output: the full list (exact values; no rounding of the weight).
+            if out_dtype == torch.float16:
+                if d["esc_idx_fp16"] is None:
+                    from qv_band.formats.qvb8.escape_split import fp16_missing_error
+                    raise fp16_missing_error(str(path))
+                esc_idx, esc_vals = d["esc_idx_fp16"], d["esc_vals_fp16"]
+            else:
+                esc_idx, esc_vals = d["esc_idx"], d["esc_vals"]
         else:
             from qv_band.formats.qvb8.pack import unpack_tensor
             (min_s, tau_s, nb, bit_off, buf, Q, P, _tau,

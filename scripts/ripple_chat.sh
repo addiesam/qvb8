@@ -7,4 +7,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 : "${DRAFT:?set DRAFT to the DFlash2 drafter pack dir}"
 export RIPPLE_PACK="$MODEL" RIPPLE_DRAFT="$DRAFT"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-exec "${PYTHON:-python}" -m ai_engine.cli.chat_ripple "$MODEL" "$@"
+# the compute dtype: --dtype bf16 unless the arguments choose one (--dtype fp16 on a GPU without bf16, e.g. V100);
+# added after them, so the prompt stays the first positional argument
+DT=(--dtype bf16)
+for a in "$@"; do case "$a" in --dtype|--dtype=*) DT=() ;; esac; done
+exec "${PYTHON:-python}" -m ai_engine.cli.chat_ripple "$MODEL" "$@" ${DT[@]+"${DT[@]}"}

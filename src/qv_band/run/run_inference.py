@@ -218,7 +218,7 @@ def _repair_pack_dir_missing_dense(pack_dir: str, manifest: dict,
 
 
 def load_qv_model(model_dir: str, pack_dir: Optional[str], *,
-                  no_compress: bool = False, device: str = "cuda"):
+                  no_compress: bool = False, device: str = "cuda", dtype: Optional[str] = None):
     """Build the model skeleton on meta, swap QV-band v7 anchored packs,
     stream the remaining dense tensors, and return (model, tokenizer).
     Extracted from main() so other harnesses (speculative decode, benchmarks)
@@ -231,6 +231,7 @@ def load_qv_model(model_dir: str, pack_dir: Optional[str], *,
     # pack_dir=None (config.py's LLM_PACK_DIR in "normal" mode) means dense.
     args.no_compress = no_compress or pack_dir is None
     args.device = device
+    args.dtype = dtype          # "bf16" / "fp16" (--dtype); None = the model's own dtype
     return _load_qv_model_impl(args)
 
 
@@ -539,19 +540,21 @@ def _load_qv_model_impl(args):
         else:
             model = AutoModelForCausalLM.from_config(text_cfg, trust_remote_code=True)
     model_dtype = getattr(text_cfg, "torch_dtype", None) or torch.bfloat16
-    # QV_MODEL_DTYPE=float16: run a bf16 checkpoint in fp16 -- for GPUs with no
-    # bf16 hardware (V100, sm_70), where every bf16 op is emulated. An fp16
-    # pack's weights already restore to fp16; the risk is activation overflow
-    # (fp16 tops out at 65504), so compare outputs against bf16 first.
-    _dt_override = os.environ.get("QV_MODEL_DTYPE", "").strip().lower()
-    if _dt_override:
-        _dtypes = {"float16": torch.float16, "fp16": torch.float16,
-                   "bfloat16": torch.bfloat16, "bf16": torch.bfloat16}
-        if _dt_override not in _dtypes:
-            raise ValueError(f"QV_MODEL_DTYPE={_dt_override!r}: expected one of {sorted(_dtypes)}")
-        model_dtype = _dtypes[_dt_override]
+    # --dtype fp16 / bf16 (the user's choice; never picked from the GPU): fp16 for GPUs with no bf16 hardware (V100,
+    # sm_70), where every bf16 op is emulated. The risk of fp16 is activation overflow (fp16 tops out at 65504), so
+    # compare outputs against bf16 first. Unset: the model's own dtype.
+    _dt = getattr(args, "dtype", None)
+    if _dt:
+        _dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16}
+        if _dt not in _dtypes:
+            raise ValueError(f"--dtype {_dt!r}: expected one of {sorted(_dtypes)}")
+        model_dtype = _dtypes[_dt]
         text_cfg.torch_dtype = model_dtype
-        print(f">>> model dtype: {model_dtype} (QV_MODEL_DTYPE override)", flush=True)
+        print(f">>> model dtype: {model_dtype} (--dtype {_dt})", flush=True)
+    if model_dtype == torch.float16 and getattr(args, "pack_dir", None):
+        # fp16 run: an fp16+bf16 pack needs its fp16 escape table (escape_tables.json); refuse up front, not mid-run
+        from qv_band.formats.qvb8.escape_split import require_fp16_tables
+        require_fp16_tables(args.pack_dir)
     model = model.to(model_dtype).eval()
     tied = bool(getattr(text_cfg, "tie_word_embeddings", False))
 
