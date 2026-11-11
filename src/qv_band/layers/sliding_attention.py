@@ -1,4 +1,5 @@
-"""Ripple attention forward, routed through the engine the same way Qwen's is.
+"""Layer kind: gated attention with value residual, as sliding-window (RoPE) or global (NoPE) layers, routed through
+the engine's attention registry. Used by: Ripple (RicursiveAttention).
 
 The shipped RicursiveAttention.forward calls F.scaled_dot_product_attention directly, which bypasses the
 engine (no qvb8 fused attention, no flash-attn) and has two masking bugs with a KV cache:
@@ -6,7 +7,7 @@ engine (no qvb8 fused attention, no flash-attn) and has two masking bugs with a 
      speculative verify / chunked prefill sees almost no context;
   2. sliding layers: keys are numbered 0..kv_len-1 while queries use absolute positions, which is wrong once
      the window cache has dropped old keys (context > 1024 tokens) -- plain decoding included.
-This forward keeps every Ripple-specific op (value residual, per-head q/k norm, RoPE on sliding layers only,
+This forward keeps every op of the shipped layer (value residual, per-head q/k norm, RoPE on sliding layers only,
 NoPE global layers, sigmoid output gate) and hands the attention itself to transformers' attention registry
 (ALL_ATTENTION_FUNCTIONS[config._attn_implementation]) exactly like Qwen's modeling code. That gives:
   * flash-attn with bottom-right causal alignment and window_size=(W-1, W-1) -> both bugs gone by construction;
@@ -20,10 +21,10 @@ import sys
 import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from qv_band.models.ripple import fused as _fused
+from qv_band.layers import fused_pointwise as _fused
 
 
-def ripple_attention_forward(self, hidden_states, attention_mask=None, position_ids=None,
+def sliding_attention_forward(self, hidden_states, attention_mask=None, position_ids=None,
                              past_key_value=None, output_attentions=False, use_cache=False,
                              cache_position=None, value_residual=None, **kwargs):
     bsz, q_len, _ = hidden_states.shape
@@ -40,7 +41,7 @@ def ripple_attention_forward(self, hidden_states, attention_mask=None, position_
     v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
     if self._qv_sliding and _fused.enabled() and q.is_cuda:
-        # RoPE on local layers only; global layers are NoPE. Fused fp32 RoPE (models/ripple/fused.py) on the
+        # RoPE on local layers only; global layers are NoPE. Fused fp32 RoPE (layers/fused_pointwise.py) on the
         # (B, T, H, D) layout, before the transpose: one pass instead of ~10 fp32 copies / muls / adds.
         cos, sin = self.rotary_emb(v, position_ids)
         q = _fused.rope_bthd(q, cos, sin).transpose(1, 2)
@@ -71,7 +72,7 @@ def ripple_attention_forward(self, hidden_states, attention_mask=None, position_
 
 
 def install_attention(model, layer_types: list[str], window: int) -> int:
-    """Bind ripple_attention_forward to every attention module. layer_types: the ORIGINAL per-layer types."""
+    """Bind sliding_attention_forward to every attention module. layer_types: the ORIGINAL per-layer types."""
     n = 0
     for i, layer in enumerate(model.model.layers):
         attn = layer.self_attn
@@ -80,6 +81,6 @@ def install_attention(model, layer_types: list[str], window: int) -> int:
         attn._qv_window = window if sliding else None
         attn.is_causal = True
         attn._qv_apply_rope = sys.modules[type(attn).__module__].apply_rotary_pos_emb
-        attn.forward = ripple_attention_forward.__get__(attn)
+        attn.forward = sliding_attention_forward.__get__(attn)
         n += 1
     return n

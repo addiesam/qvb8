@@ -45,7 +45,7 @@ def calc_method_of(blob: bytes) -> int:
     check for a legacy table pack without parsing twice."""
     return _unpack_header(blob)[5]
 
-def unpack_formula(blob: bytes, *, skip_bit_decode: bool=False, fp16_list=None, where: str="") -> dict:
+def unpack_formula(blob: bytes, *, skip_bit_decode: bool=False, fp16_list=None, where: str='', _compute_fp16: bool=False) -> dict:
     """Inverse of pack_formula. Returns a dict with Q, P, tau, max_err,
     source, min_s, tau_s, codes (Q,P) int64, esc_idx, esc_vals -- the
     latter two already MERGE the esc32 and esc8 pools back into one
@@ -94,24 +94,26 @@ def unpack_formula(blob: bytes, *, skip_bit_decode: bool=False, fp16_list=None, 
     s8 = np.frombuffer(blob, '<f4', count=Q, offset=cur).copy()
     cur += 4 * Q
     esc_idx, esc_vals = _combine_escapes(esc32_idx, esc32_vals, esc8_idx, esc8_codes, s8, P)
-    # Two escape tables (escape_split.py). esc_idx/esc_vals: the FULL list on disk = the bf16 table.
-    # esc_idx_fp16/esc_vals_fp16: the fp16 table. Nothing is computed at load: for an fp16+bf16 pack it comes ONLY
-    # from escape_tables.json (fp16_list, validated against this file); without the list it is None and the caller
-    # decides (an fp16 run refuses). An fp16-only pack has one table.
-    if restore == 'fp16+bf16':
+    if restore == 'fp16+bf16' and _compute_fp16:
+        from qv_band.formats.qvb8.escape_split import split_esc32
+        need = split_esc32(esc32_idx, esc32_vals, buf=buf, nbits=nbits, bit_off=bit_off, min_s=min_s, tau_s=tau_s, P=P, tau=tau)
+        esc_idx_fp16, esc_vals_fp16 = _combine_escapes(esc32_idx[need], esc32_vals[need], esc8_idx, esc8_codes, s8, P)
+    elif restore == 'fp16+bf16':
         if fp16_list is None:
             esc_idx_fp16 = esc_vals_fp16 = None
         else:
             from qv_band.formats.qvb8.escape_split import select_fp16
             keep = select_fp16(esc_idx, fp16_list, where)
-            esc_idx_fp16, esc_vals_fp16 = esc_idx[keep], esc_vals[keep]
+            esc_idx_fp16, esc_vals_fp16 = (esc_idx[keep], esc_vals[keep])
     else:
-        esc_idx_fp16, esc_vals_fp16 = esc_idx, esc_vals
-    return dict(Q=Q, P=P, tau=tau, max_err=max_err, source=source, restore=restore, min_s=min_s, tau_s=tau_s, codes=codes,
-                esc_idx=esc_idx, esc_vals=esc_vals, esc_idx_fp16=esc_idx_fp16, esc_vals_fp16=esc_vals_fp16,
-                nbits=nbits, bit_off=bit_off, buf=buf)
+        esc_idx_fp16, esc_vals_fp16 = (esc_idx, esc_vals)
+    return dict(Q=Q, P=P, tau=tau, max_err=max_err, source=source, restore=restore, min_s=min_s, tau_s=tau_s, codes=codes, esc_idx=esc_idx, esc_vals=esc_vals, esc_idx_fp16=esc_idx_fp16, esc_vals_fp16=esc_vals_fp16, nbits=nbits, bit_off=bit_off, buf=buf)
 
-
+def compute_fp16_table(blob: bytes):
+    """(restore, full escape idx, fp16 escape idx) of a QVBD blob, by the tau check (escape_split.split_esc32).
+    Used ONLY to write escape_tables.json (end of calibration, or the escape_split CLI) -- never at load."""
+    d = unpack_formula(blob, skip_bit_decode=True, _compute_fp16=True)
+    return (d['restore'], np.asarray(d['esc_idx'], np.int64), np.asarray(d['esc_idx_fp16'], np.int64))
 
 def _bit_offsets_from_nbits(nbits: np.ndarray, P: int) -> np.ndarray:
     """pack_bits_rows lays rows back to back with no padding between

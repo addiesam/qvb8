@@ -666,7 +666,7 @@ torch::Tensor qvb8_decode(torch::Tensor ids, torch::Tensor min_s,
     //
     // The flag is unnecessary because the precondition it would guard is
     // already ENFORCED at pack time, not merely assumed. fp16 cannot represent
-    // a value with error below tau once the value is large enough that fp16's
+    // a value to within tau once the value is large enough that fp16's
     // half-ULP exceeds it (at tau=1e-3, roughly |w| >= 4), and the packer
     // deals with that by refusing the value into the esc32 pool instead:
     // pack_qvb8._escape_representable raises on exactly that condition, and

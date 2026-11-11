@@ -1,11 +1,11 @@
-"""Ripple KV-cache pieces.
+"""Cache kind: sliding-window KV layer with a rollback margin (bf16 KV path). Used by: Ripple.
 
 The cache object itself is the engine's (DynamicCache for bf16 KV, BandedKVCache for qvb8 KV, exactly as for
-Qwen). Ripple only contributes:
-  * RippleSlidingLayer -- the cache layer for its 72 sliding-window layers. HF's DynamicSlidingWindowLayer keeps
+Qwen). This module contributes:
+  * MarginSlidingLayer -- the cache layer for its 72 sliding-window layers. HF's DynamicSlidingWindowLayer keeps
     exactly sliding_window-1 keys, so a speculative verify of k tokens followed by a rejection cannot be undone
     (its crop() refuses once the window is full). This layer keeps MARGIN extra keys, so dropping up to MARGIN
-    rejected tokens is exact. Registered with HF as layer type "ripple_sliding" (cache_utils auto-registers
+    rejected tokens is exact. Registered with HF as layer type "margin_sliding" (cache_utils auto-registers
     subclasses that declare _layer_type).
   * rollback(cache, n_drop) -- exact O(1) rollback of the last n_drop tokens on every layer; the engine calls it
     through model._qv_rollback (spec_decode's hook for models without recurrent state).
@@ -16,13 +16,13 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import DynamicSlidingWindowLayer
 
-LAYER_TYPE = "ripple_sliding"
+LAYER_TYPE = "margin_sliding"
 
 
-class RippleSlidingLayer(DynamicSlidingWindowLayer):
+class MarginSlidingLayer(DynamicSlidingWindowLayer):
     _layer_type = LAYER_TYPE
     MARGIN = 64                    # >= the largest verify block (16) with room for chunked rollbacks
-    default_window = 1024          # set from the model config by runtime.install()
+    default_window = 1024          # set from the model config by the adapter
 
     def __init__(self, sliding_window: int | None = None, **kwargs):
         super().__init__(sliding_window=sliding_window or self.default_window)
@@ -76,7 +76,7 @@ class RippleSlidingLayer(DynamicSlidingWindowLayer):
         """HF convention: negative = drop that many; non-negative = truncate to that absolute length."""
         n = -max_length if max_length < 0 else self.cumulative_length - max_length
         if not self.can_drop(n):
-            raise RuntimeError(f"RippleSlidingLayer: cannot drop {n} tokens (margin {self.MARGIN})")
+            raise RuntimeError(f"MarginSlidingLayer: cannot drop {n} tokens (margin {self.MARGIN})")
         self.drop(n)
 
 
@@ -88,10 +88,10 @@ def rollback(cache, n_drop: int) -> bool:
     if not layers:
         return False
     for L in layers:
-        if isinstance(L, RippleSlidingLayer) and not L.can_drop(n_drop):
+        if isinstance(L, MarginSlidingLayer) and not L.can_drop(n_drop):
             return False
     for L in layers:
-        if isinstance(L, RippleSlidingLayer):
+        if isinstance(L, MarginSlidingLayer):
             L.drop(n_drop)
         else:                       # DynamicLayer / BandedKVLayer: both support HF's negative crop
             L.crop(-n_drop)

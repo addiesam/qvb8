@@ -378,7 +378,16 @@ class QVBandLinearV8(nn.Module):
         # fp16, so an fp32 stream keeps the GEMV / decode paths); an fp16 pack keeps its old route for any dtype.
         bf16_mode = bool(self.bf16_certified) and x2d.dtype == torch.bfloat16
         mma_ok = (not self.bf16_certified) or x2d.dtype in (torch.float16, torch.bfloat16)
-        order = self._mma_order(ext) if 8 <= M <= _MMA_MAX_M and mma_ok else None
+        order = self._mma_order(ext) if 8 <= M <= _MMA_SPLIT_MAX and mma_ok else None
+        if order is not None and M > _MMA_MAX_M:
+            # Past the kernel's row limit the old route decoded the whole matrix for one GEMM (~3x the traffic of the
+            # packed ids). Up to twice the limit, equal mma passes are cheaper -- Ripple-65B qvb8 2.5e-3, all 641
+            # linears, the dev GPU: 64 rows 1545 -> ~900 ms, 96 rows 1589 -> ~1090 ms (a verify of 4-6 requests, or a short
+            # prefill tail). Each row's result does not depend on which rows share its pass.
+            n = -(-M // _MMA_MAX_M)
+            step = -(-M // n)
+            return torch.cat([self.forward(x2d[i:i + step]) for i in range(0, M, step)]) \
+                .reshape(*orig[:-1], self.out_features).to(out_dtype)
         if order is not None:
             starts, general = self._mma_extra[bf16_mode]
             ei, ev = (self.esc_idx_bf16, self.esc_vals_bf16) if bf16_mode else (self.esc_idx, self.esc_vals)
@@ -458,6 +467,8 @@ class QVBandLinearV8(nn.Module):
 # Largest row count sent to ext.mma_multi (16 = the old limit). Clamped to the kernel's own limit (48 = 6 token
 # groups of 8): a larger value would make the launcher's TORCH_CHECK fail at run time.
 _MMA_MAX_M = max(8, min(48, int(__import__("os").environ.get("QV_MMA_MAX_M", "48"))))
+# Row counts up to this run as several mma passes of <= _MMA_MAX_M rows (see forward); above it the decode-once GEMM wins.
+_MMA_SPLIT_MAX = 2 * _MMA_MAX_M
 
 
 def _gemv_split(ids: torch.Tensor, M: int) -> bool:

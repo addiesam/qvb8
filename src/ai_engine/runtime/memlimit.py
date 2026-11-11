@@ -173,7 +173,8 @@ def _apply_vram_limit(max_gb: float, *, verbose: bool) -> bool:
         want_bytes = int(max_gb * 1e9)
         VRAM_CEILING_BYTES = want_bytes
 
-        total_bytes = torch.cuda.get_device_properties(0).total_memory
+        cards = _pipeline_cards() or [0]        # pipeline placement: the ceiling applies to EVERY card
+        total_bytes = min(torch.cuda.get_device_properties(c).total_memory for c in cards)
         # Guard 1 sits ABOVE the poll ceiling on purpose. Setting the
         # allocator fraction to exactly want_bytes made the two guards
         # coincide: the allocator raised OutOfMemoryError AT the ceiling, so
@@ -191,11 +192,13 @@ def _apply_vram_limit(max_gb: float, *, verbose: bool) -> bool:
         fraction = min(cap_bytes / total_bytes, 1.0)
         fraction_applied = fraction < 1.0
         if fraction_applied:
-            torch.cuda.set_per_process_memory_fraction(fraction, device=0)
+            for c in cards:
+                torch.cuda.set_per_process_memory_fraction(
+                    min(cap_bytes / torch.cuda.get_device_properties(c).total_memory, 1.0), device=c)
 
         if verbose:
             if fraction_applied:
-                print(f"[mem] VRAM ceiling {max_gb:g} GB: per-step poll at "
+                print(f"[mem] VRAM ceiling {max_gb:g} GB{' per card ' + str(cards) if len(cards) > 1 else ''}: per-step poll at "
                       f"{want_bytes/1e9:.1f} GB (clean stop) + allocator "
                       f"hard cap {cap_bytes/1e9:.1f} GB "
                       f"({fraction:.1%} of {total_bytes/1e9:.0f} GB, catches a "
@@ -222,6 +225,13 @@ def _apply_vram_limit(max_gb: float, *, verbose: bool) -> bool:
         return False
 
 
+def _pipeline_cards() -> list[int]:
+    """The card indices of a pipeline placement (QV_PIPELINE, --pipeline), or [] for one card."""
+    from qv_band.run.placement import requested
+    devs = requested()                      # validated (cuda:N each, >= 2 cards), clear error otherwise
+    return sorted({int(d.split(":")[1]) for d in devs}) if devs else []
+
+
 def vram_abort_check(plan=None) -> bool:
     """Zero-arg callable for speculative_generate(abort_check=...): returns
     True once live accelerator memory has reached the --max-memory-gb ceiling,
@@ -237,6 +247,10 @@ def vram_abort_check(plan=None) -> bool:
     """
     if VRAM_CEILING_BYTES is None:
         return False
+    cards = _pipeline_cards()
+    if cards:                                   # --max-memory-gb is per card: stop when ANY card reaches it
+        import torch
+        return max(torch.cuda.memory_allocated(c) for c in cards) >= VRAM_CEILING_BYTES
     from ai_engine.runtime.device import resolve_device, vram_used_bytes
     plan = plan or resolve_device("auto")
     return vram_used_bytes(plan) >= VRAM_CEILING_BYTES

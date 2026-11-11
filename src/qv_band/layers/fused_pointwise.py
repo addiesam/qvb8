@@ -1,4 +1,5 @@
-"""Fused element-wise kernels for Ripple prefill (v1).
+"""Layer kind: fused element-wise Triton kernels (clamped-SiLU MLP activation, RMSNorm, RoPE, sigmoid gate).
+Written for Ripple prefill; the adapter names the module classes to bind (install_fused).
 
 Profile of one 4096-token prefill chunk on the dev GPU (13.2 s GPU): GEMMs 6.9 s, weight decode 1.0 s, and ~2.5 s in
 the two ops below, each written in the shipped modeling file as 4-6 separate full-tensor passes:
@@ -14,7 +15,7 @@ Numerics follow the reference op by op, in fp32 with the same rounding points:
   * RMSNorm: the row sum of squares is reduced in a different order than torch's mean kernel, so the
     normalised value can differ in the last bit (|rel| ~1e-7 before the bf16 rounding). Not bit-identical.
 
-Installed by models/ripple/runtime.install (Ripple only; Qwen and the shared modeling code are untouched).
+Installed by a model adapter (today: models/ripple/adapter.py).
 QV_RIPPLE_FUSED=0 turns it off.
 """
 from __future__ import annotations
@@ -79,19 +80,19 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return out
 
 
-def install_fused(model) -> int:
-    """Swap the forward of every RicursiveMLP / RicursiveRMSNorm instance. Returns how many modules."""
+def install_fused(model, mlp_class: str, norm_class: str) -> int:
+    """Swap the forward of every module whose class is named `mlp_class` / `norm_class`. Returns how many modules."""
     if os.environ.get("QV_RIPPLE_FUSED", "1") == "0" or not torch.cuda.is_available():
         return 0
     n = 0
     for mod in model.modules():
         name = type(mod).__name__
-        if name == "RicursiveMLP":
+        if name == mlp_class:
             def fwd(x, _m=mod):
                 return _m.down_proj(mlp_act(_m.gate_proj(x), _m.up_proj(x), _m.clamp_threshold))
             mod.forward = fwd
             n += 1
-        elif name == "RicursiveRMSNorm":
+        elif name == norm_class:
             def fwd(x, _m=mod):
                 if not x.is_cuda:
                     return type(_m).forward(_m, x)
@@ -101,7 +102,7 @@ def install_fused(model) -> int:
     return n
 
 
-# -- attention-side element-wise ops (used by models/ripple/attention.py) -------------------------------------
+# -- attention-side element-wise ops (used by layers/sliding_attention.py) -------------------------------------
 @triton.jit
 def _rope_kernel(x_ptr, cos_ptr, sin_ptr, o_ptr, H, D: tl.constexpr):
     # x, o: (B*T*H, D) contiguous rows; cos/sin: (B*T, D). OLMo-core RoPE in fp32:

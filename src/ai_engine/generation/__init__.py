@@ -26,7 +26,7 @@ ai_engine for nothing, while ai_engine's servers imported straight back.
 """
 from ai_engine.generation.gen_core import (          # noqa: F401
     DEFAULTS, DRAFTER_CHOICES, KV_CACHE_CHOICES, KV_CACHE_PRESETS,
-    NO_ABORT, DrafterBuildError, GenParams, ModelBundle,
+    DrafterBuildError, GenParams, ModelBundle,
     add_generation_args, apply_kv_shadow, build_drafter, encode_prompt,
     kv_shadow_covers_tokens, parse_kv_shadow, load_model,
     params_from_args, resolve_device, run_generate,
@@ -38,7 +38,7 @@ from ai_engine.generation.loader import (            # noqa: F401
 __all__ = [
     # gen_core
     "DEFAULTS", "DRAFTER_CHOICES", "KV_CACHE_CHOICES", "KV_CACHE_PRESETS",
-    "NO_ABORT", "DrafterBuildError", "GenParams",
+    "DrafterBuildError", "GenParams",
     "ModelBundle", "add_generation_args", "apply_kv_shadow", "build_drafter",
     "encode_prompt", "kv_shadow_covers_tokens", "parse_kv_shadow",
     "load_model", "params_from_args", "resolve_device", "run_generate",

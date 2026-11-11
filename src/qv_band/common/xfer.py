@@ -8,7 +8,7 @@ GPUs: the copy silently delivers zeros and the card then MMU-faults (seen on
 until reboot). Pipeline placement only moves small tensors between cards --
 the hidden state at a stage boundary, rotary cos/sin, a few weights at load --
 so staging them through host memory costs microseconds and never touches the
-peer path. NCCL (tensor parallel) detects this itself and is unaffected.
+peer path.
 """
 from __future__ import annotations
 

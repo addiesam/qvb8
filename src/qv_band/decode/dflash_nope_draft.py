@@ -1,4 +1,5 @@
-"""Ripple-65B DFlash2 drafter (ricursiveAI/Ripple-65B-Preview-DFlash2).
+"""Drafter kind: DFlash2 with NoPE layers (drafter config `no_rope_layers`). build_dflash_drafter selects it from
+the drafter's config. Used by: ricursiveAI/Ripple-65B-Preview-DFlash2.
 
 Written as a SEPARATE module so the Qwen DFlash2 implementation (dflash_draft.py) stays untouched.
 Differences from the Qwen drafter, all handled here:
@@ -20,7 +21,7 @@ import torch.nn.functional as F
 from qv_band.decode.dflash_draft import DFlashDrafter, _lin, _rms
 
 
-class RippleDFlashDrafter(DFlashDrafter):
+class NoPEDFlashDrafter(DFlashDrafter):
     def __init__(self, draft_dir, embed, lm_head, **kw):
         super().__init__(draft_dir, embed, lm_head, **kw)
         cfg = json.load(open(os.path.join(draft_dir, "config.json")))
@@ -171,11 +172,11 @@ class RippleDFlashDrafter(DFlashDrafter):
 
 
 
-def build_ripple_drafter(model, draft_dir, device="cuda", pack_dir=None):
-    """Bind a Ripple DFlash2 checkpoint to a loaded Ripple target (its embedding and lm_head)."""
+def build_nope_drafter(model, draft_dir, device="cuda", pack_dir=None):
+    """Bind a NoPE DFlash2 checkpoint to a loaded target (its embedding and lm_head)."""
     cfg = json.load(open(os.path.join(draft_dir, "config.json")))
     n_target = model.config.num_hidden_layers
-    d = RippleDFlashDrafter(draft_dir, model.get_input_embeddings(), model.get_output_embeddings(),
+    d = NoPEDFlashDrafter(draft_dir, model.get_input_embeddings(), model.get_output_embeddings(),
                             device=device, pack_dir=pack_dir)
     if cfg.get("num_target_layers", n_target) != n_target or max(d.capture_layers) >= n_target:
         raise ValueError(f"{draft_dir} was trained for a {cfg.get('num_target_layers')}-layer target, "
@@ -185,6 +186,6 @@ def build_ripple_drafter(model, draft_dir, device="cuda", pack_dir=None):
     if os.environ.get("QV_DRAFT_EMBED_SCALE", "0") == "1":
         d.embed_mult = float(getattr(model.config, "embed_scale", None) or 1.0)
         print(f"drafter: block embeddings x {d.embed_mult:.4f} (target embed_scale)", flush=True)
-    print(f"Ripple DFlash2 drafter: {d.param_bytes/1e9:.2f} GB on {device}, block {d.block_size}, "
+    print(f"NoPE DFlash2 drafter: {d.param_bytes/1e9:.2f} GB on {device}, block {d.block_size}, "
           f"target layers {d.capture_layers}, NoPE layers {sorted(d.no_rope)}", flush=True)
     return d

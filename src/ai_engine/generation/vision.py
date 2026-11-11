@@ -561,14 +561,16 @@ class VisionAdapter:
 
 
 def adapter(bundle, drafter=None):
-    """Lazily build (once) the vision adapter for the served bundle. Nemotron-H models get their own adapter
-    (vision_nemotron.py: C-RADIO tower, same generate() contract); `drafter` is the server's speculative drafter,
+    """Lazily build (once) the vision adapter for the served bundle. A model whose adapter names one gets that
+    (e.g. vision_cradio.py: C-RADIO tower, same generate() contract); `drafter` is the server's speculative drafter,
     used by that adapter's decode loop."""
     global _ADAPTER
     if _ADAPTER is None or _ADAPTER.bundle is not bundle:
-        if getattr(bundle.model, "_qv_nemotron", False):
-            from ai_engine.generation.vision_nemotron import NemotronVisionAdapter
-            _ADAPTER = NemotronVisionAdapter(bundle, drafter)
+        _ma = getattr(bundle.model, "_qv_adapter", None)
+        if _ma is not None and _ma.vision_adapter:      # the model's adapter names another image-input kind
+            import importlib
+            mod, cls = _ma.vision_adapter.split(":")
+            _ADAPTER = getattr(importlib.import_module(mod), cls)(bundle, drafter)
         else:
             _ADAPTER = VisionAdapter(bundle)
     return _ADAPTER

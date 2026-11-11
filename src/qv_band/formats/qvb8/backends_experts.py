@@ -1,352 +1,25 @@
-"""QVB8 sharded / CPU / expert-stack backends.
+"""QVB8 CPU / expert-stack backends.
 
-The tensor-parallel, CPU and MoE-expert readers the format registry
-(common/formats.py) offers for QVB8: same constructor keywords and
-`from_packfile` signature as QVBandLinearV8, so nothing downstream has to know
-which reader it holds.
-
-QVB8 makes all three simple for one reason: a row is self-contained. Its
-origin (min_s), its width (nbits) and its bit offset are per row, so a row
-slice is just an array slice -- no codebook to re-base, no anchors to
-recompute.
+The CPU and MoE-expert readers the format registry (common/formats.py) offers for QVB8: same constructor keywords
+and `from_packfile` signature as QVBandLinearV8, so nothing downstream has to know which reader it holds.
 """
 from __future__ import annotations
 
 
 import numpy as np
-import numpy as np
 import torch
 import torch.nn as nn
 
-from qv_band.formats.qvb8.module import QVBandLinearV8, _load_ext, forward_gemv
-
-
-def shard_bounds(Q: int, world: int, rank: int) -> tuple[int, int, int]:
-    """Even row split with a fixed per-rank stride (ceil) so every rank's output
-    has the same width for all_gather; the last rank is zero-padded.
-    Returns (start, end, stride), where end - start may be < stride on the tail."""
-    stride = -(-Q // world)  # ceil
-    start = min(rank * stride, Q)
-    end = min(start + stride, Q)
-    return start, end, stride
-
-
-def _unpack_blob(blob: bytes):
-    """(min_s, tau_s, nbits, bit_off, buf, Q, P, tau, esc_idx, esc_vals) of a pack blob,
-    whichever container it is in: the current one (magic QVBD, pack_container.py) or
-    the legacy standalone QVB8 blob."""
-    if blob[:4] == b"QVBD":
-        from qv_band.formats.qvb8.pack_container import unpack_formula
-        d = unpack_formula(blob, skip_bit_decode=True)
-        # The sharded GEMV decodes in fp16/fp32. Blob only (no path, so no escape_tables.json): the pack's full list,
-        # exact values -- correct; an fp16 run of an fp16+bf16 pack is refused up front (require_fp16_tables).
-        return (d["min_s"], d["tau_s"], d["nbits"], d["bit_off"], d["buf"],
-                d["Q"], d["P"], d["tau"], d["esc_idx"], d["esc_vals"])
-    from qv_band.formats.qvb8.pack import unpack_tensor
-    return unpack_tensor(blob)
+from qv_band.formats.qvb8.module import QVBandLinearV8, _load_ext
 
 
 def _blob_shape(blob: bytes) -> tuple[int, int]:
-    """(Q, P) from the header alone, for either container (see _unpack_blob)."""
+    """(Q, P) from the header alone, for either container (QVBD or the legacy standalone QVB8 blob)."""
     if blob[:4] == b"QVBD":
         from qv_band.formats.qvb8.pack_container import _unpack_header
         return _unpack_header(blob)[:2]
     from qv_band.formats.qvb8.pack import read_header
     return read_header(blob)[:2]
-
-
-def _slice_rows(blob: bytes, start: int, end: int):
-    """The QVB8 fields for rows [start, end), as a self-contained slice.
-
-    The bit payload is REPACKED to hold only these rows. Handing over the
-    whole buffer and keeping the original offsets would also decode
-    correctly -- rows are independent -- but then every rank of a
-    tensor-parallel run holds the entire payload, which is exactly what
-    sharding exists to avoid (measured: a 0.92 GiB lm_head would cost
-    6.4 GiB across 8 ranks instead of 0.92 GiB).
-
-    Row widths vary, so the slice is rebuilt bit by bit rather than cut at
-    a byte boundary: row r's field starts at an arbitrary bit, and only
-    row 0 of the slice is guaranteed to land anywhere convenient.
-    """
-    import numpy as np
-    (min_s, tau_s, nbits, bit_off, buf, Q, P, tau,
-     esc_idx, esc_vals) = _unpack_blob(blob)
-    if not (0 <= start < end <= Q):
-        raise ValueError(f"row slice [{start}, {end}) out of range for Q={Q}")
-
-    sub_nbits = nbits[start:end]
-    # Rows are bit-contiguous (pack_bits_rows), so the slice is one byte
-    # range with the offsets rebased by a whole number of bytes: the
-    # sub-byte phase of each row is preserved and the reader strides by bit
-    # offset anyway. Decoding to ids and repacking gave the same bytes at
-    # ~100x the CPU cost (it dominated tensor-parallel load time).
-    bit_off64 = bit_off[start:end].astype(np.int64)
-    byte_lo = int(bit_off64[0]) >> 3
-    bit_hi = int(bit_off64[-1]) + int(sub_nbits[-1]) * P
-    byte_hi = (bit_hi + 7) >> 3
-    sub_buf = np.zeros(byte_hi - byte_lo + 8, dtype=np.uint8)  # 8B read pad
-    sub_buf[:byte_hi - byte_lo] = buf[byte_lo:byte_hi]
-    sub_off = (bit_off64 - (byte_lo << 3)).astype(np.uint64)
-
-    keep = (esc_idx >= start * P) & (esc_idx < end * P)
-    return {
-        "min_s": min_s[start:end],
-        "nbits": sub_nbits,
-        "bit_off": sub_off,
-        "ids": sub_buf,
-        "Q": end - start,
-        "P": P,
-        "tau_s": tau_s[start:end],
-        # Escape positions are flat (row*P + col), so they rebase by the
-        # same row shift.
-        "esc_idx": esc_idx[keep] - start * P,
-        "esc_vals": esc_vals[keep],
-    }
-
-
-class QVBandShardedLinearV8(nn.Module):
-    """Output-row-sharded QVB8 linear.
-
-    Each rank holds rows [start, end) and computes that slice of Y;
-    forward() all-gathers the ranks' columns into the full output, so the
-    rest of the model sees an ordinary replicated activation. Same
-    contract as a row-parallel linear: each rank holds rows [start, end).
-
-    A row slice is exact here by construction: every row is banded against
-    its OWN min and width, so rows never share state that would have to be
-    re-derived for a subset.
-    """
-
-    def __init__(self, packfile: str, *, rank: int, world: int,
-                 device: str = "cuda", bias=None):
-        super().__init__()
-        with open(packfile, "rb") as fh:
-            blob = fh.read()
-        Q = _blob_shape(blob)[0]
-        start, end, stride = shard_bounds(Q, world, rank)
-        self.rank, self.world, self.stride = rank, world, stride
-        self.shard_start, self.shard_end = start, end
-        self._local_rows = end - start
-
-        f = _slice_rows(blob, start, end)
-        dev = torch.device(device)
-        self.in_features = int(f["P"])
-        self.out_features = int(Q)          # the FULL output width
-        self.local_out_features = int(f["Q"])
-        self.register_buffer("tau_s",
-                             torch.from_numpy(f["tau_s"]).to(dev),
-                             persistent=False)
-        self.register_buffer("min_s", torch.from_numpy(f["min_s"]).to(dev),
-                             persistent=False)
-        self.register_buffer("nbits",
-                             torch.from_numpy(f["nbits"].astype(np.uint8)).to(dev),
-                             persistent=False)
-        self.register_buffer("bit_off",
-                             torch.from_numpy(f["bit_off"].astype(np.int64)).to(dev),
-                             persistent=False)
-        self.register_buffer("ids", torch.from_numpy(f["ids"]).to(dev),
-                             persistent=False)
-        self.register_buffer("esc_idx",
-                             torch.from_numpy(f["esc_idx"].astype(np.int64)).to(dev),
-                             persistent=False)
-        self.register_buffer("esc_vals",
-                             torch.from_numpy(f["esc_vals"].astype(np.float32)).to(dev),
-                             persistent=False)
-        self.bias = None if bias is None else nn.Parameter(bias.to(dev),
-                                                           requires_grad=False)
-
-    @classmethod
-    def from_packfile(cls, packfile: str, *, rank: int, world: int,
-                      bias=None, device: str = "cuda"):
-        # Keyword order is rank/world first so a
-        # caller can swap the class without touching the call site.
-        return cls(packfile, rank=rank, world=world, device=device, bias=bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        import torch.distributed as dist
-        ext = _load_ext()
-        orig = x.shape
-        x2d = x.reshape(-1, orig[-1])
-        if x2d.device != self.min_s.device:
-            x2d = x2d.to(self.min_s.device)
-        M = x2d.shape[0]
-
-        if self._local_rows > 0:
-            local = forward_gemv(ext, x2d.contiguous(), self.ids, self.min_s,
-                                 self.nbits, self.bit_off, self.in_features,
-                                 self.tau_s, self.esc_idx, self.esc_vals
-                                 ).to(x.dtype)
-        else:
-            # A rank past the end of the tensor owns no rows at all, which
-            # happens whenever world does not divide Q.
-            local = torch.zeros(M, 0, dtype=x.dtype, device=x2d.device)
-
-        # Zero-pad to the common stride so every rank contributes an equal-size
-        # chunk; the padding is trimmed after the gather. shard_bounds gives the
-        # LAST rank fewer rows whenever world does not divide Q (e.g. Q=10240
-        # over 3 ranks -> 3414/3414/3412), and the collective requires
-        # identical shapes, so this is not optional.
-        if local.shape[1] < self.stride:
-            pad = torch.zeros(M, self.stride - local.shape[1],
-                              dtype=local.dtype, device=local.device)
-            local = torch.cat([local, pad], dim=1)
-
-        if self.world > 1:
-            # This rank only holds rows [start, end), so the remaining
-            # output columns live on other ranks and MUST be gathered.
-            # Returning `local` without a process group would silently hand
-            # back a truncated activation, so fail loudly instead.
-            if not dist.is_initialized():
-                raise RuntimeError(
-                    f"{type(self).__name__} was built with world={self.world} "
-                    f"but torch.distributed is not initialised -- this rank "
-                    f"holds only rows [{self.shard_start}, {self.shard_end}) "
-                    f"of {self.out_features} and cannot complete the output.")
-            # ONE collective into one buffer. The list form of all_gather
-            # allocates `world` tensors, copies each way, and needs a cat
-            # afterwards: per linear that is a dozen extra launches, and a
-            # decode step has ~500 linears on a CPU-bound path.
-            gathered = torch.empty(self.world, M, self.stride,
-                                   dtype=local.dtype, device=local.device)
-            dist.all_gather_into_tensor(gathered, local.contiguous())
-            y = gathered.permute(1, 0, 2).reshape(
-                M, self.world * self.stride)[:, :self.out_features]
-        else:
-            y = local[:, :self.out_features]
-
-        y = y.reshape(*orig[:-1], self.out_features)
-        if self.bias is not None:
-            y = y + self.bias.to(y.dtype)
-        return y.to(x.dtype)
-
-
-class _FusedMember(nn.Module):
-    """Stands in for one projection of a QVBandFusedShardedGroup."""
-
-    def __init__(self, group, idx: int, in_features: int, out_features: int):
-        super().__init__()
-        object.__setattr__(self, "_group", group)     # not a registered child
-        self._idx = idx
-        self.in_features = in_features
-        self.out_features = out_features
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._group.member_forward(self._idx, x)
-
-
-class QVBandFusedShardedGroup:
-    """Several QVBandShardedLinearV8 that read the SAME input, run as one.
-
-    A decode step is bound by launch count and by the collective after every
-    sharded linear (~500 per token on a 27B), not by the weight kernel. The
-    projections of one block that share an input (qkv/z/b/a, q/k/v, gate/up)
-    are therefore concatenated row-wise into one pack: ONE kernel call and
-    ONE all_gather give every member's output. Rows are independent in QVB8,
-    so the result is bit-identical to running the members separately.
-
-    The first member called computes everything; the others take their slice
-    from the cache, which is released once every member has been served.
-    Keyed on the input tensor's identity+version, and holding a reference to
-    it, so a different tensor can never be mistaken for the cached one.
-    """
-
-    def __init__(self, members: list):
-        m0 = members[0]
-        self.world, self.rank = m0.world, m0.rank
-        self.in_features = m0.in_features
-        self.strides = [m.stride for m in members]
-        self.outs = [m.out_features for m in members]
-        self.locals = [m.local_out_features for m in members]
-        dev = m0.min_s.device
-        P = self.in_features
-        ids, bit_off, esc_idx, esc_vals = [], [], [], []
-        byte_base = row_base = 0
-        for m in members:
-            ids.append(m.ids)
-            bit_off.append(m.bit_off + 8 * byte_base)
-            esc_idx.append(m.esc_idx + row_base * P)
-            esc_vals.append(m.esc_vals)
-            byte_base += m.ids.numel()
-            row_base += m.local_out_features
-        self.ids = torch.cat(ids)
-        self.bit_off = torch.cat(bit_off)
-        self.esc_idx = torch.cat(esc_idx)
-        self.esc_vals = torch.cat(esc_vals)
-        self.min_s = torch.cat([m.min_s for m in members])
-        self.tau_s = torch.cat([m.tau_s for m in members])
-        self.nbits = torch.cat([m.nbits for m in members])
-        self.device = dev
-        self._n = len(members)
-        self._key = None
-        self._x = None
-        self._out = None
-        self._left = 0
-
-    def _compute(self, x: torch.Tensor):
-        import torch.distributed as dist
-        ext = _load_ext()
-        x2d = x.reshape(-1, x.shape[-1])
-        M = x2d.shape[0]
-        local = forward_gemv(ext, x2d.contiguous(), self.ids, self.min_s, self.nbits,
-                             self.bit_off, self.in_features, self.tau_s,
-                             self.esc_idx, self.esc_vals).to(x.dtype)
-        # local is (M, sum(local rows)); every member divides evenly by world
-        # (checked when the group is built), so local rows == stride.
-        gathered = torch.empty(self.world, M, local.shape[1],
-                               dtype=local.dtype, device=local.device)
-        dist.all_gather_into_tensor(gathered, local.contiguous())
-        outs, off = [], 0
-        for stride, out_f in zip(self.strides, self.outs):
-            part = gathered[:, :, off:off + stride]
-            outs.append(part.permute(1, 0, 2).reshape(M, self.world * stride)[:, :out_f])
-            off += stride
-        return outs
-
-    def member_forward(self, idx: int, x: torch.Tensor) -> torch.Tensor:
-        key = (x.data_ptr(), x._version, tuple(x.shape), x.dtype)
-        if self._key != key or self._left <= 0:
-            self._out = self._compute(x)
-            self._key, self._x, self._left = key, x, self._n
-        y = self._out[idx]
-        self._left -= 1
-        if self._left <= 0:
-            self._key = self._x = self._out = None
-        return y.reshape(*x.shape[:-1], self.outs[idx])
-
-
-# Projections of one block that consume the same hidden state.
-_FUSE_GROUPS = (("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
-                ("q_proj", "k_proj", "v_proj"),
-                ("gate_proj", "up_proj"))
-
-
-def fuse_sharded_siblings(model) -> int:
-    """Replace each group of sibling QVBandShardedLinearV8 by fused members.
-    Returns the number of groups fused. Skips any group whose shards are not
-    all even across the ranks or that carries a bias."""
-    n = 0
-    # Hold only the PARENT modules: a list of every module would keep the old
-    # per-projection weights alive while their fused copies are built.
-    parents = [mod for mod in model.modules()
-               if any(hasattr(mod, nms[0]) for nms in _FUSE_GROUPS)]
-    for module in parents:
-        for names in _FUSE_GROUPS:
-            subs = [getattr(module, nm, None) for nm in names]
-            if not all(isinstance(m, QVBandShardedLinearV8) for m in subs):
-                continue
-            w = subs[0].world
-            if (w < 2 or any(m.bias is not None for m in subs)
-                    or any(m.out_features % w for m in subs)
-                    or len({m.in_features for m in subs}) != 1):
-                continue
-            group = QVBandFusedShardedGroup(subs)
-            for i, (nm, m) in enumerate(zip(names, subs)):
-                setattr(module, nm, _FusedMember(group, i, m.in_features,
-                                                 m.out_features))
-            del subs, m
-            n += 1
-    return n
 
 
 class QVBandLinearCPUV8(nn.Module):
@@ -521,13 +194,28 @@ class QVBandExpertsV8(nn.Module):
         self._stk = (stack(gu), stack(dn))
         return True
 
-    # Above this many tokens the per-expert GEMM path (decode + cuBLAS) wins.
+    # Up to this many tokens the fused kernel (attention-free, one launch per projection) runs; above it the
+    # per-expert GEMM loop. The loop costs about the same from 16 to 64 tokens (one host sync + up to 2 x experts
+    # GEMMs per layer), the fused kernel grows with the tokens. Measured on the dev GPU (35B-A3B, DFlash K=8, ms per step,
+    # scheduler, 2026-11-10): 2 requests (16 tok) 261 loop / 128 fused; 3 (24 tok) 288 / 163; 6 (48 tok) 421 / 313;
+    # 8 (64 tok) 447 / 362; one request 85 either way. So several users share a step only when the limit covers
+    # their tokens. sm_70 (V100) keeps 8: not measured there.
     FUSED_MAX_TOKENS = 8
+    FUSED_MAX_TOKENS_SM80 = 64
+    _limit_by_dev: dict = {}
+
+    @classmethod
+    def fused_max_tokens(cls, device) -> int:
+        lim = cls._limit_by_dev.get(device)
+        if lim is None:
+            sm80 = device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8
+            lim = cls._limit_by_dev[device] = cls.FUSED_MAX_TOKENS_SM80 if sm80 else cls.FUSED_MAX_TOKENS
+        return lim
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor) -> torch.Tensor:
         n_tok = top_k_index.shape[0]
-        if (n_tok <= self.FUSED_MAX_TOKENS and hidden_states.is_cuda
+        if (hidden_states.is_cuda and n_tok <= self.fused_max_tokens(hidden_states.device)
                 and self.build_stack()):
             g, d = self._stk
             return _load_ext().moe_experts(

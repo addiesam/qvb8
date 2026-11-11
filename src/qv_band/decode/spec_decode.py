@@ -448,9 +448,10 @@ def _mem_breakdown(past, drafter) -> str:
                     for t in (b.min_s, b.tau_s):
                         if isinstance(t, torch.Tensor) and t.is_cuda:
                             meta_gpu += t.numel() * t.element_size()
-        f = getattr(L, "_fused", None)
-        if f is not None and f.ki is not None:
-            fused += 2 * f.ki.numel() * f.ki.element_size()
+        for f in getattr(L, "_fused_slots", None) or []:
+            if f is not None and f.ki is not None:
+                fused += 2 * f.ki.numel() * f.ki.element_size()
+                fused += sum(t.numel() for t in (f.hk, f.hv) if t is not None)
         for r in (getattr(L, "_resid_k", None) or []) + (getattr(L, "_resid_v", None) or []):
             resid += r.numel() * r.element_size()
     d = getattr(drafter, "dflash", drafter)
@@ -492,17 +493,6 @@ def _mem_groups() -> str:
         return "baseline set"
     return (("new: " if new_only else "top: ") + f"{sum(agg.values())/1e6:.0f}MB in {len(agg)} groups; "
             + "; ".join(f"{k[0]} {k[1][6:]} {v/1e6:.0f}MB" for k, v in agg.most_common(12)))
-
-
-def _over_vram_ceiling() -> bool:
-    """This rank's own VRAM-ceiling check for a tensor-parallel decode step.
-
-    QV_VRAM_CEILING_GB is the server's --max-memory-gb, exported for every
-    rank (a follower has no abort_check of its own). Unset: never over."""
-    ceiling = os.environ.get("QV_VRAM_CEILING_GB")
-    if not ceiling or not torch.cuda.is_available():
-        return False
-    return torch.cuda.memory_allocated() > float(ceiling) * 1e9
 
 
 def _rss_gb() -> float:
@@ -568,9 +558,8 @@ class MTPDrafter:
         """Give the head its own attention context over the last `window`
         positions (built from the main model's hidden states). Returns False
         -- leaving the one-row-at-a-time behaviour -- for heads that cannot do
-        it (tensor-parallel launches, heads without forward_ctx) or when window <= 0."""
-        if (window <= 0 or int(os.environ.get("WORLD_SIZE", "1")) > 1
-                or not hasattr(self.head, "forward_ctx")):
+        it (heads without forward_ctx) or when window <= 0."""
+        if window <= 0 or not hasattr(self.head, "forward_ctx"):
             return False
         self.ctx_window = int(window)
         return True
@@ -704,42 +693,6 @@ class MTPDrafter:
         if self.hidden is None:
             return [], None
 
-        # Tensor-parallel launch (torchrun, WORLD_SIZE>1): self.lm_head is
-        # the base model's real output projection, SHARDED under TP (see
-        # sharded.py) -- every rank must call it for its internal
-        # dist.all_gather to complete, so this loop cannot just run on rank
-        # 0 and broadcast the final result (that leaves every other rank's
-        # all_gather waiting forever for a call that never comes -- the
-        # exact hang this comment is here to explain avoiding).
-        #
-        # self.head/self.embed, however, are plain UNSHARDED QVBandLinearV8
-        # (see build_drafter_cuda/load_mtp_cuda) -- a small model replicated
-        # in full on every rank, run independently with no collective to
-        # keep it in lockstep. Measured: this silently diverges between the
-        # two physical GPUs a few decode steps into a real generation (same
-        # last_token, same pos, same hidden in -- different token out),
-        # ordinary GEMM reduction-order float noise, not a logic bug. Once
-        # `tid` (or `h`, next iteration) diverges, `self.lm_head`'s eventual
-        # argmax over its (still all_gathered, still consistent) logits
-        # sees DIFFERENT logits per rank and picks different tokens too --
-        # the desync compounds and the ranks build different-length `seq`
-        # tensors a few steps later, which is what actually deadlocks the
-        # verification forward's own all_gather (mismatched shapes across
-        # ranks in one collective).
-        #
-        # Fix: every rank still calls lm_head (keeping the collective
-        # satisfied), but after each position the DECIDED token (argmax, or
-        # the sampled draft at temperature>0) is broadcast from rank 0 and
-        # every other rank overwrites its own local pick with it before
-        # advancing -- so what actually reaches self.head next step, and
-        # what ends up in `draft`, is byte-identical on every rank by
-        # construction, regardless of whether the unsharded head's own
-        # float math agreed.
-        tp_world = int(os.environ.get("WORLD_SIZE", "1"))
-        tp_active = tp_world > 1
-        if tp_active:
-            import torch.distributed as dist
-
         out: list[int] = []
         logits_out: list[torch.Tensor] | None = [] if temperature > 0 else None
         h, tid = self.hidden, last_token
@@ -757,10 +710,6 @@ class MTPDrafter:
                     tid = _select(lg, temperature, top_k, top_p)
                 else:
                     tid = int(lg.argmax())
-            if tp_active:
-                box = [tid]
-                dist.broadcast_object_list(box, src=0)
-                tid = box[0]
             if temperature > 0:
                 logits_out.append(lg)
             out.append(tid)
@@ -1032,9 +981,11 @@ def _pipe_prefill(model, past):
     None (QV_PIPE_PREFILL=0, one card, no fused attention / CUDA kernel)."""
     if os.environ.get("QV_PIPE_PREFILL", "1") == "0":
         return None
-    split = int(os.environ.get("QV_PIPELINE_SPLIT", "0") or 0)
-    if split <= 0 or past is None:
+    pl = getattr(model, "_qv_placement", None)
+    # the overlapped prefill has two stages: exactly two distinct cards (N-stage: unified_scheduler.md 4.3)
+    if pl is None or len(pl.devices) != 2 or pl.devices[0] == pl.devices[1] or past is None:
         return None
+    split = pl.bounds[0]
     from qv_band.kv import banded_cache
     from qv_band.kv.fused_attn import _cuda_ext
     if not banded_cache.FUSED_ENABLED or not isinstance(past, banded_cache.BandedKVCache):
@@ -1312,7 +1263,7 @@ def _forward_with_hidden(model, input_ids, past_key_values, want_hidden: bool,
     handles = [_resolve_final_norm(model).register_forward_pre_hook(_capture_pre_norm, with_kwargs=True)]
     layer_out: dict[int, torch.Tensor] = {}
     for li in capture_layers or ():
-        def _capture_layer(_module, _args, out, li=li):
+        def _capture_layer(_module, _args, out, li=li):     # tap layers may sit on other cards: gathered below (xfer)
             layer_out[li] = out[0] if isinstance(out, tuple) else out
         handles.append(model.model.layers[li].register_forward_hook(_capture_layer))
     try:
@@ -1400,7 +1351,7 @@ def _forward_batched_with_hidden(model, input_ids, attention_mask, position_ids,
     handles = [_resolve_final_norm(model).register_forward_pre_hook(_capture_pre_norm, with_kwargs=True)]
     layer_out: dict[int, torch.Tensor] = {}
     for li in capture_layers or ():
-        def _capture_layer(_module, _args, out, li=li):
+        def _capture_layer(_module, _args, out, li=li):     # tap layers may sit on other cards: gathered below (xfer)
             layer_out[li] = out[0] if isinstance(out, tuple) else out
         handles.append(model.model.layers[li].register_forward_hook(_capture_layer))
     try:
@@ -1447,12 +1398,6 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
     whatever was emitted so far, same return shape as a normal finish.
     Meant for a caller like serve.py's SSE handler to detect a client
     disconnect mid-stream (see its _peer_gone()).
-    Under TP (WORLD_SIZE>1) only rank 0's `abort_check` result is
-    meaningful -- e.g. it alone owns the client socket a disconnect check
-    reads from -- so it is broadcast to every rank alongside the existing
-    per-step token sync (see _tp_sync above); a non-rank-0 caller may pass
-    None here (its own abort_check is never consulted) and will still stop
-    exactly when rank 0's does.
 
     `on_heartbeat`: optional zero-arg callable, polled once per prefill
     chunk AND once per decode step, but only actually CALLED when
@@ -1545,35 +1490,6 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
     # batched and llm_apps/serve.py's scheduler branch construct their
     # own instance(s) directly (one per slot/request -- each stream needs
     # its own pending-id cache).
-
-    # Tensor-parallel launch (torchrun, WORLD_SIZE>1): res.logits comes from
-    # a sharded lm_head's all_gather (see sharded.py) -- correct in exact
-    # value on every rank in principle, but GEMM reduction order can differ
-    # by ordinary floating-point noise between two physical GPUs, occasionally
-    # enough to flip an argmax/comparison right at this loop's decision
-    # points (greedy accept-count, sampling accept/reject, the residual
-    # random draw). Once ONE rank's `n_acc`/`next_tok` differs from another's,
-    # `out_ids` (and therefore every later `seq` tensor fed into the model)
-    # diverges between ranks and desyncs every subsequent collective inside
-    # the sharded layers -- observed as the whole run hanging forever a few
-    # steps in. Broadcasting the decided values from rank 0 after they're
-    # computed makes every rank's outcome byte-identical by construction,
-    # the same fix MTPDrafter.propose() applies to its own decision point.
-    tp_world = int(os.environ.get("WORLD_SIZE", "1"))
-    tp_active = tp_world > 1
-    if tp_active:
-        import torch.distributed as dist
-
-        def _tp_sync(*vals):
-            """Broadcast `vals` (picklable, e.g. ints/None) from rank 0 to
-            every rank, returning them in the same order. No-op tuple
-            passthrough when not running under TP."""
-            box = [vals]
-            dist.broadcast_object_list(box, src=0)
-            return box[0]
-    else:
-        def _tp_sync(*vals):
-            return vals
 
     # Hidden states are only needed by a drafter that consumes them (MTP); the
     # n-gram drafter does not.
@@ -1833,18 +1749,8 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                         print("[mem-debug] " + _mem_breakdown(past, drafter),
                               file=sys.__stdout__, flush=True)
                     _last_print = _now
-                # abort_check between chunks: a disconnect or the VRAM
-                # ceiling can stop a long prefill partway. Under tensor
-                # parallelism every rank must stop on the SAME chunk (only
-                # rank 0 has abort_check; any rank may be over its VRAM
-                # ceiling), or the ranks still running wait in all-gathers
-                # for one that left -- same MAX all-reduce as the decode loop.
-                stop = abort_check is not None and bool(abort_check())
-                if tp_active:
-                    flag = torch.tensor([int(stop or _over_vram_ceiling())], device=ids.device)
-                    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-                    stop = bool(flag.item())
-                return stop
+                # abort_check between chunks: a disconnect or the VRAM ceiling can stop a long prefill partway.
+                return abort_check is not None and bool(abort_check())
 
             ci = 0
             while ci < len(_chunks):
@@ -2025,16 +1931,6 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                 t0 = time.perf_counter()
                 draft, draft_logits = drafter.propose(
                     out_ids[-1], k, temperature=temperature, top_k=top_k, top_p=top_p)
-                if tp_active:
-                    # Every rank must verify and emit the SAME draft. A drafter
-                    # that samples (DFlash at temperature > 0) draws from
-                    # rank-local RNG, and even its argmax can flip on GEMM float
-                    # noise between GPUs; n_acc/next_tok are synced below, but
-                    # emit = draft[:n_acc] + [next_tok] would still differ, the
-                    # ranks would hit EOS on different steps and every later
-                    # collective would desync. Rank 0's draft wins (only rank 0
-                    # uses draft_logits, in the acceptance test).
-                    (draft,) = _tp_sync(list(draft))
                 st.t_draft += time.perf_counter() - t0
                 st.proposed += len(draft)
 
@@ -2087,15 +1983,6 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                         break
                     n_acc += 1
                 next_tok = greedy[n_acc]
-                if tp_active:
-                    # res.logits is sharded-all_gather output: correct in
-                    # exact value in principle, but ordinary GEMM reduction-
-                    # order float noise between the two physical GPUs can
-                    # occasionally flip this argmax right at the boundary a
-                    # draft token was accepted/rejected on, diverging
-                    # out_ids (and therefore every later seq tensor) between
-                    # ranks -- see this function's top-of-body comment.
-                    n_acc, next_tok = _tp_sync(n_acc, next_tok)
             else:
                 # Speculative sampling (Leviathan et al. 2023 / Chen et al. 2023):
                 # accept each draft position with probability
@@ -2107,63 +1994,47 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                 # 0), which reduces acceptance to a coin flip at p_target(token);
                 # an MTP drafter run with temperature > 0 returns its real
                 # per-position logits, so the true draft distribution is used.
-                # Every random draw in this branch (random.random() here,
-                # and whatever _resample_residual/_select sample with) is
-                # rank-local RNG state -- under TP it would pick a different
-                # outcome per rank even given identical inputs, which is a
-                # SEPARATE divergence source from the GEMM float-noise this
-                # function's top comment describes. Rather than seed every
-                # rank's RNG in lockstep (fragile: any future change to how
-                # many draws happen inside this loop, or their order, would
-                # silently break sync again), only rank 0's draws are real;
-                # every rank's final (n_acc, next_tok) is broadcast from
-                # rank 0 below, same as the greedy branch, which is
-                # sufficient because nothing outside this block observes
-                # the loop's intermediate per-iteration state.
                 n_acc = 0
                 next_tok = None
-                if not tp_active or int(os.environ.get("RANK", "0")) == 0:
-                    for i, d in enumerate(draft):
-                        p_target = _probs(res.logits[0, i], temperature, top_k, top_p)
-                        # draft_logits (the whole list) not being None does
-                        # NOT mean every element is real: NGramWithMTPDrafter
-                        # pads n-gram-sourced positions with a per-element
-                        # None placeholder (see its propose()'s comment --
-                        # n-gram has no distribution, only a one-hot pick),
-                        # so a list that IS present can still hold None at
-                        # position i. Checking only the outer list crashed
-                        # here with `TypeError: unsupported operand type(s)
-                        # for /: 'NoneType' and 'float'` inside _probs the
-                        # first time a draft was ENTIRELY n-gram-sourced
-                        # (remaining <= 0 in NGramWithMTPDrafter.propose, so
-                        # MTP never even ran) -- _accept_prob/
-                        # _resample_residual already correctly treat
-                        # p_draft=None as "one-hot", they just never got the
-                        # chance because _probs(None, ...) raised first.
-                        _dl = draft_logits[i] if draft_logits is not None else None
-                        if _dl is None:
-                            p_draft = None
-                        elif draft_probs:
-                            # The drafter sampled from this exact
-                            # distribution (DFlash2's selector over its
-                            # top-k candidates); re-filtering it would make
-                            # p_draft differ from the real proposal.
-                            p_draft = _dl
-                        else:
-                            p_draft = _probs(_dl, temperature, top_k, top_p)
-                        if random.random() < _accept_prob(p_target, p_draft, d):
-                            n_acc += 1
-                        else:
-                            next_tok = _resample_residual(p_target, p_draft, d)
-                            break
-                    if next_tok is None:
-                        # Every drafted position was accepted (or there was no draft):
-                        # emit the target's own next token at the position after the
-                        # draft, sampled exactly as a plain step-by-step sample would
-                        # be.
-                        next_tok = _select(res.logits[0, n_acc], temperature, top_k, top_p)
-                if tp_active:
-                    n_acc, next_tok = _tp_sync(n_acc, next_tok)
+                for i, d in enumerate(draft):
+                    p_target = _probs(res.logits[0, i], temperature, top_k, top_p)
+                    # draft_logits (the whole list) not being None does
+                    # NOT mean every element is real: NGramWithMTPDrafter
+                    # pads n-gram-sourced positions with a per-element
+                    # None placeholder (see its propose()'s comment --
+                    # n-gram has no distribution, only a one-hot pick),
+                    # so a list that IS present can still hold None at
+                    # position i. Checking only the outer list crashed
+                    # here with `TypeError: unsupported operand type(s)
+                    # for /: 'NoneType' and 'float'` inside _probs the
+                    # first time a draft was ENTIRELY n-gram-sourced
+                    # (remaining <= 0 in NGramWithMTPDrafter.propose, so
+                    # MTP never even ran) -- _accept_prob/
+                    # _resample_residual already correctly treat
+                    # p_draft=None as "one-hot", they just never got the
+                    # chance because _probs(None, ...) raised first.
+                    _dl = draft_logits[i] if draft_logits is not None else None
+                    if _dl is None:
+                        p_draft = None
+                    elif draft_probs:
+                        # The drafter sampled from this exact
+                        # distribution (DFlash2's selector over its
+                        # top-k candidates); re-filtering it would make
+                        # p_draft differ from the real proposal.
+                        p_draft = _dl
+                    else:
+                        p_draft = _probs(_dl, temperature, top_k, top_p)
+                    if random.random() < _accept_prob(p_target, p_draft, d):
+                        n_acc += 1
+                    else:
+                        next_tok = _resample_residual(p_target, p_draft, d)
+                        break
+                if next_tok is None:
+                    # Every drafted position was accepted (or there was no draft):
+                    # emit the target's own next token at the position after the
+                    # draft, sampled exactly as a plain step-by-step sample would
+                    # be.
+                    next_tok = _select(res.logits[0, n_acc], temperature, top_k, top_p)
             st.accepted += n_acc
             if capture:
                 # Rows 0..n_acc of the verify batch are seq[0] + the accepted
@@ -2407,28 +2278,8 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
 
             _heartbeat.tick()
 
-            if abort_check is not None or tp_active:
-                # Only rank 0's abort_check result is meaningful (e.g. it
-                # alone owns the client socket a disconnect check reads
-                # from -- see this function's docstring), so broadcast the
-                # decision the same way n_acc/next_tok are above: every
-                # rank must stop on the SAME step, or the one that kept
-                # going desyncs every later collective waiting for a rank
-                # that already returned.
-                aborted = bool(abort_check()) if abort_check is not None else False
-                if tp_active:
-                    # Rank 0's decision, OR any rank over the VRAM ceiling:
-                    # abort_check only measures rank 0's card, and a follower
-                    # that runs out of memory raises, drops back to its
-                    # dispatch loop, and desyncs every later collective (seen
-                    # on 2x V100: card 1 full while card 0 still had room).
-                    # MAX over ranks lets the fuller card stop both cleanly.
-                    flag = torch.tensor([int(aborted or _over_vram_ceiling())],
-                                        device=ids.device)
-                    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-                    aborted = bool(flag.item())
-                if aborted:
-                    stop = True
+            if abort_check is not None and abort_check():
+                stop = True
             if stop:
                 break
         if _dp is not None:                  # the loop ended inside a profiled iteration: close it, or it stays on
@@ -2614,30 +2465,38 @@ def _seed_ngram_with_prompt(drafter, prompt_ids) -> None:
         ng.reset(prompt_ids)
 
 
-def _export_slot_state(past, bi: int):
-    """Slot `bi` of every cache layer, or None if some layer type is not supported."""
+_UNSUPPORTED = object()
+
+
+def _export_layer_slot(layer, bi: int):
+    """Slot `bi` of ONE cache layer, as an entry of _export_slot_state's list, or _UNSUPPORTED."""
     from transformers.cache_utils import DynamicLayer, LinearAttentionCacheLayerMixin
     from qv_band.kv.banded_cache import BandedKVLayer
+    if isinstance(layer, BandedKVLayer):
+        return ("kv", layer.export_slot(bi))
+    if isinstance(layer, LinearAttentionCacheLayerMixin) and not isinstance(layer, DynamicLayer):
+        cs, rs = layer.conv_states.get(0), layer.recurrent_states.get(0)
+        if cs is None or rs is None or cs.shape[0] <= bi or rs.shape[0] <= bi:
+            return _UNSUPPORTED
+        return ("lin", (cs[bi].clone(), rs[bi].clone()))
+    if (getattr(layer, "conv_states", None) is None
+            and getattr(layer, "recurrent_states", None) is None
+            and getattr(layer, "keys", None) is None):
+        # A stateless block (Nemotron-H's moe/mlp placeholder layers): it contributes nothing to a slot's state, so
+        # record an empty entry instead of treating it as unsupported. A layer that DOES carry state but is not one
+        # of the known types is unsupported.
+        return ("none", None)
+    return _UNSUPPORTED
+
+
+def _export_slot_state(past, bi: int):
+    """Slot `bi` of every cache layer, or None if some layer type is not supported."""
     out = []
     for layer in past.layers:
-        if isinstance(layer, BandedKVLayer):
-            out.append(("kv", layer.export_slot(bi)))
-        elif isinstance(layer, LinearAttentionCacheLayerMixin) and not isinstance(layer, DynamicLayer):
-            cs, rs = layer.conv_states.get(0), layer.recurrent_states.get(0)
-            if cs is None or rs is None or cs.shape[0] <= bi or rs.shape[0] <= bi:
-                return None
-            out.append(("lin", (cs[bi].clone(), rs[bi].clone())))
-        elif (getattr(layer, "conv_states", None) is None
-                and getattr(layer, "recurrent_states", None) is None
-                and getattr(layer, "keys", None) is None):
-            # A stateless block (Nemotron-H's moe/mlp placeholder layers):
-            # it contributes nothing to a slot's state, so record an empty
-            # entry instead of treating it as unsupported. A layer that
-            # DOES carry state but is not one of the known types still
-            # returns None below.
-            out.append(("none", None))
-        else:
+        e = _export_layer_slot(layer, bi)
+        if e is _UNSUPPORTED:
             return None
+        out.append(e)
     return out
 
 
@@ -2735,7 +2594,8 @@ class _BatchSlot:
     __slots__ = ("bi", "out_ids", "drafter", "max_new", "done",
                  "temperature", "top_k", "top_p", "_history_len",
                  "req_id", "stats", "on_token", "just_admitted",
-                 "acc_ema", "spec_off", "spec_backoff", "prompt_ids", "prefix_hit", "branch", "_ckpt_at", "k_cur", "acc_len_ema")
+                 "acc_ema", "spec_off", "spec_backoff", "prompt_ids", "prefix_hit", "branch", "_ckpt_at", "k_cur", "acc_len_ema",
+                 "admit_no")
 
     def __init__(self, bi: int, drafter, max_new: int,
                  temperature: float, top_k: int, top_p: float,
@@ -2758,6 +2618,7 @@ class _BatchSlot:
         self.acc_len_ema = 4.0      # accepted drafts per step, smoothed
         self._ckpt_at = 0           # slot length at the last chunk-boundary checkpoint
         self.branch = 0             # where this prompt leaves a saved one: save a checkpoint there too
+        self.admit_no = 0           # admission order (engine counter): the VRAM-ceiling stop takes the newest
         # True for exactly the step a slot was admitted mid-batch on --
         # that step's forward is a genuine prefill for THIS slot (its
         # whole prompt, not [last_token]+draft), so the decode loop must
@@ -2811,16 +2672,19 @@ _QV_VARLEN_REGISTERED = False
 _QV_DENSE_VIEWS = os.environ.get("QV_BAND_DENSE_VIEWS", "1")
 
 
-def _sdpa_segment(q, k, v, dropout, scaling):
+def _sdpa_segment(q, k, v, dropout, scaling, window: int | None = None):
     """One sequence's causal attention via SDPA, for boxes without flash-attn.
     q: (1, lq, heads, dim); k, v: (1, lk, kv_heads, dim), lq <= lk. Returns
     (1, lq, heads, dim). The causal mask is bottom-right aligned like
-    flash-attn's: query i sees keys j <= lk - lq + i.
+    flash-attn's: query i sees keys j <= lk - lq + i; with `window`, also
+    j > lk - lq + i - window (flash-attn's window_size=(window - 1, ...)).
     """
     lq, lk = q.shape[1], k.shape[1]
     mask = None
-    if lq > 1:
+    if lq > 1 or (window is not None and lk > window):
         mask = torch.ones(lq, lk, dtype=torch.bool, device=q.device).tril(lk - lq)
+        if window is not None:
+            mask &= torch.ones(lq, lk, dtype=torch.bool, device=q.device).triu(lk - lq - window + 1)
     o = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
         attn_mask=mask, dropout_p=dropout, scale=scaling,
@@ -2828,31 +2692,92 @@ def _sdpa_segment(q, k, v, dropout, scaling):
     return o.transpose(1, 2)
 
 
+# Fused qvb8 attention in packed steps (per slot): QV_FUSED_ATTN=0 turns it off here too.
+_QV_FUSED_PACKED = os.environ.get("QV_FUSED_ATTN", "1") != "0"
+_FLASH_OK: dict = {}
+
+
+def _flash_ok(device) -> bool:
+    """flash-attn usable on `device`: a CUDA card of sm_80 or newer with the library installed (V100 = sm_70 has no
+    flash-attn kernels). QV_ATTN_FLASH=0 forces the no-flash path on any card (to test the sm_70 path elsewhere)."""
+    if os.environ.get("QV_ATTN_FLASH", "1") == "0":
+        return False
+    key = str(device)
+    if key not in _FLASH_OK:
+        ok = False
+        if torch.device(device).type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8:
+            try:
+                import flash_attn  # noqa: F401
+                ok = True
+            except ImportError:
+                pass
+        _FLASH_OK[key] = ok
+    return _FLASH_OK[key]
+
+
 def _qv_packed_attention(layer, query, segs, dropout, scaling):
     """Attention for a PACKED step: query is (1, heads, T, head_dim) holding every slot's new tokens back to
     back; segs = [(slot, offset, length)]. Each segment attends its own slot's history (already appended by
-    update()), bottom-right causal, sliding window if the layer has one. No padded column exists anywhere."""
-    from flash_attn import flash_attn_func
+    update()), bottom-right causal, sliding window if the layer has one. No padded column exists anywhere.
+
+    Kernel per GPU (fastest measured there):
+      full-attention layer, decode / verify segment (<= 16 tokens from sm_80) with a banded history >= 1024: the
+        fused qvb8 kernel straight from the slot's ids (fused_attn.segment_attention); the slot's dense view is
+        released. Without flash-attn (sm_70, or QV_ATTN_FLASH=0) the fused kernel takes EVERY length, prefill
+        chunks too (the sm_70 CUDA kernel tiles any query), so no dense view of the history is built.
+      full-attention layer, anything else: flash-attn on the slot's dense view; without flash-attn, SDPA on it.
+      sliding-window layer: the last window of the slot (O(window)); flash-attn with window_size, or SDPA with the
+        same causal + window mask."""
     out = query.new_empty((1, query.shape[2], query.shape[1], query.shape[3]))
+    scale = scaling if scaling is not None else query.shape[-1] ** -0.5
+    flash = _flash_ok(query.device)
     win = getattr(layer, "window", None)
+    if win is not None:
+        for bi, off, n in segs:
+            q_i = query[:, :, off:off + n].transpose(1, 2)
+            k_i, v_i = layer.window_kv_slot(bi, win - 1 + n, query.dtype, query.device)
+            if flash:
+                from flash_attn import flash_attn_func
+                o_i = flash_attn_func(q_i, k_i.transpose(1, 2), v_i.transpose(1, 2), dropout_p=dropout,
+                                      softmax_scale=scale, causal=True, window_size=(win - 1, win - 1))
+            else:
+                o_i = _sdpa_segment(q_i, k_i.transpose(1, 2), v_i.transpose(1, 2), dropout, scale, window=win)
+            out[:, off:off + n] = o_i.to(out.dtype)
+        return out, None
+    if _QV_FUSED_PACKED and query.is_cuda:
+        from qv_band.kv import banded_cache as _bc, fused_attn as _fa
+        mq = _bc._fused_max_q(query.device) if flash else None
+        rest = []
+        for bi, off, n in segs:
+            fk = None
+            if (mq is None or n <= mq) and layer._banded_len[bi] >= _bc._FUSED_MIN_BANDED:
+                fk = _fa.slot_fused(layer, bi)
+            if fk is None:
+                rest.append((bi, off, n))
+                continue
+            layer.release_sm_view(bi)
+            out[:, off:off + n] = _fa.segment_attention(
+                layer, fk, bi, query[:, :, off:off + n].transpose(1, 2), scale)
+        if not rest:
+            return out, None
+        segs = rest
     views = None
-    if win is None and _QV_DENSE_VIEWS != "0":
+    if _QV_DENSE_VIEWS != "0":
         views = layer.ragged_kv_views(query.dtype, [s for s, _, _ in segs])
     per_k = per_v = None
     for bi, off, n in segs:
         q_i = query[:, :, off:off + n].transpose(1, 2)
-        if win is not None:
-            k_i, v_i = layer.window_kv_slot(bi, win - 1 + n, query.dtype, query.device)
-            o_i = flash_attn_func(q_i, k_i.transpose(1, 2), v_i.transpose(1, 2), dropout_p=dropout,
-                                  softmax_scale=scaling, causal=True, window_size=(win - 1, win - 1))
-        elif views is not None:
+        if views is not None:
             k_i, v_i = views[bi]
-            o_i = flash_attn_func(q_i, k_i, v_i, dropout_p=dropout, softmax_scale=scaling, causal=True)
         else:
             if per_k is None:
                 per_k, per_v = layer.reconstruct_per_slot(query.dtype)
-            o_i = flash_attn_func(q_i, per_k[bi].transpose(1, 2), per_v[bi].transpose(1, 2),
-                                  dropout_p=dropout, softmax_scale=scaling, causal=True)
+            k_i, v_i = per_k[bi].transpose(1, 2), per_v[bi].transpose(1, 2)
+        if flash:
+            from flash_attn import flash_attn_func
+            o_i = flash_attn_func(q_i, k_i, v_i, dropout_p=dropout, softmax_scale=scale, causal=True)
+        else:
+            o_i = _sdpa_segment(q_i, k_i, v_i, dropout, scale)
         out[:, off:off + n] = o_i.to(out.dtype)
     return out, None
 
@@ -2948,7 +2873,9 @@ def _qv_varlen_attention_forward(module, query, key, value, attention_mask,
             "attention implementation is only valid for a BandedKVCache."
             % layer_idx)
 
-    segs = getattr(past, "_step_segments", None)
+    from qv_band.kv.step_ctx import current as _step_ctx
+    _ctx = _step_ctx()                                  # this thread's engine step (qv_band/kv/step_ctx.py)
+    segs = _ctx.segs if _ctx is not None else None
     if segs is not None:
         return _qv_packed_attention(layer, query, segs, dropout, scaling)
 
@@ -2961,7 +2888,7 @@ def _qv_varlen_attention_forward(module, query, key, value, attention_mask,
             raise RuntimeError("qv_varlen: a sliding-window layer needs flash-attn (window_size)")
         from flash_attn import flash_attn_func
         batch, num_heads, seq_max, head_dim = query.shape
-        real = getattr(past, "_step_real_lens", None) or [seq_max] * batch
+        real = (_ctx.real_lens if _ctx is not None else None) or [seq_max] * batch
         out = query.new_zeros((batch, seq_max, num_heads, head_dim))
         for bi in range(batch):
             rl = real[bi]
@@ -2979,7 +2906,7 @@ def _qv_varlen_attention_forward(module, query, key, value, attention_mask,
     # no cross-slot cat, no transpose. One kernel launch per active slot
     # instead of one varlen launch; slots per step are few, and each launch
     # now skips three history-sized copies.
-    real_lens_fast = getattr(past, "_step_real_lens", None)
+    real_lens_fast = _ctx.real_lens if _ctx is not None else None
     if real_lens_fast is not None and _QV_DENSE_VIEWS != "0":
         rows = [bi for bi in range(query.shape[0]) if real_lens_fast[bi] > 0]
         views = layer.ragged_kv_views(query.dtype, rows) if rows else {}
@@ -3007,13 +2934,11 @@ def _qv_varlen_attention_forward(module, query, key, value, attention_mask,
     # resident cache stays banded (certified-bounded) rather than
     # carrying a full dense shadow copy of every slot's history.
     per_slot_k, per_slot_v = layer.reconstruct_per_slot(query.dtype)
-    real_lens_q = getattr(past, "_step_real_lens", None)
+    real_lens_q = _ctx.real_lens if _ctx is not None else None
     if real_lens_q is None:
         raise RuntimeError(
-            "qv_varlen attention: past_key_values._step_real_lens is not "
-            "set -- ContinuousBatchEngine.step() must set it (query-side "
-            "real lengths) before calling the model; it is the same "
-            "per-slot real-length list update() itself already requires.")
+            "qv_varlen attention: no step real lengths -- ContinuousBatchEngine must run its forward inside "
+            "step_ctx.active(real_lens=...) (query-side real lengths), the list update() itself reads.")
     batch, num_heads, seq_max, head_dim = query.shape
     _, num_kv_heads, _, _ = key.shape
     device, dtype = query.device, query.dtype
@@ -3244,6 +3169,16 @@ def _run_linear_attn_per_slot(module, hidden_states, cache_params, real_lens,
     # typical mixed step (a few decode rows of width 1-3 plus maybe one
     # prompt) has far fewer distinct widths than rows. Only rows whose
     # lengths genuinely differ are separated.
+    if layer is not None:
+        # After the last request left, the state keeps its tensors with an EMPTY batch axis, and add_request does
+        # not grow an empty state (_linear_attention_state_ready). Two or more requests of different lengths
+        # admitted together then reach this function with fewer state rows than slots: index_select on a row that
+        # does not exist is a device-side assert, which takes the whole CUDA context (every later request fails
+        # until the server restarts). Give every slot its (zero = cold) row first.
+        for store in (layer.conv_states, layer.recurrent_states):
+            t = store.get(0) if store else None
+            if t is not None and t.shape[0] < batch:
+                store[0] = torch.cat([t, t.new_zeros((batch - t.shape[0],) + tuple(t.shape[1:]))], dim=0)
     groups: dict = {}
     for bi in range(batch):
         rl = real_lens[bi]
@@ -3297,6 +3232,16 @@ def _run_linear_attn_per_slot(module, hidden_states, cache_params, real_lens,
             if rs_full is not None:
                 rs_full.index_copy_(0, idx, layer.recurrent_states[0])
                 layer.recurrent_states[0] = rs_full
+            # The first forward of a fresh cache with rows of DIFFERENT lengths (several requests admitted before
+            # any step, prompts shorter than the chunk): this group's call just created the state, sized for its
+            # own rows only. Give it the whole batch (the other rows zero = cold, as a fresh slot is), or the next
+            # group indexes a row that does not exist ("srcIndex < srcSelectDimSize" device assert).
+            for full, store in ((cs_full, layer.conv_states), (rs_full, layer.recurrent_states)):
+                t = store.get(0) if (full is None and store) else None
+                if t is not None and t.shape[0] == len(rows) < batch:
+                    grown = t.new_zeros((batch,) + tuple(t.shape[1:]))
+                    grown.index_copy_(0, idx, t)
+                    store[0] = grown
             if isinstance(hps, dict) and hps_saved is not None:
                 # Every row that ran here now HAS previous state, so the
                 # layer ends this call warm regardless of how it started.
@@ -3313,7 +3258,7 @@ def _run_mamba_per_slot(module, hidden_states, cache_params, real_lens,
     timesteps, and no mask can stop that.
 
     `module` is the mixer (NemotronHMamba2Mixer); `orig_forward` is its
-    RAW forward (run/nemotron_h._mamba2_forward, with the _Graphed fast
+    RAW forward (layers/mamba2_hybrid._mamba2_forward, with the _Graphed fast
     path unwrapped by the installer), which reads and writes the state
     for module.layer_idx in place. The state tensors live in the owning
     layer's conv_states[0]/recurrent_states[0] dicts (the cache-level
@@ -3404,12 +3349,11 @@ def _install_linear_attn_per_slot_hooks(model):
                 orig_forward = lin.forward
                 def _wrapped(hidden_states, cache_params=None, attention_mask=None,
                              _orig=orig_forward, _mod=lin, **kwargs):
-                    real_lens = getattr(cache_params, "_step_real_lens", None) \
-                        if cache_params is not None else None
-                    cold = getattr(cache_params, "_step_cold_rows", None) \
-                        if cache_params is not None else None
-                    segs = getattr(cache_params, "_step_segments", None) \
-                        if cache_params is not None else None
+                    from qv_band.kv.step_ctx import current as _step_ctx
+                    _c = _step_ctx() if cache_params is not None else None
+                    real_lens = _c.real_lens if _c is not None else None
+                    cold = _c.cold_rows if _c is not None else None
+                    segs = _c.segs if _c is not None else None
                     if segs is not None:
                         return _run_linear_attn_packed(_mod, hidden_states, cache_params, segs, _orig,
                                                        cold, **kwargs)
@@ -3438,7 +3382,7 @@ def _install_linear_attn_per_slot_hooks(model):
         if mx is None or getattr(mx, "_qv_per_slot_wrapped", False):
             continue
         orig_forward = mx.forward
-        # The _Graphed fast path (run/nemotron_h.install_fast_paths) keys its
+        # The _Graphed fast path (layers/mamba2_hybrid.install_fast_paths) keys its
         # graphs on the state tensors' addresses and is only safe for the
         # UNIFORM passthrough below; the per-group calls run the raw forward
         # directly so a ragged step never captures or replays a graph against
@@ -3448,8 +3392,9 @@ def _install_linear_attn_per_slot_hooks(model):
                        else orig_forward)
         def _wrapped(hidden_states, cache_params=None, attention_mask=None,
                      _orig=orig_forward, _raw=raw_forward, _mod=mx, **kwargs):
-            real_lens = getattr(cache_params, "_step_real_lens", None) \
-                if cache_params is not None else None
+            from qv_band.kv.step_ctx import current as _step_ctx
+            _c = _step_ctx() if cache_params is not None else None
+            real_lens = _c.real_lens if _c is not None else None
             if (real_lens is None
                     or hidden_states.shape[0] != len(real_lens)
                     or len(set(real_lens)) == 1):
@@ -3506,18 +3451,52 @@ def _build_varlen_inputs(slots: list, seqs: list[list[int]], hist_lens: list[int
     both = torch.tensor([ids_rows, pos_rows], dtype=torch.long).to(
         device, non_blocking=True) if n else torch.zeros(2, 0, width, dtype=torch.long, device=device)
     return both[0], both[1]
+def _ring_plan(past, ring: dict, bi: int):
+    """The linear-attention layers of `past` and their capture of this step for slot `bi`: a list of
+    (layer, (capture, row)), empty when the cache holds no recurrent state, None if a layer lacks a usable capture."""
+    plan = []
+    for li, layer in enumerate(past.layers):
+        rs = getattr(layer, "recurrent_states", None)
+        if rs is None or rs.get(0) is None:
+            continue                      # full-attention layer
+        hit = None
+        for e in ring.get(li, ()):
+            if bi in e["rows"]:
+                hit = (e, e["rows"].index(bi))
+                break
+        if hit is None or hit[0]["scan"][5] is None:
+            return None
+        plan.append((layer, hit))
+    return plan
+
+
+def _ring_apply(plan, bi: int, t: int) -> None:
+    """Rebuild slot `bi`'s state after `t` tokens of the step from a _ring_plan."""
+    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+    for layer, (e, r) in plan:
+        q, k, v, g, beta, init = e["scan"]
+        K = layer.conv_states[0].shape[-1]
+        layer.conv_states[0][bi].copy_(e["win"][r, :, t:t + K])
+        _, st = fused_recurrent_gated_delta_rule(
+            q[r:r + 1, :t], k[r:r + 1, :t], v[r:r + 1, :t],
+            g=g[r:r + 1, :t], beta=beta[r:r + 1, :t],
+            initial_state=init[r:r + 1], output_final_state=True,
+            use_qk_l2norm_in_kernel=True)
+        layer.recurrent_states[0][bi].copy_(st[0])
+
+
 def _make_banded_cache(config, *, tau, residual_length):
     """The resident banded cache for `config`'s decoder. A Nemotron-H
     hybrid (config carries layers_block_type with mamba blocks) gets
-    NemotronHBandedCache -- banded attention KV plus per-slot Mamba-2
+    HybridBandedCache -- banded attention KV plus per-slot Mamba-2
     conv/SSM state and the model-level conv_states/ssm_states surface the
     shipped modeling code reads; everything else gets the plain
     BandedKVCache, unchanged."""
-    from qv_band.kv.banded_cache import BandedKVCache, NemotronHBandedCache
+    from qv_band.kv.banded_cache import BandedKVCache, HybridBandedCache
     decoder = config.get_text_config(decoder=True)
     block_types = getattr(decoder, "layers_block_type", None)
     if block_types is not None and any(str(t) == "mamba" for t in block_types):
-        return NemotronHBandedCache(config=config, tau=tau,
+        return HybridBandedCache(config=config, tau=tau,
                                     residual_length=residual_length)
     return BandedKVCache(config=config, tau=tau,
                          residual_length=residual_length)
@@ -3554,9 +3533,7 @@ class ContinuousBatchEngine:
     row's real tokens (real_lens, see BandedKVLayer.update). No
     attention mask is built anywhere on this path.
     REQUIRES qvb8_resident (BandedKVCache) -- the per-slot banded store
-    is what supplies ragged K/V directly. Tensor-parallel (WORLD_SIZE>1)
-    is not supported: the per-step accept/reject decisions would need a
-    per-slot rank broadcast that is not built here.
+    is what supplies ragged K/V directly.
     """
     def __init__(self, model, tok, drafter_factory=None, k: int = 8,
                 kv_tau: float | None = None, int8_residual_length: int = 128,
@@ -3583,11 +3560,21 @@ class ContinuousBatchEngine:
         eos = tok.eos_token_id
         self.eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         self.past = None            # BandedKVCache, built lazily on first admit
+        # Decoder layers on other machines (decode/remote_stage.py); empty on one machine. Every cache action below
+        # is repeated on each stage for the layers it holds.
+        self._stages = getattr(model, "_qv_remote_stages", ())
+        self._remote_layers = getattr(model, "_qv_remote_layers", frozenset())
+        for _st in self._stages:
+            _st.reset(kv_tau or KV_DEFAULT_TAU, int8_residual_length)
         self.slots: list[_BatchSlot | None] = []
         self._pending_prompts: dict[int, torch.Tensor] = {}   # bi -> prompt ids, this-step admits
         self._prefix_store: list[dict] = []        # saved prompt prefixes, most recently used first
         # set by the server: () -> set of req_ids whose client is gone; a chunked prefill stops between chunks for them
         self.cancel_check = None
+        # set by the server: () -> True when a card is at the --max-memory-gb ceiling (per card under --pipeline).
+        # Polled once per step(); see _ceiling_stop. None = no ceiling.
+        self.over_ceiling = None
+        self._admit_seq = 0
         # Populated by _drop() with (req_id, out_ids, Stats) the instant a
         # slot finishes and is removed from self.slots -- a caller
         # (BatchScheduler) that only checks "is this req_id still live"
@@ -3674,22 +3661,11 @@ class ContinuousBatchEngine:
         if self._packed_ok():
             return self._forward_packed(seqs, hist_lens, want_hidden, _logits, keep, keep_hidden,
                                         capture_layers)
-        from qv_band.kv.banded_cache import BandedKVLayer
         real_lens = [len(s) for s in seqs]
         input_ids, position_ids = _build_varlen_inputs(
             [s for _, s in self._live()], seqs, hist_lens, self._device)
-        # Qwen3.5's decoder layer keeps its attention on .self_attn; Nemotron-H's
-        # block keeps it on .mixer (block_type "attention"). Both need
-        # _qv_active_past so _qv_varlen_attention_forward can reach the
-        # live cache (it is not passed into attention_interface's kwargs).
-        attn_modules = [getattr(dl, "self_attn", None) or (
-            getattr(dl, "mixer", None)
-            if getattr(dl, "block_type", None) == "attention" else None)
-            for dl in getattr(self.model.model, "layers", [])]
-        for layer in self.past.layers:
-            if isinstance(layer, BandedKVLayer):
-                layer._step_real_lens = real_lens
-        self.past._step_real_lens = real_lens
+        # Every attention module (Qwen3.5: .self_attn; Nemotron-H: .mixer of an "attention" block) reaches the live
+        # cache through _qv_active_past (it is not passed into attention_interface's kwargs): set by self._armed().
         # Rows whose linear-attention state is still COLD this step.
         # has_previous_state is a single per-LAYER flag, but a mid-flight
         # admission makes the batch heterogeneous: the running rows have
@@ -3705,41 +3681,79 @@ class ContinuousBatchEngine:
         # The residual error it removes is small enough that it did not
         # change sampled tokens in the cases measured -- it is a
         # correctness fix, not an output fix.
-        self.past._step_cold_rows = [h == 0 for h in hist_lens]
-        for am in attn_modules:
-            if am is not None:
-                am._qv_active_past = self.past
-        if self._qv_text_config is not None:
-            self._qv_text_config._attn_implementation = "qv_varlen"
-        try:
+        from qv_band.kv import step_ctx
+        with self._armed(), step_ctx.active(real_lens=real_lens, cold_rows=[h == 0 for h in hist_lens]):
             if not _logits:
                 return _advance_cache_only(
                     self.model, input_ids, position_ids, self.past)
             return _forward_batched_with_hidden(
                 self.model, input_ids, None, position_ids, self.past, want_hidden,
                 keep=keep, keep_hidden=keep_hidden, capture_layers=capture_layers)
-        finally:
-            if self._qv_text_config is not None:
-                self._qv_text_config._attn_implementation = self._qv_orig_attn_impl
-            for am in attn_modules:
-                if am is not None:
-                    am._qv_active_past = None
-            for layer in self.past.layers:
-                if isinstance(layer, BandedKVLayer):
-                    layer._step_real_lens = None
-            self.past._step_real_lens = None
-            self.past._step_cold_rows = None
+
+    def _armed(self):
+        """Context: the model is switched to the engine's attention ("qv_varlen") and every attention module can reach
+        the live cache (_qv_active_past). Reference-counted, so several forwards in flight at once (overlapped
+        multi-card prefill, one thread per chunk) share one arming: the first entry sets it, the last exit restores."""
+        from contextlib import contextmanager
+        eng = self
+
+        @contextmanager
+        def _cm():
+            if not hasattr(eng, "_arm_lock"):
+                eng._arm_lock, eng._arm_depth = threading.Lock(), 0
+            with eng._arm_lock:
+                if eng._arm_depth == 0:
+                    mods = [getattr(dl, "self_attn", None) or (
+                        getattr(dl, "mixer", None) if getattr(dl, "block_type", None) == "attention" else None)
+                        for dl in getattr(eng.model.model, "layers", [])]
+                    eng._arm_mods = [m for m in mods if m is not None]
+                    for m in eng._arm_mods:
+                        m._qv_active_past = eng.past
+                    if eng._qv_text_config is not None:
+                        eng._qv_text_config._attn_implementation = "qv_varlen"
+                eng._arm_depth += 1
+            try:
+                yield
+            finally:
+                with eng._arm_lock:
+                    eng._arm_depth -= 1
+                    if eng._arm_depth == 0:
+                        if eng._qv_text_config is not None:
+                            eng._qv_text_config._attn_implementation = eng._qv_orig_attn_impl
+                        for m in eng._arm_mods:
+                            m._qv_active_past = None
+        return _cm()
+
+    def _step_hooks(self, capture_layers):
+        """Persistent forward hooks that write a drafter tap's output (and the final norm's input) into the CALLING
+        thread's step context (qv_band/kv/step_ctx.py) -- not per-forward hooks, which would also fire for another
+        chunk's forward in flight at the same time. Installed once per layer, idle outside a step that asks."""
+        from qv_band.kv.step_ctx import current as _cur
+        hooked = self.__dict__.setdefault("_hooked_taps", {})
+        for li in capture_layers or ():
+            if li not in hooked and li not in self._remote_layers:   # a remote tap comes back with the stage's reply
+                def _tap(_m, _a, o, li=li):
+                    c = _cur()
+                    if c is not None and c.capture is not None and li in c.capture_layers:
+                        # pipeline placement: a tap layer may sit on another card -- copied through host memory, never
+                        # peer-to-peer (common/xfer.py): a direct card-to-card copy gave the drafter wrong taps on the two
+                        # V100s (0% accepted, 2026-11-11)
+                        from qv_band.common.xfer import to_device as _to_dev
+                        c.capture[li] = _to_dev(o[0] if isinstance(o, tuple) else o, c.capture_dev)
+                hooked[li] = self.model.model.layers[li].register_forward_hook(_tap)
+        if "_norm" not in hooked:
+            def _pre(_m, a, _k):
+                c = _cur()
+                if c is not None and c.want_pre_norm:
+                    c.pre_norm = a[0]
+            hooked["_norm"] = _resolve_final_norm(self.model).register_forward_pre_hook(_pre, with_kwargs=True)
+
     def _packed_ok(self) -> bool:
         """Packed steps need every cache layer to be a BandedKVLayer (pure attention, e.g. Ripple): a
         linear-attention / Mamba layer keeps per-ROW state, which a single packed row cannot carry."""
         p = getattr(self, "_packed", None)
         if p is None or p[0] is not self.past:
-            from qv_band.kv.banded_cache import BandedKVLayer
-            try:                                   # packed attention runs on flash-attn (sm_80+); else padded path
-                import flash_attn  # noqa: F401
-                fa = torch.cuda.is_available() and torch.cuda.get_device_capability(self._device)[0] >= 8
-            except ImportError:
-                fa = False
+            from qv_band.kv.banded_cache import BandedKVLayer, _StatelessLayer
             # Attention layers must be banded; a linear-attention layer (Qwen3.5 GatedDeltaNet) is fine too -- its
             # hook re-splits a packed row per slot (_run_linear_attn_packed). Not covered: Mamba (Nemotron-H) and
             # MoE models (their decode CUDA graphs are keyed on the padded batch shape).
@@ -3747,13 +3761,16 @@ class ContinuousBatchEngine:
             moe = bool(getattr(cfg, "num_experts", 0) or getattr(cfg, "n_routed_experts", 0))
             lin_ok = all(hasattr(getattr(dl, "linear_attn", None), "_qv_per_slot_wrapped")
                          for dl in self.model.model.layers if getattr(dl, "linear_attn", None) is not None)
-            ok = (PACKED_ENABLED and fa and not moe and lin_ok and self.past is not None
+            ok = (PACKED_ENABLED and not moe and lin_ok and self.past is not None
                   and type(self.past).__name__ == "BandedKVCache" and len(self.past.layers) > 0
-                  and all(isinstance(l, BandedKVLayer) or hasattr(l, "recurrent_states")
-                          for l in self.past.layers))
+                  and all(isinstance(l, (BandedKVLayer, _StatelessLayer)) or hasattr(l, "recurrent_states")
+                          for l in self.past.layers))   # _StatelessLayer: a layer held by a remote stage
             self._packed = p = (self.past, ok)
             print(f"[engine] packed steps (no padding, prefill interleaved with decode): "
-                  f"{'ON' if ok else 'off (model has per-row recurrent state)'}", file=sys.__stdout__, flush=True)
+                  f"{'ON' if ok else 'off (MoE / Mamba / unwrapped linear attention)'}"
+                  f"{' -- attention: flash-attn + fused qvb8' if ok and _flash_ok(self._device) else ''}"
+                  f"{' -- attention: fused qvb8 for every length + SDPA (no flash-attn)' if ok and not _flash_ok(self._device) else ''}",
+                  file=sys.__stdout__, flush=True)
         return p[1]
 
     def _forward_packed(self, seqs, hist_lens, want_hidden, _logits, keep, keep_hidden, capture_layers):
@@ -3774,43 +3791,22 @@ class ContinuousBatchEngine:
         dev = self._device
         both = torch.tensor([ids, pos], dtype=torch.long).to(dev, non_blocking=True)
         input_ids, position_ids = both[0:1], both[1:2]
-        attn_modules = [getattr(dl, "self_attn", None) for dl in getattr(self.model.model, "layers", [])]
-        layers = [l for l in self.past.layers if isinstance(l, BandedKVLayer)]
-        for l in layers:
-            l._step_segments = segs
-        self.past._step_segments = segs
-        self.past._step_cold_rows = [h == 0 for h in hist_lens]     # linear-attention rows with no state yet
-        for am in attn_modules:
-            if am is not None:
-                am._qv_active_past = self.past
-        if self._qv_text_config is not None:
-            self._qv_text_config._attn_implementation = "qv_varlen"
-        pre_norm, layer_out, handles = [None], {}, []
-        try:
+        from qv_band.kv import step_ctx
+        if _logits:
+            self._step_hooks(capture_layers)
+        # the step layout lives in this thread's step context (several chunks can be in flight, one per thread);
+        # linear-attention rows with no state yet start cold
+        with self._armed(), step_ctx.active(segs=segs, cold_rows=[h == 0 for h in hist_lens],
+                                            capture={} if (_logits and capture_layers) else None,
+                                            capture_layers=capture_layers, capture_dev=dev) as ctx:
             if not _logits:
                 self.model.model(input_ids, attention_mask=None, position_ids=position_ids,
                                  past_key_values=self.past, use_cache=True)
                 return _ResultWithHidden(None, self.past, None)
-            if want_hidden:
-                handles.append(_resolve_final_norm(self.model).register_forward_pre_hook(
-                    lambda _m, a, _k: pre_norm.__setitem__(0, a[0]), with_kwargs=True))
-            for li in capture_layers or ():
-                handles.append(self.model.model.layers[li].register_forward_hook(
-                    lambda _m, _a, o, li=li: layer_out.__setitem__(li, o[0] if isinstance(o, tuple) else o)))
+            ctx.want_pre_norm = want_hidden
             out = self.model.model(input_ids, attention_mask=None, position_ids=position_ids,
                                    past_key_values=self.past, use_cache=True)
-        finally:
-            for h in handles:
-                h.remove()
-            if self._qv_text_config is not None:
-                self._qv_text_config._attn_implementation = self._qv_orig_attn_impl
-            for am in attn_modules:
-                if am is not None:
-                    am._qv_active_past = None
-            for l in layers:
-                l._step_segments = None
-            self.past._step_segments = None
-            self.past._step_cold_rows = None
+        pre_norm, layer_out = [ctx.pre_norm], ctx.capture
         # (rows, width) gather index, real tokens right-aligned; filler points at the row's first token
         width = max(len(s) for s in seqs)
         idx = torch.zeros(len(seqs), width, dtype=torch.long)
@@ -3830,6 +3826,123 @@ class ContinuousBatchEngine:
         if capture_layers:
             feats = torch.cat([layer_out[li] for li in capture_layers], dim=-1)[0][idx]
         return _ResultWithHidden(logits, self.past, hidden, feats)
+
+    def _prefill_rounds_overlapped(self, gate, live, rows, work, heads, cuts, ch, done, totals, t0) -> bool:
+        """The rounds of _prefill_admitted's loop, overlapped across the cards of a pipeline placement
+        (decode/stage_gate.py): each round runs the model's own forward in its own thread holding a ticket; every
+        card takes rounds strictly in order, so the KV is exactly what the sequential loop builds. At most one round
+        per card is in flight. A prefix checkpoint after round c is assembled from per-card snapshots taken when
+        round c leaves each card (the only moment that card's layers hold exactly the state after round c).
+        Drafter features are observed and checkpoints saved here, in round order. Updates `done` per finished round.
+        Returns True when a client cancelled (the caller parks the rest of the prompt)."""
+        import functools
+        from concurrent.futures import ThreadPoolExecutor
+        from qv_band.decode import stage_gate as _sg
+        slot = dict(live)
+        hist = {bi: self._slot_len(bi) for bi, _ in live}
+        ckpt_at = {bi: getattr(slot[bi], "_ckpt_at", 0) for bi in work}
+        d = dict(done)
+        plan = []                                    # (seqs, hist per row, saves after it, done after it, hist after it)
+        while any(d[bi] < heads[bi] for bi in work):
+            seqs = [[] for _ in live]
+            for bi in work:
+                if d[bi] < heads[bi]:
+                    take = min(ch, heads[bi] - d[bi])
+                    if d[bi] < cuts.get(bi, 0):
+                        take = min(take, cuts[bi] - d[bi])
+                    seqs[rows[bi]] = work[bi][0, d[bi]:d[bi] + take].tolist()
+            hl = [hist[bi] for bi, _ in live]
+            saves = []
+            for bi in work:
+                n = len(seqs[rows[bi]])
+                d[bi] += n
+                hist[bi] += n
+                if cuts.get(bi) == d[bi]:
+                    saves.append(bi)
+                elif (d[bi] < heads[bi] and slot[bi].prompt_ids is not None
+                      and hist[bi] - ckpt_at[bi] >= self.prefill_chunk):
+                    ckpt_at[bi] = hist[bi]
+                    saves.append(bi)
+            plan.append((seqs, hl, saves, dict(d), dict(hist)))
+        L = len(self.past.layers)
+        base = gate.new_run(len(plan))
+        snaps = {}
+
+        def snap(c, s, bis):                         # inside gate.leave(s, base + c)
+            lo, hi = gate.stage_layers[s]
+            for bi in bis:
+                arr = snaps[c][bi]
+                for li in range(lo, hi):
+                    arr[li] = _export_layer_slot(self.past.layers[li], bi)
+
+        for c, (_, _, saves, _, _) in enumerate(plan):
+            if saves:
+                snaps[c] = {bi: [None] * L for bi in saves}
+                for s in range(gate.n):
+                    gate.on_leave[(s, base + c)] = functools.partial(snap, c, s, saves)
+        failed = []
+
+        @torch.no_grad()                             # grad mode is per thread
+        def run(c):
+            seqs, hl, _, _, _ = plan[c]
+            with torch.cuda.device(self._device), _sg.as_ticket(base + c):
+                if failed:
+                    gate.release(base + c)
+                    return None
+                try:
+                    if self.capture:
+                        return self._forward_ragged(seqs, hl, True, keep=1, capture_layers=self.capture)
+                    self._advance_ragged(seqs, hl)
+                    return None
+                except BaseException as e:
+                    failed.append(e)
+                    gate.release(base + c)
+                    raise
+
+        pool = ThreadPoolExecutor(max_workers=gate.n, thread_name_prefix="prefill-card")
+        futs, nxt, completed, cancelled, last_print = {}, 0, 0, False, t0
+        try:
+            while completed < len(plan):
+                while not cancelled and not failed and nxt < len(plan) and nxt - completed < gate.n:
+                    futs[nxt] = pool.submit(run, nxt)
+                    nxt += 1
+                if completed >= nxt:
+                    break
+                c = completed
+                res = futs.pop(c).result()           # re-raises the round's error
+                seqs, hl, saves, dc, hc = plan[c]
+                if res is not None:
+                    for bi in work:
+                        r, n = rows[bi], len(seqs[rows[bi]])
+                        dr = slot[bi].drafter
+                        if n and dr is not None:
+                            dr.observe_features(hl[r], res.layer_features[r, -n:])
+                    del res
+                for bi in saves:
+                    state = snaps[c][bi]
+                    if all(e is not None and e is not _UNSUPPORTED for e in state):
+                        slot[bi]._ckpt_at = hc[bi]
+                        self._save_prefix(bi, slot[bi], branch=True, state=state, n=hc[bi])
+                snaps.pop(c, None)
+                done.update(dc)
+                completed += 1
+                now = time.time()
+                if now - last_print >= 2.0:
+                    tot = sum(done.values())
+                    parts = " ".join(f"#{slot[bi].req_id}:{hc[bi]}/{hc[bi] + totals[bi] - done[bi]}" for bi in work)
+                    print(f"[prefill] {parts} overlapped over {gate.n} cards -- {tot} tok in {now - t0:.1f}s "
+                          f"({tot / max(now - t0, 1e-9):.0f} tok/s)", file=sys.__stdout__, flush=True)
+                    last_print = now
+                self._heartbeat.tick()
+                if self.cancel_check is not None and (
+                        self.cancel_check() & {slot[b].req_id for b in work}):
+                    cancelled = True
+        finally:
+            pool.shutdown(wait=True)
+            for c in range(len(plan)):
+                for s in range(gate.n):
+                    gate.on_leave.pop((s, base + c), None)
+        return cancelled
 
     def _prefill_admitted(self) -> bool:
         """Consume all but the last PREFILL_CHUNK tokens of every
@@ -3906,6 +4019,19 @@ class ContinuousBatchEngine:
         t0 = time.time()
         last_print = t0
         done = {bi: 0 for bi in work}
+        gate = getattr(self.model, "_qv_stage_gate", None)
+        if (gate is not None and gate.n > 1 and packed and not decoding
+                and os.environ.get("QV_PIPE_PREFILL", "1") != "0"
+                and len(self.past.layers) == gate.stage_layers[-1][1]):
+            # Pipeline placement over several cards and nobody is decoding: run ALL the rounds now, overlapped
+            # across the cards (round c + 1 on card i while round c is on card i + 1), not one round per step.
+            if self._prefill_rounds_overlapped(gate, live, rows, work, heads, cuts, ch, done, totals, t0):
+                for b in work:                       # a client is gone: park the rest, as the sequential loop does
+                    sl = dict(live)[b]
+                    self._pending_prompts[b] = work[b][:, done[b]:]
+                    sl.prefix_hit += done[b]
+                    sl._history_len = self._slot_len(b)
+                return True
         while any(done[bi] < heads[bi] for bi in work):
             seqs = [[] for _ in live]
             for bi in work:
@@ -4054,8 +4180,16 @@ class ContinuousBatchEngine:
             from qv_band.kv import banded_cache as _bc
             gib = 2.0 ** 30
             store = _bytes_of([e["state"] for e in self._prefix_store], set()) / gib
-            mem = (f", vram {torch.cuda.memory_allocated() / gib:.1f}G alloc "
-                   f"{torch.cuda.memory_reserved() / gib:.1f}G reserved "
+            pl = getattr(self.model, "_qv_placement", None)
+            cards = sorted({torch.device(d).index for d in pl.devices}) if pl is not None else None
+            if cards and len(cards) > 1:              # pipeline placement: every card, not just the current one
+                vram = ", vram " + " ".join(
+                    f"cuda:{c} {torch.cuda.memory_allocated(c) / gib:.1f}/{torch.cuda.memory_reserved(c) / gib:.1f}G"
+                    for c in cards) + " alloc/reserved "
+            else:
+                vram = (f", vram {torch.cuda.memory_allocated() / gib:.1f}G alloc "
+                        f"{torch.cuda.memory_reserved() / gib:.1f}G reserved ")
+            mem = (vram +
                    f"(dense kv views {_bc._GLOBAL_SM_BYTES / gib:.2f}G joined {_bc._GLOBAL_JOINED_BYTES / gib:.2f}G "
                    f"prefix store {store:.2f}G x{len(self._prefix_store)})")
         except Exception:
@@ -4125,6 +4259,9 @@ class ContinuousBatchEngine:
             self.past = _make_banded_cache(self.model.config,
                                            tau=self.kv_tau or KV_DEFAULT_TAU,
                                            residual_length=self.int8_residual_length)
+            if self._stages:
+                from qv_band.decode.remote_stage import _localize
+                _localize(self.past, set(range(len(self.past.layers))) - self._remote_layers)
         # Find a free slot index: reuse a hole left by a dropped request
         # before growing the list, so bi stays dense (drop_slot's own
         # "every later index shifts down" contract, applied consistently).
@@ -4160,6 +4297,8 @@ class ContinuousBatchEngine:
         # torch.cat([conv_state, mixed_qkv]) on the next forward.
         if _linear_attention_state_ready(self.past):
             _grow_linear_attention_batch(self.past)
+        for _st in self._stages:
+            _st.queue("add_slot")
         if bi is None:
             bi = new_bi
             slot = _BatchSlot(bi, drafter, max_new, temperature, top_k, top_p,
@@ -4176,6 +4315,8 @@ class ContinuousBatchEngine:
                               req_id=req_id, on_token=on_token)
             self.slots[bi] = slot
         slot.just_admitted = True
+        self._admit_seq += 1
+        slot.admit_no = self._admit_seq
         self._pending_prompts[bi] = ids
         self._restore_prefix(bi, slot, ids)
         return bi
@@ -4217,7 +4358,7 @@ class ContinuousBatchEngine:
         dr = slot.drafter
         if dr is not None and not hasattr(dr, "import_state") and type(dr).__name__ != "NGramDrafter":
             return
-        if not _import_slot_state(self.past, bi, best["state"]):
+        if not self._import_state(bi, best["state"]):
             return
         if dr is not None and best["drafter"] is not None:
             dr.import_state(best["drafter"])
@@ -4229,16 +4370,19 @@ class ContinuousBatchEngine:
         print(f"[prefix] req #{slot.req_id}: restored {n} of {n_ids} prompt tokens, "
               f"prefilling {n_ids - n}", file=sys.__stdout__, flush=True)
 
-    def _save_prefix(self, bi: int, slot: "_BatchSlot", branch: bool = False) -> None:
+    def _save_prefix(self, bi: int, slot: "_BatchSlot", branch: bool = False, state=None, n=None) -> None:
         """Keep slot `bi`'s cache as it stands (the prompt up to PREFIX_TAIL tokens
-        short of its end) for a later prompt that starts the same way."""
-        n = self._slot_len(bi)
+        short of its end) for a later prompt that starts the same way. `state` / `n`: a snapshot taken earlier
+        (overlapped prefill: each card snapshots its layers when the round leaves it) and its length."""
+        if n is None:
+            n = self._slot_len(bi)
         dr = slot.drafter
         if slot.prompt_ids is None or n < PREFIX_MIN or n > len(slot.prompt_ids) - PREFIX_TAIL:
             return
         if dr is not None and not hasattr(dr, "export_state") and type(dr).__name__ != "NGramDrafter":
             return
-        state = _export_slot_state(self.past, bi)
+        if state is None:
+            state = self._export_state(bi)
         if state is None:
             return
         tokens = slot.prompt_ids[:n]
@@ -4251,6 +4395,36 @@ class ContinuousBatchEngine:
         self._prefix_store.insert(0, {"tokens": tokens, "state": state, "branch": branch,
                                       "drafter": dr.export_state() if hasattr(dr, "export_state") else None})
         self._trim_prefix_store()
+
+    def _export_state(self, bi: int):
+        """Slot `bi` of every cache layer, here and on every stage; None if some layer cannot be exported."""
+        state = _export_slot_state(self.past, bi)
+        if state is None or not self._stages:
+            return state
+        from qv_band.decode.remote_stage import StagedState
+        state = StagedState(state)
+        for st in self._stages:
+            sid = st.export(bi)
+            if sid is None:
+                return None                    # the ids taken so far are freed with `state`
+            state.remote += ((st, sid),)
+        return state
+
+    def _import_state(self, bi: int, state) -> bool:
+        """Write a saved slot into the empty slot `bi`, here and on every stage. All-or-nothing."""
+        remote = getattr(state, "remote", ())
+        if len(remote) != len(self._stages):
+            return False
+        for n, (st, sid) in enumerate(remote):
+            if not st.import_(bi, sid):
+                if n:
+                    raise RuntimeError("slot import: accepted by one stage and refused by another")
+                return False
+        if not _import_slot_state(self.past, bi, state):
+            if remote:
+                raise RuntimeError("slot import: accepted by the stages and refused by the main machine")
+            return False
+        return True
 
     def _trim_prefix_store(self) -> None:
         """Keep PREFIX_KEEP entries. Oldest first, but a branch point or chunk-boundary checkpoint goes
@@ -4275,6 +4449,8 @@ class ContinuousBatchEngine:
         # batch axis once it exists (see _linear_attention_state_ready).
         if _linear_attention_state_ready(self.past):
             _drop_linear_attention_batch(self.past, bi)
+        for _st in self._stages:
+            _st.queue("drop", bi)
         del self.slots[bi]
         for s in self.slots[bi:]:
             if s is not None:
@@ -4298,6 +4474,7 @@ class ContinuousBatchEngine:
         scan runs per-slot at each row's true length, and the KV cache
         commits only each row's real tokens. See _build_varlen_inputs.
         """
+        self._ceiling_stop()
         live = self._live()
         if not live:
             return []
@@ -4381,6 +4558,9 @@ class ContinuousBatchEngine:
         # each row at its true length), so there is nothing else a
         # snapshot would be protecting against.
         recur_snap = _snapshot_recurrent_state(self.past) if any(drafts) else None
+        if recur_snap is not None:
+            for _st in self._stages:
+                _st.queue("snapshot")
         # A just-admitted row reads only its LAST position (first sampled
         # token); a decode row reads all of its k+1. Nothing else is needed,
         # so lm_head runs over max(decode widths, 1) trailing positions
@@ -4523,6 +4703,8 @@ class ContinuousBatchEngine:
                 # Full-attention side: drop just the rejected tail.
                 _tc = time.perf_counter()
                 self.past.crop(-n_drop, slot=bi)
+                for _st in self._stages:
+                    _st.queue("crop", -n_drop, bi)
                 self._phase[9] += time.perf_counter() - _tc
                 if recur_snap is not None:
                     # Recurrent side has no partial rollback. Preferred:
@@ -4538,6 +4720,8 @@ class ContinuousBatchEngine:
                     self._phase[6] += time.perf_counter() - _tr
                     if not _rolled:
                         _restore_recurrent_state_slot(self.past, recur_snap, bi)
+                        for _st in self._stages:
+                            _st.queue("restore", bi)
                         replay[bi] = [seq[0]] + draft[:n_acc]
             _te = time.perf_counter()
             self._emit(s, bi, draft[:n_acc] + [next_tok], emitted, finished)
@@ -4599,38 +4783,42 @@ class ContinuousBatchEngine:
         for bi in sorted(finished, reverse=True):
             self._drop(bi)
         return emitted
+    def _ceiling_stop(self) -> None:
+        """The scheduler's form of the single path's abort-on-VRAM-ceiling. At the --max-memory-gb ceiling the
+        request admitted LAST ends here with what it has produced (its client gets a normal end of stream); the
+        requests admitted before it keep running. One request per step, so the poll sees the freed memory before
+        it takes another. Without this the next allocation hits the allocator's hard cap, the step raises, and
+        every live request fails together."""
+        chk = self.over_ceiling
+        if chk is None or not chk():
+            return
+        live = self._live()
+        if not live:
+            return
+        bi, s = max(live, key=lambda x: x[1].admit_no)
+        s.stats.vram_stop = True
+        ctx = self._slot_len(bi)
+        self._drop(bi)
+        print(f"[engine] VRAM ceiling reached: request {s.req_id} stopped after {len(s.out_ids)} generated tokens "
+              f"({ctx} tokens of context freed); {len(self._live())} request(s) keep running", flush=True)
+
     def _ring_rollback(self, ring: dict, bi: int, t: int) -> bool:
         """Put slot `bi`'s linear-attention state where it would be after
         `t` tokens of this step's verify input (seq[0] + t-1 accepted
         drafts), using what that forward recorded. All-or-nothing: False
-        (nothing touched) if any linear layer lacks a usable capture."""
-        plan = []
-        for li, layer in enumerate(self.past.layers):
-            rs = getattr(layer, "recurrent_states", None)
-            if rs is None or rs.get(0) is None:
-                continue                      # full-attention layer
-            hit = None
-            for e in ring.get(li, ()):
-                if bi in e["rows"]:
-                    hit = (e, e["rows"].index(bi))
-                    break
-            if hit is None or hit[0]["scan"][5] is None:
-                return False
-            plan.append((layer, hit))
-        if not plan:
+        (nothing touched, here or on a stage) if any linear layer lacks a usable capture."""
+        plan = _ring_plan(self.past, ring, bi)
+        if plan is None:
             return False
-        from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
-        for layer, (e, r) in plan:
-            q, k, v, g, beta, init = e["scan"]
-            K = layer.conv_states[0].shape[-1]
-            layer.conv_states[0][bi].copy_(e["win"][r, :, t:t + K])
-            _, st = fused_recurrent_gated_delta_rule(
-                q[r:r + 1, :t], k[r:r + 1, :t], v[r:r + 1, :t],
-                g=g[r:r + 1, :t], beta=beta[r:r + 1, :t],
-                initial_state=init[r:r + 1], output_final_state=True,
-                use_qk_l2norm_in_kernel=True)
-            layer.recurrent_states[0][bi].copy_(st[0])
+        got = [st.ring_plan(bi) for st in self._stages]
+        if "fail" in got or not (plan or "ok" in got):
+            return False
+        _ring_apply(plan, bi, t)
+        for st, g in zip(self._stages, got):
+            if g == "ok":
+                st.queue("ring_apply", bi, t)
         return True
+
     def _verify(self, s, draft, dl, row_logits, greedy=None) -> tuple[int, int]:
         """Accept/reject this slot's draft and pick its next token --
         greedy exact-match at temperature 0, speculative sampling above
@@ -4711,6 +4899,8 @@ class ContinuousBatchEngine:
         self._advance_ragged(seqs, hist)
         for bi, toks in replay.items():
             self.past.crop(-len(toks), slot=bi)
+            for _st in self._stages:
+                _st.queue("crop", -len(toks), bi)
         # Restore each slot's true length for the next step.
         for bi, s in self._live():
             s._history_len = self._slot_len(bi)

@@ -16,7 +16,7 @@ source bytes + flags + target (GPU arch / XPU / CPU machine) + torch version + c
 A new format (qvb9, ...) needs nothing beyond calling these from its loader -- no setup.py, no build.py.
 
 CUDA toolkit: the newest under $CUDA_HOME, /usr/local/cuda, /usr/local/cuda-* that can still target the GPU (CUDA 13
-dropped sm_70/72: a V100 gets the newest 12.x). Concurrent first starts (torchrun ranks) serialise on torch's
+dropped sm_70/72: a V100 gets the newest 12.x). Concurrent first starts (several servers) serialise on torch's
 build-directory lock (CUDA / SYCL) or a host+pid lock file (C), which a later start clears if its builder
 died.
 """
@@ -68,14 +68,26 @@ def _key(name: str, sources, *extra) -> str:
     return h.hexdigest()[:12]
 
 
+def _torch_home(torch) -> str:
+    """The torch install the build compiles against. Part of the CUDA / SYCL key: the compile command names its
+    include folder, so two venvs with the same torch version sharing one build folder would each rebuild it at
+    every start (about 90 s) and replace the library under a running server of the other."""
+    return os.path.dirname(os.path.abspath(torch.__file__))
+
+
 def _announce(name: str, target: str, how: str) -> None:
     print(f"[qv_band] compiling {name} for {target} with {how} "
           f"(first run on this machine or after a source update)", flush=True)
 
 
 def _venv_on_path(*more: str) -> None:
-    """torch's builder needs ninja, which lives in the venv's bin/ (not always on PATH)."""
-    os.environ["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), *more, os.environ.get("PATH", "")])
+    """torch's builder needs ninja, which lives in a venv's bin/ (not always on PATH): this interpreter's, then the
+    one of the venv that holds torch (a venv layered on another by a .pth file, e.g. .venv-s2v on .venv, has the
+    ninja package from the lower venv but not its bin/ script)."""
+    import torch
+    lower = os.path.join(_torch_home(torch), *[os.pardir] * 4, "bin")           # <venv>/lib/pythonX.Y/site-packages/torch
+    os.environ["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), os.path.normpath(lower), *more,
+                                          os.environ.get("PATH", "")])
 
 
 # -- CUDA ------------------------------------------------------------------------------------------------------------
@@ -128,7 +140,7 @@ def load_cuda_ext(name: str, sources: list[str], *, cflags=(), cuda_cflags=(), l
         _LOADED[(name, "dev", dev)] = _LOADED[(name, arch)]
         return _LOADED[(name, arch)]
     home, ver = _toolkit_for(cc)
-    bdir = os.path.join(_CACHE, f"{name}-sm{arch}-{_key(name, sources, cflags, cuda_cflags, ldflags, arch, torch.__version__, ver)}")
+    bdir = os.path.join(_CACHE, f"{name}-sm{arch}-{_key(name, sources, cflags, cuda_cflags, ldflags, arch, torch.__version__, _torch_home(torch), ver)}")
     os.makedirs(bdir, exist_ok=True)
     if not glob.glob(os.path.join(bdir, f"{name}*.so")):
         _announce(name, f"sm_{arch}", f"CUDA {ver[0]}.{ver[1]}")
@@ -151,7 +163,7 @@ def load_sycl_ext(name: str, sources: list[str], *, cflags=(), sycl_cflags=()):
     if ("sycl", name) in _LOADED:
         return _LOADED[("sycl", name)]
     import torch
-    bdir = os.path.join(_CACHE, f"{name}-xpu-{_key(name, sources, cflags, sycl_cflags, torch.__version__)}")
+    bdir = os.path.join(_CACHE, f"{name}-xpu-{_key(name, sources, cflags, sycl_cflags, torch.__version__, _torch_home(torch))}")
     os.makedirs(bdir, exist_ok=True)
     if not glob.glob(os.path.join(bdir, f"{name}*.so")) and not glob.glob(os.path.join(bdir, f"{name}*.pyd")):
         _announce(name, "XPU", "the oneAPI SYCL compiler")
@@ -235,7 +247,7 @@ def load_c_ext(name: str, sources: list[str], *, cflags=(), ldflags=(), machines
     found = lambda: glob.glob(os.path.join(bdir, f"{name}*.so")) + glob.glob(os.path.join(bdir, f"{name}*.pyd"))
     built = found()
     if not built:
-        # One builder at a time (torchrun ranks start together). The module is linked in a private stage dir and
+        # One builder at a time (several servers can start together). The module is linked in a private stage dir and
         # moved into bdir with os.replace, so found() only ever sees a complete file; the others wait for it.
         lock = os.path.join(bdir, "lock")
         if _lock_take(lock):

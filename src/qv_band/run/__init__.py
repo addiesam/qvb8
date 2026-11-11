@@ -5,7 +5,5 @@ only -- calibration/pack drivers live under each codec's own calibration/.
                                     through. gen_core.load_model calls its
                                     load_qv_model.
     run_inference_cpu.py        300  CPU path
-    run_inference_tp.py         277  tensor-parallel multi-GPU; unused on a
-                                    single-GPU box but kept because it is the
-                                    multi-GPU path, not dead code
+    placement.py                     pipeline placement over N cards (--pipeline), the multi-GPU path
 """

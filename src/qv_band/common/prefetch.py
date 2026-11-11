@@ -35,7 +35,7 @@ class PackfilePrefetcher:
     """
 
     # Max bytes read ahead of the consumer. Unbounded read-ahead buffered most
-    # of the pack in host RAM (22 GB x 2 tensor-parallel ranks -> kernel OOM
+    # of the pack in host RAM (22 GB x 2 processes -> kernel OOM
     # on a 31 GB host); a few hundred MB keeps the I/O overlap.
     MAX_AHEAD_BYTES = 512 * 1024 * 1024
 

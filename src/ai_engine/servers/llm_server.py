@@ -29,7 +29,7 @@ at this speed -- a 200-token answer takes minutes, and you want the tokens as
 they arrive rather than after.
 
   python -m ai_engine.servers.llm_server /mnt/backup/models/Qwen3.5-9B_qvb8_fp16_1e-3 --port 8080
-  python -m ai_engine.servers.llm_server /mnt/data/models/Qwen3.8-27B_qvb8_tau1e-3 --host 0.0.0.0
+  python -m ai_engine.servers.llm_server /mnt/data/qvb8/Qwen3.8-27B_qvb8_1e-3_fp16 --host 0.0.0.0
 
 First argument is a self-contained pack folder (config, tokenizer and
 weights all live there) -- just a model path, nothing else needed to pick
@@ -61,7 +61,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from ai_engine.runtime.sampling import resolve_sampling
 from ai_engine.runtime.memlimit import rss_gb, vram_abort_check
 from ai_engine.generation.gen_core import (
-    DEFAULTS, GenParams, NO_ABORT, add_generation_args,
+    DEFAULTS, GenParams, add_generation_args,
     params_from_args, build_drafter, run_generate)
 from ai_engine.generation.loader import load_qvb8_llm
 
@@ -74,7 +74,7 @@ MODEL_ID = "qv-band-local"
 # STATE["params"] is the base GenParams built at load() from the launch
 # flags; each request clones it with per-call overrides (max_tokens,
 # temperature, ...). STATE["bundle"] is gen_core's ModelBundle (model,
-# tok, resolved device, TP remap). The loose per-field keys below are kept
+# tok, resolved device). The loose per-field keys below are kept
 # only for /health's JSON and backward-compatible reads.
 # STATE["prefix_cache"]: single-conversation KV-cache reuse (see
 # qv_band.decode.spec_decode.PrefixCache) across consecutive requests -- an
@@ -106,55 +106,22 @@ def _next_req_id() -> int:
         STATE["req_seq"] += 1
         return STATE["req_seq"]
 
-# ---------------------------------------------------------------------------
-# Tensor-parallel request dispatch (torchrun, WORLD_SIZE>1)
-# ---------------------------------------------------------------------------
-# speculative_generate() itself is TP-safe (see spec_decode.py: every rank
-# broadcasts its drafted/accepted token from rank 0 so every rank's model
-# input is byte-identical every step -- otherwise GEMM reduction-order float
-# noise between the physical GPUs desyncs the ranks and hangs forever). But
-# it still needs every rank to CALL it, with the identical arguments, at
-# the same time. Only rank 0 can own the HTTP socket (every rank binding
-# the same port is nonsensical), so the other ranks have no request of
-# their own to call it with -- this dispatcher is what gives them one.
-#
-# Rank 0: every generate()/streaming call goes through _tp_dispatch first,
-# which broadcasts the call's arguments (a small picklable dict) to every
-# other rank before running the real work locally.
-# Rank 1+: after the model loads, main() puts these ranks into
-# _tp_follower_loop instead of starting an HTTP server -- they block on the
-# same broadcast, receive rank 0's arguments when a request arrives, and
-# run the identical generate() call (its own local devices, its own
-# drafter instance, but the arguments -- and, thanks to speculative_generate's
-# own internal sync, ultimately the token stream -- match rank 0's exactly).
-#
-# A clean shutdown is a broadcast too (kind="stop"), so ranks 1+ exit their
-# loop instead of being torchrun SIGTERM'd -- which would leave rank 0's
-# next request hanging on a broadcast nobody answers.
-_TP_WORLD = int(os.environ.get("WORLD_SIZE", "1"))
-_TP_ACTIVE = _TP_WORLD > 1
-
 # Largest non-streaming response served. A non-streaming request holds an
 # idle socket for the whole generation, and most HTTP clients apply a read
 # timeout well under that; past this size the client is told to stream
 # instead. Streaming has no such limit -- it is bounded by
 # --max-output-tokens like any other request.
 NONSTREAM_MAX_TOKENS = DEFAULTS.MAX_OUTPUT_TOKENS
-_TP_RANK = int(os.environ.get("RANK", "0"))
-_TP_IS_LEADER = (not _TP_ACTIVE) or _TP_RANK == 0
 
 # Seconds of scheduler idleness before the CUDA allocator cache is returned
 # to the driver (once per idle period). 30 min by default so a pause between
 # chat turns never pays the re-allocation; QV_IDLE_TRIM_S=0 trims at once.
 IDLE_TRIM_S = float(os.environ.get("QV_IDLE_TRIM_S", "1800"))
 
-# --no-scheduler / QV_NO_SCHEDULER=1: serve with the STATE["lock"]-serialised
-# path instead of the continuous-batching scheduler. Useful for debugging or
-# comparing against the batched path. (It used to be REQUIRED on a box without
-# flash_attn; the batched path now falls back to per-sequence SDPA there, just
-# more slowly -- see qv_band spec_decode._qv_varlen_attention_forward.) Set in
-# main() from the flag; the env var alone also works for callers that build
-# GenParams by hand.
+# --no-scheduler / QV_NO_SCHEDULER=1: one switch, read once at start-up, the same on every machine (the dev GPU, V100,
+# sm_80+ cards). On (default): the continuous-batching scheduler serves every request. Off: one request at a time
+# behind STATE["lock"]. load() builds the scheduler or not from this value; a request takes its path once, on
+# arrival (STATE["scheduler"] set or None) -- no step or token loop tests it.
 _SCHEDULER_OFF = os.environ.get("QV_NO_SCHEDULER", "").lower() in (
     "1", "true", "yes", "on")
 
@@ -163,58 +130,6 @@ def _set_scheduler(enabled: bool) -> None:
     """Record the --no-scheduler decision in the module global load() reads."""
     global _SCHEDULER_OFF
     _SCHEDULER_OFF = not enabled
-
-
-def _tp_dispatch(kind: str, payload: dict) -> None:
-    """Rank 0 only: broadcast one request's dispatch payload to every other
-    rank before running it locally. No-op when not running under TP.
-
-    Call it ONLY while holding STATE["lock"]: a dispatch sent while another
-    request is generating lands between that request's model collectives, and
-    the follower reads a spec_decode broadcast as its next dispatch."""
-    if not _TP_ACTIVE:
-        return
-    import torch.distributed as dist
-    box = [{"kind": kind, "payload": payload}]
-    dist.broadcast_object_list(box, src=0)
-
-
-def _tp_follower_loop() -> None:
-    """Non-leader ranks: block for rank 0's next dispatched request (or
-    stop signal) and run it identically. Runs for the process lifetime in
-    place of serving HTTP."""
-    import torch.distributed as dist
-    print(f"[serve] rank {_TP_RANK} following rank 0's requests "
-          f"(no HTTP socket on this rank)", flush=True)
-    while True:
-        box = [None]
-        dist.broadcast_object_list(box, src=0)
-        msg = box[0]
-        if msg is None or msg.get("kind") == "stop":
-            print(f"[serve] rank {_TP_RANK} stopping", flush=True)
-            return
-        payload = msg.get("payload", {})
-        try:
-            if msg["kind"] == "generate":
-                generate(**payload, _tp_dispatched=True)
-            elif msg["kind"] == "stream":
-                # The SSE path emits bytes to a real client socket rank 0
-                # owns; this rank has no socket to write to and does not
-                # need one -- it only needs to run speculative_generate in
-                # lockstep. _stream_follower reproduces exactly the model
-                # call _stream_leader_side makes (same drafter resolution,
-                # same speculative_generate arguments), discarding output.
-                _stream_follower(**payload)
-        except Exception as e:
-            # A follower's exception must never propagate out of this loop
-            # (there is no HTTP response to send it to, and an uncaught
-            # exception here would kill this rank while rank 0 carries on
-            # -- the next request's broadcast would then hang forever
-            # waiting for a rank that no longer exists). Log and keep
-            # following; rank 0's own try/except around the same call
-            # reports the real error to the client.
-            print(f"[serve] rank {_TP_RANK} follower error (continuing): "
-                  f"{e!r}", flush=True)
 
 
 def _ts() -> str:
@@ -231,9 +146,7 @@ def _ts() -> str:
 # +2.0 GB after a long prompt, none of it visible to torch. Resetting the stack
 # limit releases it; the next request re-grows it in a few ms. That part is
 # skipped while CUDA graphs are on (QVB8_MLP_GRAPH, see _rest_trim). Runs inside each
-# request's lock on every rank (all ranks call this at the same point), never
-# from a background thread: a follower rank idles inside an NCCL broadcast,
-# and a device-synchronising call there would deadlock.
+# request's lock, never from a background thread.
 _REST_TRIM = os.environ.get("QV_REST_TRIM", "1") != "0"
 _CUDART = None
 
@@ -243,10 +156,10 @@ def _rest_trim() -> None:
     import ctypes
     import torch
     # Pipeline placement spans every visible card in this one process; a
-    # tensor-parallel rank (or a single-card server) owns only its current
-    # one -- touching another card would create a stray context there.
-    if int(os.environ.get("QV_PIPELINE_SPLIT", "0") or 0) > 0:
-        devices = list(range(torch.cuda.device_count()))
+    # single-card server owns only its current one -- touching another card
+    # would create a stray context there.
+    if os.environ.get("QV_PIPELINE", "").strip():
+        devices = sorted({torch.device(d).index for d in os.environ["QV_PIPELINE"].split(",") if d.strip()})
     else:
         devices = [torch.cuda.current_device()]
     for d in devices:
@@ -347,12 +260,11 @@ def _maybe_empty_cache(bundle) -> None:
 # file, which is where a reader actually looks.
 #
 # SCOPE (matches ContinuousBatchEngine's own documented gaps): only
-# qvb8_resident (BandedKVCache) + non-TP requests use this path. int8/bf16
-# KV caches and tensor-parallel (WORLD_SIZE>1) have NO per-slot state / no
-# batched-forward broadcast built for them yet -- load() must keep routing
+# qvb8_resident (BandedKVCache) requests use this path. int8/bf16
+# KV caches have NO per-slot state built for them -- load() must keep routing
 # those through the OLD STATE["lock"] path rather than silently degrading
 # them under this scheduler, which would either crash (batch-size
-# mismatch) or (TP) desync ranks and hang forever.
+# mismatch) or hang.
 #
 # NOT YET SUPPORTED, same as ContinuousBatchEngine: prefix-cache reuse
 # across requests (every request prefills cold), abort/disconnect
@@ -621,6 +533,7 @@ class BatchScheduler:
             prefill_chunk=self.prefill_chunk)
         engine = self._engine
         engine.cancel_check = self._cancel_snapshot
+        engine.over_ceiling = vram_abort_check
         last_active = time.monotonic()
         trimmed = False
         while not self._stop.is_set():
@@ -712,6 +625,7 @@ class BatchScheduler:
                     prefill_chunk=self.prefill_chunk)
                 engine = self._engine
                 engine.cancel_check = self._cancel_snapshot
+                engine.over_ceiling = vram_abort_check
                 continue
 
             # A slot that finished this step is already dropped from
@@ -785,8 +699,7 @@ def load(model_dir: str, think: bool, params: "GenParams"):
     # Continuous-batching scheduler (real multi-request parallel serving)
     # -- only wired up when this server's own config matches what
     # speculative_generate_batched actually supports: qvb8_resident (the
-    # per-slot KV cache rewrite this backs onto) and non-TP (no rank-
-    # broadcast built for the batched path yet). Every other config keeps
+    # per-slot KV cache rewrite this backs onto). Every other config keeps
     # using the old STATE["lock"]-serialised path unchanged -- see
     # BatchScheduler's own docstring above for the full scope rationale.
     # A fresh drafter instance is needed PER SLOT (drafters
@@ -794,12 +707,17 @@ def load(model_dir: str, think: bool, params: "GenParams"):
     # (build_drafter called again on demand), not the single shared
     # drafter_obj every other path reuses.
     STATE["scheduler"] = None
-    # Pipeline placement (layers split across cards, QV_PIPELINE_SPLIT) runs
-    # only on the serialised path: the batched engine builds its per-slot
-    # tensors on one device and concatenates across layers that now live on
-    # two (RuntimeError "Expected all tensors to be on the same device").
-    _pipeline = int(os.environ.get("QV_PIPELINE_SPLIT", "0") or 0) > 0
-    if params.qvb8_resident and not _TP_ACTIVE and not _SCHEDULER_OFF and not _pipeline:
+    # Pipeline placement over N cards (QV_PIPELINE, --pipeline) is served by the scheduler too: every per-slot cache
+    # tensor lives on its layer's card (BandedKVLayer._adopt_device / add_slot) and drafter taps are gathered on the
+    # main card (unified_scheduler.md section 4).
+    _pipeline = bool(os.environ.get("QV_PIPELINE", "").strip())      # N-card placement: served by the scheduler too
+    if os.environ.get("QV_STAGES", "").strip():
+        # Layers on another machine (--pipeline HOST:PORT,local): the scheduler is the only path that serves them.
+        if not (params.qvb8_resident and not _SCHEDULER_OFF):
+            raise SystemExit("--pipeline with a remote stage needs the scheduler (--kv-cache qvb8, no --no-scheduler)")
+        from qv_band.decode.remote_stage import attach_from_env
+        attach_from_env(bundle.model)
+    if params.qvb8_resident and not _SCHEDULER_OFF:
         # A DFlash drafter carries gigabytes of weights: every slot gets a
         # fork() of the one already built (shared weights, own context)
         # instead of loading the draft model once per concurrent request.
@@ -818,15 +736,15 @@ def load(model_dir: str, think: bool, params: "GenParams"):
         scheduler.start()
         STATE["scheduler"] = scheduler
         print("[serve] continuous-batching scheduler ACTIVE "
-              "(qvb8_resident, non-TP) -- concurrent requests share "
+              "(qvb8_resident) -- concurrent requests share "
               "batched forward passes", flush=True)
     else:
         # Serialised path: one request at a time behind STATE["lock"], using
         # the stock attention implementation. Chosen by --no-scheduler, or
         # forced when the config does not support the batched engine
-        # (non-resident KV cache, tensor parallel).
+        # (non-resident KV cache).
         print("[serve] continuous-batching scheduler NOT active "
-              f"(qvb8_resident={params.qvb8_resident}, TP={_TP_ACTIVE}, "
+              f"(qvb8_resident={params.qvb8_resident}, "
               f"pipeline={_pipeline}, disabled={_SCHEDULER_OFF}) "
               "-- requests are serialised behind STATE[\"lock\"]",
               flush=True)
@@ -1171,14 +1089,8 @@ def _timings_str(t: dict) -> str:
 def generate(text: str, max_tokens: int, draft: int, on_token=None,
              temperature: float | None = None, top_k: int | None = None,
              top_p: float | None = None, think: bool = True,
-             _tp_dispatched: bool = False, req_id: int = 0) -> dict:
+             req_id: int = 0) -> dict:
     """One generation, serialised.  Returns text and timing.
-
-    `_tp_dispatched`: set by _tp_follower_loop when it calls this on behalf
-    of a broadcast from rank 0 -- skips re-broadcasting (which would hang
-    waiting for a rank that already IS the one running this call) and
-    skips STATE["served"]/["tokens"] bookkeeping (meaningless off the
-    leader, which is the only rank an HTTP client ever talks to).
 
     `req_id`: the server-side log tag for this request. The non-streaming
     route used to print NOTHING -- no "arrived", no "done", no timing --
@@ -1197,11 +1109,50 @@ def generate(text: str, max_tokens: int, draft: int, on_token=None,
     # run_generate; nothing here re-derives it.
     rp = _request_params(max_tokens, draft, temperature, top_k, top_p)
 
+    # Scheduler active: the scheduler thread is the ONLY thread that may run the model. A forward pass on this HTTP
+    # thread would fire the scheduler's layer-capture hooks and see its global attention-implementation switch
+    # (wrong-size feature tensors, "ragged_kv_views" on an empty slot). Submit like the streaming route does, collect.
+    sch = STATE.get("scheduler")
+    if sch is not None:
+        print(f"[serve] {_ts()} req #{req_id} scheduler path", file=sys.__stdout__, flush=True)
+        out_q = sch.submit(ids, rp.max_output_tokens, rp.temperature or 0.0, rp.top_k or 0, rp.top_p or 1.0, req_id)
+        out, st, t0 = [], None, time.time()
+        try:
+            while True:
+                try:
+                    item = out_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if isinstance(item, Exception):
+                    raise item
+                if hasattr(item, "stats"):          # _StreamDone
+                    st = item.stats
+                    break
+                out.append(int(item))
+        except BaseException:
+            sch.cancel(req_id)
+            raise
+        dt = time.time() - t0
+        STATE["served"] += 1
+        STATE["tokens"] += len(out)
+        _decoded = tok.decode(out, skip_special_tokens=True)
+        line = (f"[serve] {_ts()} req #{req_id} done: {len(out)} tok in {dt:.1f}s "
+                f"({len(out)/max(dt, 1e-9):.2f} tok/s) [scheduler]")
+        if st is not None and st.proposed:
+            line += (f"  |  drafted {st.proposed}, accepted {st.accepted} ({st.acceptance:.0%}), "
+                     f"{st.steps} steps, draft {st.t_draft:.1f}s verify {st.t_verify:.1f}s")
+        print(line, file=sys.__stdout__, flush=True)
+        return {
+            "text": _strip_think(_decoded) if think else _decoded,
+            "prompt_tokens": int(ids.shape[1]),
+            "completion_tokens": len(out),
+            "seconds": round(dt, 2),
+            "tokens_per_second": round(len(out) / dt, 3) if dt else None,
+            "accepted": st.accepted if st else 0, "proposed": st.proposed if st else 0,
+            "timings": _timings(st, len(out), dt, int(ids.shape[1])) if st else {},
+        }
+
     with STATE["lock"]:
-        if _TP_ACTIVE and not _tp_dispatched:
-            _tp_dispatch("generate", dict(
-                text=text, max_tokens=max_tokens, draft=draft,
-                temperature=temperature, top_k=top_k, top_p=top_p, think=think))
         t0 = time.time()
         prefix_cache_in = STATE["prefix_cache"]
         try:
@@ -1242,41 +1193,6 @@ def generate(text: str, max_tokens: int, draft: int, on_token=None,
         "accepted": st.accepted, "proposed": st.proposed,
         "timings": tm,
     }
-
-
-def _stream_follower(text: str, max_tokens: int, draft: int, has_tools: bool,
-                     think: bool, stops: list[str] | None,
-                     temperature: float | None, top_k: int | None,
-                     top_p: float | None) -> None:
-    """Non-leader-rank counterpart of Handler._stream: runs the identical
-    speculative_generate call (same drafter resolution, same arguments,
-    same abort-sync participation) with no HTTP socket to write to and no
-    output worth keeping -- this rank's only job is to stay in lockstep
-    with rank 0's real request. See _tp_follower_loop/_tp_dispatch's module
-    docstring for why a follower rank needs this at all.
-
-    `has_tools`/`think`/`stops` are accepted for signature parity with the
-    leader's dispatch payload but unused here -- they only affect what
-    Handler._stream buffers/truncates for the CLIENT'S benefit, not what
-    speculative_generate computes, so this rank has no reason to replicate
-    that bookkeeping."""
-    bundle = STATE["bundle"]
-    ids = bundle.tok(text, return_tensors="pt").input_ids
-    if bundle.use_gpu:
-        ids = ids.to(bundle.gpu_dev)
-    drafter = STATE["drafter_obj"] if draft > 0 else None
-    rp = _request_params(max_tokens, draft, temperature, top_k, top_p)
-
-    with STATE["lock"]:
-        try:
-            # NO_ABORT: this rank has no client socket. Only rank 0's
-            # abort_check is consulted; spec_decode broadcasts rank 0's
-            # decision every step (tp_active branch), so this rank still
-            # stops exactly when rank 0 (disconnect OR VRAM ceiling) does.
-            run_generate(bundle, drafter, ids, rp, stream=False,
-                         abort_check=NO_ABORT)
-        finally:
-            _maybe_empty_cache(bundle)
 
 
 class Handler(QVHTTPHandler):
@@ -1350,8 +1266,6 @@ class Handler(QVHTTPHandler):
         "stream": true request is handled by _vision_chat_stream)."""
         from ai_engine.generation import vision as _vision
         bundle = STATE["bundle"]
-        if _TP_ACTIVE:
-            return self._send(400, {"error": "image input is not supported with tensor parallel"})
         if body.get("stream"):
             return self._vision_chat_stream(body, max_tokens, think, temperature, top_k, top_p,
                                             req_id=req_id)
@@ -2127,7 +2041,7 @@ class Handler(QVHTTPHandler):
         rp = _request_params(max_tokens, draft, temperature, top_k, top_p)
 
         # ---- CONTINUOUS-BATCHING SCHEDULER PATH -----------------------
-        # When STATE["scheduler"] is set (qvb8_resident + non-TP, see
+        # When STATE["scheduler"] is set (qvb8_resident, see
         # load()), route through it instead of the old STATE["lock"]-
         # serialised call below -- this is what actually lets two Cline
         # connections share one batched forward pass per decode step
@@ -2301,11 +2215,6 @@ class Handler(QVHTTPHandler):
              f"prompt {ids.shape[1]} tok",
              file=sys.__stdout__, flush=True)
         with STATE["lock"]:
-            if _TP_ACTIVE:
-                _tp_dispatch("stream", dict(
-                    text=text, max_tokens=rp.max_output_tokens, draft=rp.draft_k,
-                    has_tools=has_tools, think=think, stops=stops,
-                    temperature=rp.temperature, top_k=rp.top_k, top_p=rp.top_p))
             t0 = time.time()
             prefix_cache_in = STATE["prefix_cache"]
             # BUG FIX: spec_decode.py's [prefill] lines read this via
@@ -2333,8 +2242,7 @@ class Handler(QVHTTPHandler):
                 # abort_check: stop if the client disconnected OR live CUDA
                 # memory reached --max-memory-gb. Polled every step (not
                 # only when a token is emitted, which is all _Shim.write's
-                # _ClientGone catches), and under TP speculative_generate
-                # broadcasts the decision to every rank -- see its docstring.
+                # _ClientGone catches).
                 # A raised exception here (_ClientGone, a CUDA OOM, ...)
                 # means speculative_generate's own return_cache path never
                 # ran -- but the cache object it was mutating in place
@@ -2586,14 +2494,6 @@ class Handler(QVHTTPHandler):
 
 
 def main():
-    # Tensor-parallel launch (torchrun, WORLD_SIZE>1): silence every rank
-    # but 0's stdout via redirect (not a builtins.print monkeypatch --
-    # numba, imported lazily by qv_band's KV codec modules,
-    # asserts the real print builtin is still reachable by identity at
-    # builtins.print; see chat.py's identical guard for the fuller story).
-    if _TP_ACTIVE and not _TP_IS_LEADER:
-        sys.stdout = open(os.devnull, "w")
-
     ap = argparse.ArgumentParser()
     ap.add_argument("model", help="self-contained pack folder to serve")
     ap.add_argument("--host", default="127.0.0.1",
@@ -2619,6 +2519,10 @@ def main():
                     help="top-K logits kept (temperature > 0 only).")
     ap.add_argument("--top-p", type=float, default=None,
                     help="nucleus threshold (temperature > 0 only).")
+    from ai_engine.cli.kv_offload import add_flags as _add_kv_offload_flags
+    from ai_engine.cli.pipeline_flags import add_flags as _add_pipeline_flags
+    _add_kv_offload_flags(ap)
+    _add_pipeline_flags(ap)       # applied before the engine import by the entry point (cli/kv_offload.py)
     ap.add_argument("--greedy", action="store_true",
                     help="plain greedy/deterministic decoding (== "
                          "--temperature 0).")
@@ -2629,10 +2533,9 @@ def main():
     ap.add_argument("--no-scheduler", dest="scheduler", action="store_false",
                     default=True,
                     help="do not start the continuous-batching scheduler; "
-                         "serve requests one at a time behind a lock. Slower "
-                         "under concurrency; mainly for debugging and for "
-                         "comparing against the batched path. (Env: "
-                         "QV_NO_SCHEDULER=1.)")
+                         "serve requests one at a time behind a lock (slower "
+                         "with several users). Works on every machine; decided "
+                         "once at start-up. (Env: QV_NO_SCHEDULER=1.)")
     args = ap.parse_args()
     _set_scheduler(args.scheduler)
 
@@ -2642,38 +2545,21 @@ def main():
     # One GenParams from the launch flags -- llm_server.py holds it in
     # STATE["params"] and each request clones it (see _request_params).
     params = params_from_args(args)
-    if _TP_ACTIVE and params.max_memory_gb:
-        # Every rank checks its own card against the ceiling at each decode
-        # step (spec_decode._over_vram_ceiling) -- a follower has no
-        # abort_check of its own, and its card can be the fuller one.
-        os.environ["QV_VRAM_CEILING_GB"] = str(params.max_memory_gb)
     STATE["vision"] = (args.vision != "off")
     # Bind the socket BEFORE loading the model: loading a 27B pack takes
     # minutes and ~24 GB of VRAM, and a port clash discovered afterwards
     # wastes all of that (the process then dies with "Address already in
     # use" only after the whole model is resident). Fail fast instead.
-    # Only the leader binds: every rank of a torchrun launch shares the host,
-    # so a follower binding first makes rank 0 fail with "Address in use".
-    srv = None
-    if _TP_IS_LEADER:
-        try:
-            srv = QVHTTPServer((args.host, args.port), Handler)
-        except OSError as exc:
-            print(f"[serve] cannot bind {args.host}:{args.port}: {exc}",
-                  file=sys.stderr, flush=True)
-            print("[serve] another server is probably already running on that "
-                  "port -- stop it, or pass -p <port>.", file=sys.stderr,
-                  flush=True)
-            raise SystemExit(1) from exc
+    try:
+        srv = QVHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        print(f"[serve] cannot bind {args.host}:{args.port}: {exc}",
+              file=sys.stderr, flush=True)
+        print("[serve] another server is probably already running on that "
+              "port -- stop it, or pass -p <port>.", file=sys.stderr,
+              flush=True)
+        raise SystemExit(1) from exc
     load(args.model, args.think, params)
-
-    if not _TP_IS_LEADER:
-        # Tensor-parallel non-leader rank: no HTTP socket, no port to bind
-        # (every rank binding the same one would be nonsensical anyway) --
-        # just follow rank 0's requests for the process lifetime. See
-        # _tp_follower_loop's docstring for the full architecture.
-        _tp_follower_loop()
-        return
 
     print(f"[serve] http://{args.host}:{args.port}")
     print("  GET  /health")
@@ -2707,12 +2593,6 @@ def main():
             except Exception:
                 traceback.print_exc()
         srv.server_close()
-        # Tell any following ranks to exit their loop too -- otherwise
-        # they sit forever on a broadcast this rank (now shutting down)
-        # will never send, and torchrun has to SIGTERM them instead of a
-        # clean exit.
-        if _TP_ACTIVE:
-            _tp_dispatch("stop", {})
 
 
 if __name__ == "__main__":

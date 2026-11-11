@@ -348,31 +348,8 @@ class DFlashDrafter:
         # Each tensor is read by its OWN file extension, as the model loader does: a qvb8r pack keeps a
         # few tensors as .qvband.
         spec_of = lambda path: get_format(os.path.splitext(path)[1].lstrip("."))
-        # Tensor parallel: every rank runs the drafter in lockstep (same
-        # inputs, rank 0's draft broadcast), so its linears can be row-sharded
-        # like the target's -- each rank holds 1/world of the drafter instead
-        # of a full replica (2.5 GB -> 1.25 GB per card on the 27B's DFlash2).
-        # A format without a sharded reader (qvb8r) loads a full replica on
-        # every rank instead -- what every format did before sharding existed.
-        import torch.distributed as dist
-        tp_world = dist.get_world_size() if dist.is_initialized() else 1
-        replicated: list = []
-        if tp_world > 1:
-            tp_rank = dist.get_rank()
-
-            def _load_linear(path):
-                spec = spec_of(path)
-                if spec.sharded_linear is None:
-                    if not replicated:
-                        print(f"DFlash2: format {spec.name} has no sharded reader -- "
-                              f"full drafter replica on every rank", flush=True)
-                    replicated.append(path)
-                    return spec.linear.from_packfile(path, device=str(self.device))
-                return spec.sharded_linear.from_packfile(
-                    path, rank=tp_rank, world=tp_world, device=str(self.device))
-        else:
-            def _load_linear(path):
-                return spec_of(path).linear.from_packfile(path, device=str(self.device))
+        def _load_linear(path):
+            return spec_of(path).linear.from_packfile(path, device=str(self.device))
         for name, info in man.get("tensors", {}).items():
             if name in self._DENSE_ONLY:
                 if name not in w and pack_dir == self._draft_dir:
@@ -396,7 +373,7 @@ class DFlashDrafter:
                     f"(pack source: {man.get('hf_model')})")
             path = os.path.join(pack_dir, info["pack"])
             w[name] = _load_linear(path)
-            self.param_bytes += info["bytes"] if (tp_world == 1 or path in replicated) else info["bytes"] // tp_world
+            self.param_bytes += info["bytes"]
             n += 1
         self.param_bytes += sum(v.numel() * v.element_size()
                                 for v in w.values() if isinstance(v, torch.Tensor))
@@ -831,7 +808,10 @@ def build_dflash_drafter(model, draft_dir: str, device: str = "cuda",
     `pack_dir`: a qvb8 pack of `draft_dir` (pack_model.py) for the linears."""
     n_target = model.config.num_hidden_layers
     cfg = json.load(open(os.path.join(draft_dir, "config.json")))
-    if "LiLiCorrDraftModel" in (cfg.get("architectures") or []):      # Nemotron-3.5-Bolt LiLiCorr drafter
+    if cfg.get("no_rope_layers"):                                     # DFlash2 with NoPE layers
+        from qv_band.decode.dflash_nope_draft import build_nope_drafter
+        return build_nope_drafter(model, draft_dir, device=device, pack_dir=pack_dir)
+    if "LiLiCorrDraftModel" in (cfg.get("architectures") or []):      # LiLiCorr drafter
         from qv_band.decode.lilicorr_draft import LiLiCorrDrafter
         cls = LiLiCorrDrafter
     else:

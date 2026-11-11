@@ -10,7 +10,7 @@ tensor program with no host synchronisation and static weight addresses, which
 is exactly what a CUDA graph replays at a fraction of the cost.
 
 HOW. `install_moe_graphs(model)` wraps each MoE block's forward. For a block
-call with M <= QVBandExpertsV8.FUSED_MAX_TOKENS rows the wrapper keeps one
+call with M <= QVBandExpertsV8.fused_max_tokens(device) rows the wrapper keeps one
 captured graph per (M, dtype): on first use it warms up eagerly (which also
 builds the experts' stacked layout, an allocation that must not happen inside
 capture), then captures; afterwards a call is `static_in.copy_(x); graph.replay();
@@ -56,10 +56,10 @@ def capture_stream_for(device) -> "torch.cuda.Stream":
 
 
 class _BlockGraphs:
-    def __init__(self, block, max_tokens: int, pool=None):
+    def __init__(self, block, max_tokens, pool=None):
         self.block = block
         self.orig = block.forward
-        self.max_tokens = max_tokens
+        self.limit = max_tokens         # device -> the fused path's token limit on that GPU
         self.pool = pool                # shared capture pool (None: one per graph)
         self.graphs: dict = {}
         self.disabled = False
@@ -69,7 +69,7 @@ class _BlockGraphs:
                 or hidden_states.dim() != 3):
             return self.orig(hidden_states)
         b, s, h = hidden_states.shape
-        if b * s > self.max_tokens or torch.cuda.is_current_stream_capturing():
+        if b * s > self.limit(hidden_states.device) or torch.cuda.is_current_stream_capturing():
             return self.orig(hidden_states)
         key = (b, s, hidden_states.dtype)
         ent = self.graphs.get(key)
@@ -132,7 +132,7 @@ def install_moe_graphs(model) -> int:
         ex = getattr(mod, "experts", None)
         if not isinstance(ex, QVBandExpertsV8) or getattr(mod, "_qvb8_moe_graph", False):
             continue
-        g = _BlockGraphs(mod, QVBandExpertsV8.FUSED_MAX_TOKENS)
+        g = _BlockGraphs(mod, QVBandExpertsV8.fused_max_tokens)
         mod.forward = g
         mod._qvb8_moe_graph = True
         n += 1
@@ -146,14 +146,13 @@ def install_mlp_graphs(model) -> int:
     """Dense models: replay each decoder layer's MLP as a CUDA graph at decode.
 
     The same CPU-bound decode the MoE path fixes, on a dense 27B: a decode
-    step is ~500 packed-linear calls plus (tensor parallel) their all-gathers,
-    and the GPU idles while Python issues them (measured 2x V100: each rank at
-    100% of one core, GPUs 53-75% busy). An MLP -- gate/up, SwiGLU, down and
-    their collectives -- is stateless with static weight addresses, so it
+    step is ~500 packed-linear calls,
+    and the GPU idles while Python issues them. An MLP -- gate/up, SwiGLU, down
+    -- is stateless with static weight addresses, so it
     captures cleanly; attention and Gated-DeltaNet carry Python-managed cache
-    state and stay eager. Under tensor parallel every rank sees the same row
-    counts in the same order, so both capture the same collectives together.
-    Opt-in, QVB8_MLP_GRAPH=1: +17% decode on 2x V100 but it pins ~2 GB of local
+    state and stay eager.
+    Opt-in, QVB8_MLP_GRAPH=1: it measured +17% decode on 2x V100 under the removed tensor-parallel launch (not
+    re-measured with --pipeline) but it pins ~2 GB of local
     memory per card (and blocks the rest-trim), and on the dev GPU it measured ~10%
     SLOWER (DFlash decode, 27B). Returns how many MLPs were wrapped."""
     if os.environ.get("QVB8_MLP_GRAPH", "0") != "1" or not torch.cuda.is_available():
@@ -173,7 +172,7 @@ def install_mlp_graphs(model) -> int:
         if (mlp is None or getattr(mlp, "_qvb8_moe_graph", False)
                 or isinstance(getattr(mlp, "experts", None), QVBandExpertsV8)):
             continue
-        mlp.forward = _BlockGraphs(mlp, MLP_GRAPH_MAX_TOKENS, pool=pool)
+        mlp.forward = _BlockGraphs(mlp, lambda _dev: MLP_GRAPH_MAX_TOKENS, pool=pool)   # limit: device -> tokens
         mlp._qvb8_moe_graph = True
         n += 1
     return n

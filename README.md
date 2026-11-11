@@ -2,8 +2,8 @@
 
 QVB8 stores model weights in a compressed format where **the error of every restored weight is guaranteed to be less than the
 error bound τ**. The engine runs the compressed weights directly on the GPU: custom CUDA kernels decode them inside
-the matmuls, so large models run on small hardware. It provides an OpenAI-compatible HTTP server and a terminal chat,
-with DFlash2 speculative decoding.
+the matmuls, so large models run on small hardware. It provides an OpenAI-compatible HTTP server and a terminal chat
+client, with DFlash2 speculative decoding.
 
 The engine is general CUDA code. **Version 1 provides a build for the NVIDIA DGX Spark (GB10, sm_121, aarch64).**
 
@@ -30,14 +30,17 @@ identical to the original's, or correct. See the disclaimer at the end of this f
 - **Model:** one model so far, **Ripple-65B-Preview** (a dense 65B LLM by Ricursive AI), with its DFlash2 draft model for
   speculative decoding.
 - **Weight formats:** QVB8 and QVB8R packs (QVB8R is the smaller, entropy-coded variant).
-- **Interfaces:** an OpenAI-compatible HTTP server (streaming, tool calls, reasoning output) and a terminal chat.
+- **Interfaces:** an OpenAI-compatible HTTP server (streaming, tool calls, reasoning output) and a terminal chat client.
+- **Hardware:** one GPU, or several in one machine (`--pipeline cuda:0,cuda:1`, one process, the layers split across
+  the cards), or several machines (a remote stage worker runs a layer range on another box).
+- **KV cache:** the certified compressed KV cache, with optional offload of the cold history to system RAM
+  (`--kv-window` / `--kv-host`) for long contexts.
 - **Not in version 1:** images, video and audio models, image input to the LLM, other LLMs, and creating packs.
 
 | Model | Type | Status |
 |---|---|---|
 | **Ripple-65B-Preview** | LLM (text) | **Version 1: supported** |
 | Qwen3.8-27B | LLM (text) | Planned |
-| Z-Image, Qwen-Image-Edit, MiniMax-H3 | Image / video | Planned |
 
 ## Requirements
 
@@ -46,8 +49,8 @@ identical to the original's, or correct. See the disclaimer at the end of this f
   This is the build that has been tested.
 - **Other GPUs:** the source is not tied to one GPU. The kernels compile for your GPU on first use (for example sm_120 on an
   RTX PRO 6000), but only the DGX Spark build is tested for Ripple.
-- **Compute dtype, `--dtype bf16|fp16`:** the launchers pass `--dtype bf16`; add `--dtype fp16` after it to run in fp16,
-  for example `scripts/ripple_server.sh start --dtype fp16` (the same flag works for `scripts/ripple_chat.sh`). Nothing
+- **Compute dtype, `--dtype bf16|fp16`:** the server launcher passes `--dtype fp16`; add `--dtype bf16` after it to
+  run in bf16, for example `scripts/ripple_server.sh start --dtype bf16`. Nothing
   is chosen automatically. A GPU without bf16 support (for example the V100, sm_70) emulates bf16 and is slow, so run it
   in fp16. On a GPU with bf16 (A100, H100, RTX 30/40/50, DGX Spark) both work: test which is faster on your card. The
   packs below are certified for both fp16 and bf16, so the error of every restored weight is less than tau in either
@@ -57,7 +60,7 @@ identical to the original's, or correct. See the disclaimer at the end of this f
   `manifest.json`. It holds the fp16 escape table: the few weights an fp16 decode must take from the stored originals.
   An fp16 run without it stops at start-up and tells you to download it; a bf16 run does not need it.
   For the V100 the code has its own kernel paths (register-blocked GEMV, WMMA attention) and needs CUDA 12.x, because
-  CUDA 13 dropped sm_70. The V100 path is verified on Qwen models, not yet on Ripple.
+  CUDA 13 dropped sm_70. The V100 path is not yet verified on Ripple.
 - Python 3.10+ (tested 3.12) and the packages in `requirements.txt` (tested versions pinned).
 - A Ripple target pack and a DFlash2 drafter pack (each pack dir carries its own config, modeling code and tokenizer).
 
@@ -118,9 +121,16 @@ export DRAFT=./models/Ripple-65B-Preview-DFlash2-QVB8-5e-3
 scripts/ripple_server.sh            # start in the background, wait until ready
 scripts/ripple_server.sh status
 scripts/ripple_server.sh log        # follow scripts/logs/Ripple-65B.log
+scripts/ripple_server.sh startup    # the load / placement / kernel / memory lines from this start
 scripts/ripple_server.sh stop
 scripts/ripple_server.sh restart --no-think    # extra flags go to the server and win
 ```
+
+More than one card in one machine: add `--pipeline cuda:0,cuda:1` (the cards, in layer order; the last is the main
+card). One process; each card holds a contiguous range of layers, so a pack larger than one card's memory loads.
+Several machines: run `python -m ai_engine.cli.stage_worker $MODEL --stage-port 50818 --stage-layers 0:12` on the
+other box and add `--pipeline host:50818,local --pipeline-split 12` here (the link is unauthenticated: use a private
+network).
 
 Default port is 8080 (override with `PORT=...`). The server speaks the OpenAI chat API:
 
@@ -134,10 +144,16 @@ as sent by Cline and similar clients.
 
 ## Chat in the terminal
 
+The chat is a client for a running server (it loads no model; standard library only):
+
 ```bash
-MODEL=... DRAFT=... scripts/ripple_chat.sh                                 # interactive
-MODEL=... DRAFT=... scripts/ripple_chat.sh "Explain entropy" --no-interactive
+scripts/ripple_chat.sh                                 # interactive, server on port 8080
+scripts/ripple_chat.sh "Explain entropy" --no-interactive
+PORT=9090 scripts/ripple_chat.sh                       # a server on another port
+URL=http://host:8080 scripts/ripple_chat.sh --no-think  # a server on another machine
 ```
+
+In the chat: `/reset` starts a new conversation, `/exit` (or Ctrl-D) leaves, Ctrl-C stops the current answer.
 
 ## Supported options
 
@@ -146,6 +162,8 @@ The release supports GPU only. These are the supported settings (the defaults ar
 - `--kv-cache qvb8` (certified compressed KV) or `bf16`
 - `--prefill-linear qvb8`
 - `--drafter dflash`, `ngram` or none
+- `--pipeline cuda:0,cuda:1,...` (several cards in one machine) and `--pipeline-split`
+- `--kv-window N|auto`, `--kv-host`, `--kv-cold-block T`, `--kv-gpu-reserve-mb M` (KV cache offload to system RAM)
 
 Other values that the CLI help still lists, such as `--prefill-linear int8`, CPU or MTP drafters, are not part of
 this release.
@@ -163,6 +181,26 @@ Speculative decoding is verified by the full model. In our tests, greedy output 
 exact near-tie, the choice can differ.
 
 ## Update history
+
+**v1.1.0**
+- The engine is updated to the current development code: the model runs through the engine adapter (the Ripple
+  adapter is registered by name), the continuous-batching scheduler is the current one, and the KV cache gains the
+  sliding-window layers and the certified per-channel codec of the current engine.
+- Several GPUs in one machine: `--pipeline cuda:0,cuda:1` splits the layers across the cards in one process
+  (placement by layer range; the last card is the main card). This replaces tensor parallelism, which is no longer
+  in the engine.
+- Several machines: a remote stage worker (`python -m ai_engine.cli.stage_worker`) runs a layer range on another
+  box; the server reaches it with `--pipeline host:port,local --pipeline-split N`.
+- KV cache offload to system RAM for long contexts: `--kv-window N|auto` keeps the last N tokens (or an automatic
+  window) in VRAM and the cold history in pinned host RAM; `--kv-host` moves the whole cache to host RAM.
+- The terminal chat is now a client for a running server (`scripts/ripple_chat.sh`, standard library only): it sends
+  OpenAI-style requests and prints the answer; it loads no model and works from any machine that can reach the
+  server.
+- The server launcher passes `--dtype fp16` (measured faster on the DGX Spark) and `--kv-tau-threshold 0.2`; add
+  `--dtype bf16` to run in bf16.
+- The launcher keeps a startup log (`scripts/logs/Ripple-65B.startup.log`, action `startup`): the command line and
+  everything the server printed until it answered the health check -- the load, placement, kernel and memory lines,
+  apart from the request log.
 
 **v1.0.1**
 - One switch for the compute dtype: `--dtype bf16|fp16` (replaces the `QV_MODEL_DTYPE` variable). The launchers set

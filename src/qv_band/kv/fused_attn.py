@@ -13,9 +13,9 @@ AND the shadow buffer (2 bytes/elem) is not needed at all.
 
 Scope: any query length -- decode, verify and chunked prefill (queries are
 tiled in row blocks, keys in BLOCK_N tiles: flash-attention style, so no
-O(context) or O(q x context) tensor is ever built). Heads that needed > 8 bits are not
-representable here (layout_from_segments returns None -> caller keeps the dense
-path). The dense residual tail is attended separately and merged by LSE.
+O(context) or O(q x context) tensor is ever built). A layer with a head that needs 9..16 bits
+keeps 2-byte ids (int16 holding the uint16 pattern); the kernels split each id
+into two exact bytes (hi * 256 + lo). The dense residual tail is attended separately and merged by LSE.
 """
 from __future__ import annotations
 
@@ -30,12 +30,13 @@ BLOCK_N = 32
 
 @triton.jit
 def _fwd_split(Q, KI, VI, KC, VC, KMIN, KSTEP, VMIN, VSTEP,
-               T_START, T_LEN, T_SEG,
+               T_START, T_LEN, T_SEG, HK, HV, T_HK, T_HV,
                O, M_OUT, L_OUT,
                q_pos0, n_tiles, tiles_per_split, scale, n_rows,
                stride_ki_n, stride_ki_h, stride_qr, stride_qh,
                G: tl.constexpr, BLOCK_M: tl.constexpr,
-               D: tl.constexpr, BLOCK_N: tl.constexpr, NHKV: tl.constexpr):
+               D: tl.constexpr, BLOCK_N: tl.constexpr, NHKV: tl.constexpr, WIDE: tl.constexpr,
+               HAS_HI: tl.constexpr):
     # grid (kv head, split, query-row block). Query rows of one kv head are
     # r = i * G + g (token i, group member g); a block holds BLOCK_M of them,
     # so any query length works -- decode, verify AND prefill chunks. The
@@ -91,9 +92,25 @@ def _fwd_split(Q, KI, VI, KC, VC, KMIN, KSTEP, VMIN, VSTEP,
             n = tl.arange(0, BLOCK_N)
             n_ok = n < nlen
             kp = KI + (start + n)[:, None] * stride_ki_n + h * stride_ki_h + d[None, :]
-            k = tl.load(kp, mask=n_ok[:, None], other=0).to(tl.float16)   # raw ids
-            kt = tl.trans(k)
-            s = tl.dot(qs_hi, kt, out_dtype=tl.float32) + tl.dot(qs_lo, kt, out_dtype=tl.float32)
+            if WIDE:
+                # 9..16-bit ids (int16 holding the uint16 bit pattern): id = hi * 256 + lo, both bytes exact in fp16
+                kr = tl.load(kp, mask=n_ok[:, None], other=0).to(tl.int32) & 0xFFFF
+                klt = tl.trans((kr & 255).to(tl.float16))
+                kht = tl.trans((kr >> 8).to(tl.float16))
+                s = (tl.dot(qs_hi, klt, out_dtype=tl.float32) + tl.dot(qs_lo, klt, out_dtype=tl.float32)
+                     + 256.0 * (tl.dot(qs_hi, kht, out_dtype=tl.float32) + tl.dot(qs_lo, kht, out_dtype=tl.float32)))
+            else:
+                k = tl.load(kp, mask=n_ok[:, None], other=0).to(tl.float16)   # raw ids
+                kt = tl.trans(k)
+                s = tl.dot(qs_hi, kt, out_dtype=tl.float32) + tl.dot(qs_lo, kt, out_dtype=tl.float32)
+            if HAS_HI:
+                # high-byte pool: a (segment, head) with 9..16-bit ids keeps its low byte in KI and its high byte in
+                # HK rows (row of this tile's first key, -1 = none): id = hi * 256 + lo, both exact in fp16
+                hk_row = tl.load(T_HK + t * NHKV + h)
+                if hk_row >= 0:
+                    khi = tl.load(HK + (hk_row + n)[:, None] * D + d[None, :], mask=n_ok[:, None], other=0)
+                    khit = tl.trans(khi.to(tl.float16))
+                    s += 256.0 * (tl.dot(qs_hi, khit, out_dtype=tl.float32) + tl.dot(qs_lo, khit, out_dtype=tl.float32))
             s = (s + qb[:, None]) * scale
             kpos = start + n
             ok = n_ok[None, :] & (kpos[None, :] <= qpos[:, None]) & row_ok[:, None]
@@ -106,11 +123,21 @@ def _fwd_split(Q, KI, VI, KC, VC, KMIN, KSTEP, VMIN, VSTEP,
             l_i = l_i * alpha + tl.sum(p, axis=1)
 
             vp = VI + (start + n)[:, None] * stride_ki_n + h * stride_ki_h + d[None, :]
-            v = tl.load(vp, mask=n_ok[:, None], other=0).to(tl.float16)
             # V = vmid + vstep * (id - vc): centre on the accumulator side. Both terms use
             # the SAME fp16-rounded p, so its rounding cancels instead of being amplified.
             p16 = p.to(tl.float16)
-            pv = tl.dot(p16, v, out_dtype=tl.float32)
+            if WIDE:
+                vr = tl.load(vp, mask=n_ok[:, None], other=0).to(tl.int32) & 0xFFFF
+                pv = (tl.dot(p16, (vr & 255).to(tl.float16), out_dtype=tl.float32)
+                      + 256.0 * tl.dot(p16, (vr >> 8).to(tl.float16), out_dtype=tl.float32))
+            else:
+                v = tl.load(vp, mask=n_ok[:, None], other=0).to(tl.float16)
+                pv = tl.dot(p16, v, out_dtype=tl.float32)
+            if HAS_HI:
+                hv_row = tl.load(T_HV + t * NHKV + h)
+                if hv_row >= 0:
+                    vhi = tl.load(HV + (hv_row + n)[:, None] * D + d[None, :], mask=n_ok[:, None], other=0)
+                    pv += 256.0 * tl.dot(p16, vhi.to(tl.float16), out_dtype=tl.float32)
             ps = tl.sum(p16.to(tl.float32), axis=1)
             acc = acc * alpha[:, None] + (pv - vc * ps[:, None]) * vstep[None, :] + ps[:, None] * vmin[None, :]
             m_i = m_new
@@ -130,7 +157,9 @@ class QVLayout:
     """
 
     def __init__(self, ki, vi, kmin, kstep, vmin, vstep, seg_len, device, block_n=BLOCK_N,
-                 kc=None, vc=None):
+                 kc=None, vc=None, hk=None, hv=None, hrow=None):
+        """hk / hv / hrow: optional high-byte pool (rows of (D,) uint8) and, per segment, (K rows, V rows) per head
+        of its first pool row (-1 = 8-bit head) -- see _tile_table."""
         self.block_n = block_n
         n_seg = len(seg_len)
         # kmin / vmin hold the range CENTRE when kc / vc are given (see _centre)
@@ -150,6 +179,11 @@ class QVLayout:
         self.t_len = torch.tensor(lens, dtype=torch.int32, device=device)
         self.t_seg = torch.tensor(segs, dtype=torch.int32, device=device)
         self.n_tiles = len(starts)
+        self.hk = self.hv = self.t_hk = self.t_hv = None
+        if hrow is not None:
+            tt = _tile_table(seg_len, 0, self.n, device, block_n, hrow, ki.shape[1])
+            self.t_hk, self.t_hv = tt[4], tt[5]
+            self.hk, self.hv = (hk, hv) if self.t_hk is not None else (None, None)
 
 
 def layout_from_segments(segs_k, segs_v, seg_len, device):
@@ -184,7 +218,6 @@ def layout_from_segments(segs_k, segs_v, seg_len, device):
 
 _EXT = {}
 import os as _os
-_KV_HOST = _os.environ.get("QV_KV_HOST", "0") == "1"
 
 
 def _cuda_ext(device):
@@ -247,17 +280,24 @@ def attend(q, lay: QVLayout, q_pos0: int, scale: float, n_splits: int | None = N
     o = torch.empty(n_splits, hkv, rows, d, dtype=torch.float32, device=q.device)
     m = torch.empty(n_splits, hkv, rows, dtype=torch.float32, device=q.device)
     l = torch.empty_like(m)
+    t_hk = getattr(lay, "t_hk", None)
     if ext is not None:
+        assert t_hk is None, "the CUDA kernel reads 2-byte ids, not the high-byte pool"
         ext.fwd(q, lay.ki, lay.vi, lay.kmin, lay.kstep, lay.vmin, lay.vstep,
                 lay.kc.contiguous(), lay.vc.contiguous(), lay.t_start, lay.t_len, lay.t_seg,
                 o, m, l, q_pos0, tps, float(kscale), g)
     else:
+        has_hi = t_hk is not None
         _fwd_split[(hkv, n_splits, n_rb)](
             q, lay.ki, lay.vi, lay.kc, lay.vc, lay.kmin, lay.kstep, lay.vmin, lay.vstep,
-            lay.t_start, lay.t_len, lay.t_seg, o, m, l,
+            lay.t_start, lay.t_len, lay.t_seg,
+            # a pool that does not exist (no wide piece on that side) is never read: its rows are all -1
+            lay.hk if has_hi and lay.hk is not None else lay.ki, lay.hv if has_hi and lay.hv is not None else lay.vi,
+            t_hk if has_hi else lay.t_seg, lay.t_hv if has_hi else lay.t_seg,
+            o, m, l,
             q_pos0, lay.n_tiles, tps, scale, rows,
             lay.ki.stride(0), lay.ki.stride(1), q.stride(0), q.stride(1),
-            G=g, BLOCK_M=block_m, D=d, BLOCK_N=lay.block_n, NHKV=hkv,
+            G=g, BLOCK_M=block_m, D=d, BLOCK_N=lay.block_n, NHKV=hkv, WIDE=lay.ki.dtype == torch.int16, HAS_HI=has_hi,
             num_warps=num_warps, num_stages=num_stages)
     if n_splits == 1:
         lsum, mx_s = l[0], m[0]
@@ -312,38 +352,55 @@ def _vram_room(dev, nbytes: int) -> bool:
     free += torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
     return free - nbytes >= _RESERVE
 _COLD_BLOCK = int(_os.environ.get("QV_KV_COLD_BLOCK", "4096") or 4096)
-_HOST_LAG = 1024       # keep the newest packed segments on the GPU (rollback reads them)
-_HOST_BATCH = 4096     # move packed copies to host this many tokens at a time
+_GROW_TOK = 4096       # spare rows when an id buffer / high-byte pool grows
 
 
-def _tile_table(seg_len, a, b, dev, block_n=BLOCK_N):
+def _tile_table(seg_len, a, b, dev, block_n=BLOCK_N, hrow=None, nh=0):
     """Tiles covering absolute positions [a, b), t_start relative to a; a tile
-    never straddles a segment (it carries one segment's affine params)."""
+    never straddles a segment (it carries one segment's affine params).
+    hrow: per segment, (K rows, V rows) per head of its high-byte pool rows (-1 = 8-bit head), or None when the
+    layer has no 9..16-bit head: then the table has no high-byte part (t_hk = t_hv = None)."""
     starts, lens, segs, pos = [], [], [], 0
+    hk, hv = [], []
+    use_hi = hrow is not None and any(r is not None for r in hrow)
     for si, sl in enumerate(seg_len):
         s0, s1 = max(pos, a), min(pos + sl, b)
+        r = hrow[si] if use_hi and si < len(hrow) else None
         for x in range(s0, s1, block_n):
             starts.append(x - a)
             lens.append(min(block_n, s1 - x))
             segs.append(si)
+            if use_hi:
+                off = x - pos                               # this tile's first key, within its segment
+                if r is None:
+                    hk.extend([-1] * nh)
+                    hv.extend([-1] * nh)
+                else:
+                    hk.extend(rk + off if rk >= 0 else -1 for rk in r[0])
+                    hv.extend(rv + off if rv >= 0 else -1 for rv in r[1])
         pos += sl
         if pos >= b:
             break
     # one pinned host->device copy, no stream sync (a pageable copy waits for
     # the card's whole queue and stalls the CPU that should be queueing ahead)
     from qv_band.common.xfer import h2d_small
-    allv = h2d_small(torch.tensor(starts + lens + segs, dtype=torch.int32), dev)
+    allv = h2d_small(torch.tensor(starts + lens + segs + hk + hv, dtype=torch.int32), dev)
     n = len(starts)
-    return allv[:n], allv[n:2 * n], allv[2 * n:], n
+    if not use_hi:
+        return allv[:n], allv[n:2 * n], allv[2 * n:3 * n], n, None, None
+    nh = len(hk)
+    return allv[:n], allv[n:2 * n], allv[2 * n:3 * n], n, allv[3 * n:3 * n + nh], allv[3 * n + nh:]
 
 
-def _mk_lay(ki, vi, P, C, ns, tt):
+
+def _mk_lay(ki, vi, P, C, ns, tt, hk=None, hv=None):
     lay = QVLayout.__new__(QVLayout)
     lay.block_n = BLOCK_N
     lay.ki, lay.vi = ki, vi
     lay.kmin, lay.kstep, lay.vmin, lay.vstep = (x[:ns] for x in P)
     lay.kc, lay.vc = C[0][:ns], C[1][:ns]
-    lay.t_start, lay.t_len, lay.t_seg, lay.n_tiles = tt
+    lay.t_start, lay.t_len, lay.t_seg, lay.n_tiles, lay.t_hk, lay.t_hv = tt
+    lay.hk, lay.hv = (hk, hv) if lay.t_hk is not None else (None, None)
     return lay
 
 
@@ -359,7 +416,8 @@ def _staging(dev, dt, h, d):
 
 
 class FusedKV:
-    """Per-layer (slot 0) id view of the banded segments: GPU window + host tier."""
+    """One (layer, slot)'s id view of the banded segments: GPU window + host tier. The layer keeps one per slot in
+    BandedKVLayer._fused_slots (slot index -> FusedKV); the single-request path uses slot 0."""
 
     def __init__(self):
         self.segk, self.segv = [], []
@@ -374,12 +432,23 @@ class FusedKV:
         self.lay = None
         self.bad = False
         self.win = _GPU_WIN           # GPU window, tokens (0 = unlimited); "auto" sets it when VRAM runs short
+        # High-byte pool (Triton kernel): a (segment, head) whose ids need 9..16 bits keeps its low byte in ki / vi
+        # and its high byte in hk / hv rows (one (D,) row per token, on the GPU). The CUDA kernel (sm_70) reads
+        # 2-byte ids instead: there the whole buffer is widened (_widen). Decided at the first sync.
+        self.gen = -1                 # BandedKVLayer._seg_gen at the last sync
+        self.hipool = None
+        self.hk = self.hv = None
+        self.hused = [0, 0]           # rows used in hk, hv
+        self.hrow = []                # per segment: None, or (K rows, V rows) per head of its first pool row (-1 = 8 bit)
+        self.hmark = []               # per segment: hused before it (a rewrite from segment m frees everything after)
 
     def _grow(self, need_tok, need_seg, h, d, dev, seg_len=0):
         """need_tok: window length (from base) that must fit. seg_len: the segment being appended (a prefill chunk): the
         id buffer needs GPU window + cold block + that many spare rows before eviction can make room for it."""
         if self.ki is None or need_tok > self.cap:
-            cap = max(need_tok + need_tok // 4, need_tok + 4096)
+            # fixed spare room, not a fraction of the context: 25% of a 36k-token slot was ~9k unused tokens per layer;
+            # a growth copy every 4k tokens costs milliseconds
+            cap = need_tok + _GROW_TOK
             if self.win:
                 cap = max(need_tok, min(cap, self.win + _COLD_BLOCK + seg_len))
             dt = self.ki.dtype if self.ki is not None else torch.uint8
@@ -399,52 +468,21 @@ class FusedKV:
                     a[:self.cap_seg] = b
             self.P, self.C, self.cap_seg = P, C, cs
 
-    _host_moves = ()
-    _host_ev = None
-
-    def _finish_host_moves(self):
-        """Swap in the pinned host copies issued by the previous sync (long
-        finished by now: waiting on its event costs nothing)."""
-        if self._host_moves:
-            if self._host_ev is not None:
-                self._host_ev.synchronize()
-            for bk, pin in self._host_moves:
-                bk.packed = pin
-        self._host_moves = []
-        self._host_ev = None
-
-    _host_upto = 0                  # segments [0, _host_upto) already queued for host
-
-    def _queue_host_moves(self, sk, sv, lens, dev):
-        """Packed copies -> host RAM for segments older than _HOST_LAG tokens,
-        batched: one pinned buffer and async copies per batch (attention reads
-        only the id buffer; the packed copy serves rollback / fallback / prefix
-        save). Swapped in on the next sync, when the copies are long done."""
-        if self._host_upto > len(sk):
-            self._host_upto = 0
-        end = sum(lens) - _HOST_LAG
-        pos, j = sum(lens[:self._host_upto]), self._host_upto
-        while j < len(sk) and pos + lens[j] <= end:
-            pos += lens[j]
-            j += 1
-        if j - self._host_upto < 1 or pos - sum(lens[:self._host_upto]) < _HOST_BATCH:
-            return
-        items = [bk for si in range(self._host_upto, j) for st in (sk, sv) for bk in st[si]
-                 if bk.packed.is_cuda]
-        self._host_upto = j
-        if not items:
-            return
-        tot = sum(bk.packed.numel() * bk.packed.element_size() for bk in items)
-        pin = torch.empty(tot, dtype=torch.uint8, pin_memory=True)
-        off = 0
-        for bk in items:
-            nb = bk.packed.numel() * bk.packed.element_size()
-            dst = pin[off:off + nb].view(bk.packed.dtype).view(bk.packed.shape)
-            dst.copy_(bk.packed, non_blocking=True)
-            self._host_moves.append((bk, dst))
-            off += nb
-        self._host_ev = torch.cuda.Event()
-        self._host_ev.record(torch.cuda.current_stream(dev))
+    def _hrows(self, which, n, d, dev):
+        """n rows of the high-byte pool `which` (0 = K, 1 = V); returns the first row."""
+        pool = self.hk if which == 0 else self.hv
+        r0 = self.hused[which]
+        if pool is None or r0 + n > pool.shape[0]:
+            cap = r0 + n + _GROW_TOK
+            new = torch.empty(cap, d, dtype=torch.uint8, device=dev)
+            if pool is not None and r0:
+                new[:r0] = pool[:r0]
+            if which == 0:
+                self.hk = new
+            else:
+                self.hv = new
+        self.hused[which] = r0 + n
+        return r0
 
     def _widen(self):
         """Switch the id buffers to 2 bytes (int16 holding uint16 bit patterns)."""
@@ -463,32 +501,37 @@ class FusedKV:
             hk.copy_(self.ki[:B])
             hv.copy_(self.vi[:B])
             a = self.base
-            self.cold.append((a, a + B, hk, hv, _tile_table(lens, a, a + B, dev)))
+            self.cold.append((a, a + B, hk, hv, _tile_table(lens, a, a + B, dev, hrow=self.hrow if self.hipool else None,
+                                                            nh=self.ki.shape[1])))
             n = self.valid - a - B
             self.ki[:n] = self.ki[B:B + n].clone()
             self.vi[:n] = self.vi[B:B + n].clone()
             self.base = a + B
 
-    def sync(self, layer):
-        """The QVLayout for slot 0's current banded segments (GPU window part), or None."""
+    def sync(self, layer, bi: int = 0):
+        """The QVLayout for slot `bi`'s current banded segments (GPU window part), or None."""
         if self.bad:
             return None
         from .codec import _unpack_dev
-        sk, sv, lens = layer._banded_k[0], layer._banded_v[0], layer._seg_len[0]
+        sk, sv, lens = layer._banded_k[bi], layer._banded_v[bi], layer._seg_len[bi]
         m, lim = 0, min(len(self.segk), len(sk))
         while m < lim and self.segk[m] is sk[m] and self.segv[m] is sv[m]:
             m += 1
         if self.lay is not None and m == len(sk) == len(self.segk):
+            self.gen = layer._seg_gen
             return self.lay
         dev = layer._device if layer._device is not None else self.ki.device
+        if self.hipool is None:
+            self.hipool = _cuda_ext(dev) is None
         h, d = len(sk[0]), sk[0][0].orig_shape[1]
         pos = sum(lens[:m])
-        self._host_upto = min(self._host_upto, m)    # rolled-back segments re-queue
         if pos < self.base:                 # history rewritten inside the host tier
             self.cold, self.base, m, pos = [], 0, 0, 0
+        if m < len(self.hmark):             # segments from m on are rewritten: free their high-byte rows
+            self.hused = list(self.hmark[m])
+        del self.hmark[m:], self.hrow[m:]
         self.valid = pos
         self._grow(0, len(sk), h, d, dev)
-        self._finish_host_moves()
         cvals = []                          # (si, k centres, v centres): one copy at the end
         for si in range(m, len(sk)):
             sl = lens[si]
@@ -505,23 +548,30 @@ class FusedKV:
                     need = pos + sl - self.base
             self._grow(need, len(sk), h, d, dev, sl)
             cvals.append((si, [0.0] * h, [0.0] * h))
+            self.hmark.append(tuple(self.hused))
+            rows = ([-1] * h, [-1] * h)
             w = pos - self.base
             for hi in range(h):
                 for store, is_k, mn, st in ((sk, True, self.P[0], self.P[1]),
                                             (sv, False, self.P[2], self.P[3])):
                     bk = store[si][hi]
-                    if bk.bits > 8 and self.ki.dtype == torch.uint8:
-                        if _cuda_ext(dev) is None:      # the Triton kernel reads bytes only
-                            self.bad = True
-                            return None
-                        self._widen()                   # 9..16-bit head: 2-byte ids from now on
                     ids = _unpack_dev(bk.packed.to(dev), bk.bits, sl * d).reshape(sl, d)
+                    if bk.bits > 8:
+                        if self.hipool:                 # high byte to the pool, low byte stays in the 1-byte buffer
+                            which = 0 if is_k else 1
+                            r0 = self._hrows(which, sl, d, dev)
+                            (self.hk if is_k else self.hv)[r0:r0 + sl] = (ids >> 8).to(torch.uint8)
+                            rows[which][hi] = r0
+                            ids = ids & 255
+                        elif self.ki.dtype == torch.uint8:
+                            self._widen()               # CUDA kernel (sm_70): 2-byte ids from now on
                     # int16 holds the uint16 bit pattern (the kernel reads it unsigned)
                     (self.ki if is_k else self.vi)[w:w + sl, hi] = ids.to(torch.int32).to(self.ki.dtype)
                     c = ((1 << bk.bits) - 1) / 2.0
                     mn[si, hi] = (bk.min_s + bk.tau_s * c).to(dev)    # range centre
                     st[si, hi] = bk.tau_s.to(dev)
                     cvals[-1][1 if is_k else 2][hi] = c
+            self.hrow.append(rows if max(rows[0] + rows[1]) >= 0 else None)
             pos += sl
             self.valid = pos
             self._evict(lens, dev)
@@ -531,12 +581,12 @@ class FusedKV:
             idx = h2d_small(torch.tensor([cv[0] for cv in cvals], dtype=torch.long), dev)
             self.C[0][idx] = rows[:, :h]
             self.C[1][idx] = rows[:, h:]
-        if _KV_HOST:
-            self._queue_host_moves(sk, sv, lens, dev)
         self.segk, self.segv = list(sk), list(sv)
+        self.gen = layer._seg_gen
         ns = len(sk)
         self.lay = _mk_lay(self.ki, self.vi, self.P, self.C, ns,
-                           _tile_table(lens, self.base, self.valid, dev))
+                           _tile_table(lens, self.base, self.valid, dev, hrow=self.hrow if self.hipool else None, nh=h),
+                           self.hk, self.hv)
         return self.lay
 
     def attend_cold(self, q, q_pos0, scale):
@@ -568,7 +618,7 @@ class FusedKV:
         for j, (a, b, _, _, tt) in enumerate(self.cold):
             s = j % 2
             main.wait_event(ready[s])
-            o2, l2 = attend(q, _mk_lay(sk[s], sv[s], self.P, self.C, ns, tt), q_pos0 - a, scale)
+            o2, l2 = attend(q, _mk_lay(sk[s], sv[s], self.P, self.C, ns, tt, self.hk, self.hv), q_pos0 - a, scale)
             o, lse = (o2, l2) if o is None else _merge_lse(o, lse, o2, l2)
             done[s] = torch.cuda.Event()
             done[s].record(main)
@@ -595,9 +645,9 @@ def _merge(o1, lse1, o2, lse2):
     return (o1 * w1[..., None] + o2 * w2[..., None]) / den[..., None]
 
 
-def _resid_part(layer, q, q_pos0, scale, banded_len):
-    """Attention of q (MQ,Hq,D) over the dense residual tail -> (o, lse) fp32."""
-    rk, rv = layer._resid_k[0][0], layer._resid_v[0][0]      # (H, r, D)
+def _resid_part(layer, q, q_pos0, scale, banded_len, bi: int = 0):
+    """Attention of q (MQ,Hq,D) over slot `bi`'s dense residual tail -> (o, lse) fp32."""
+    rk, rv = layer._resid_k[bi][0], layer._resid_v[bi][0]    # (H, r, D)
     mq, hq, d = q.shape
     h, r = rk.shape[0], rk.shape[1]
     g = hq // h
@@ -612,15 +662,13 @@ def _resid_part(layer, q, q_pos0, scale, banded_len):
     return o.reshape(mq, hq, d), lse.reshape(mq, hq)
 
 
-def fused_layer_attention(layer, query, scale):
-    """query (1, Hq, q, D) -> (1, q, Hq, D). Banded history via the kernel, the
-    dense residual tail via torch, merged exactly (log-sum-exp)."""
-    fk = layer._fused
+def _attend_slot(layer, fk, bi, q, scale):
+    """q (MQ, Hq, D): the slot's newest MQ positions (update() has already appended them). Banded history via the
+    kernel (GPU window + host tier), the dense residual tail via torch, merged exactly. -> fp32 (MQ, Hq, D)."""
     lay = fk.lay
-    q = query[0].transpose(0, 1).contiguous()                 # (MQ, Hq, D)
     mq = q.shape[0]
-    banded_len = layer._banded_len[0]
-    r = layer._resid_k[0].shape[-2]
+    banded_len = layer._banded_len[bi]
+    r = layer._resid_k[bi].shape[-2]
     q_pos0 = banded_len + r - mq
     o1 = lse1 = None
     if lay.n_tiles:
@@ -629,9 +677,49 @@ def fused_layer_attention(layer, query, scale):
     if cold is not None:
         o1, lse1 = cold if o1 is None else _merge_lse(o1, lse1, *cold)
     if r:
-        o2, lse2 = _resid_part(layer, q, q_pos0, scale, banded_len)
-        o1 = _merge(o1, lse1, o2, lse2)
-    return o1.to(query.dtype)[None]
+        o2, lse2 = _resid_part(layer, q, q_pos0, scale, banded_len, bi)
+        o1 = o2 if o1 is None else _merge(o1, lse1, o2, lse2)
+    return o1
+
+
+
+def fused_layer_attention(layer, query, scale):
+    """Single-request path: query (1, Hq, q, D) -> (1, q, Hq, D) for slot 0."""
+    q = query[0].transpose(0, 1).contiguous()                 # (MQ, Hq, D)
+    return _attend_slot(layer, layer._fused_slots[0], 0, q, scale).to(query.dtype)[None]
+
+
+def slot_fused(layer, bi: int):
+    """Slot `bi`'s FusedKV, synced to its current segments (None only if FusedKV.sync refuses the layer; the caller
+    then uses the dense path)."""
+    fs = layer._fused_slots
+    if len(fs) < len(layer._banded_k):                 # slots added since: they start without fused state
+        fs.extend([None] * (len(layer._banded_k) - len(fs)))
+    fk = fs[bi]
+    if fk is not None and fk.lay is not None and fk.gen == layer._seg_gen:
+        # no segment list of this layer changed since this slot's last sync (the common decode step: only the dense
+        # residual grew): skip the per-segment identity walk
+        from . import banded_cache as _bc
+        if _bc._KV_HOST and bi < len(layer._host_tiers) and layer._host_tiers[bi] is not None:
+            layer._host_tiers[bi].poll()
+        return fk
+    new = fk is None
+    if new:
+        fk = fs[bi] = FusedKV()
+    if fk.sync(layer, bi) is None:
+        return None
+    from . import banded_cache as _bc
+    if _bc._KV_HOST:
+        if new:
+            layer._host_step(bi)        # --kv-host: from now on attention reads the ids, not the packed data
+        elif bi < len(layer._host_tiers) and layer._host_tiers[bi] is not None:
+            layer._host_tiers[bi].poll()
+    return fk
+
+
+def segment_attention(layer, fk, bi: int, q_seg, scale):
+    """Packed step: q_seg (1, n, Hq, D), slot `bi`'s n newest tokens -> (1, n, Hq, D) in q_seg's dtype."""
+    return _attend_slot(layer, fk, bi, q_seg[0].contiguous(), scale).to(q_seg.dtype)[None]
 
 
 def pending():

@@ -23,12 +23,6 @@ Accepted device values, everywhere, in every modality:
     "cuda:N"    pin to that exact index (single-process multi-GPU)
     "xpu"       Intel XPU if present
     "cpu"       never touch an accelerator
-
-The tensor-parallel remap also lives here: under torchrun a rank handed the
-bare "cuda" actually runs on cuda:{LOCAL_RANK}, resolved inside
-qv_band.run.run_inference.load_qv_model and never handed back. Recomputing the
-same remap is what stops a rank sending its tensors to the wrong card --
-observed as MTP hanging forever behind an unresolved implicit sync.
 """
 from __future__ import annotations
 
@@ -162,11 +156,6 @@ def resolve_device(device: str = "auto", *, verbose: bool = False,
                   f"Check CUDA_VISIBLE_DEVICES.")
         else:
             gpu_dev = device
-
-    # TP remap: a rank given the generic "cuda" runs on cuda:{LOCAL_RANK}.
-    # A caller that already pinned "cuda:<int>" is left alone.
-    if gpu_dev == "cuda" and int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        gpu_dev = f"cuda:{os.environ.get('LOCAL_RANK', '0')}"
 
     use_gpu = gpu_dev is not None
     use_cuda = use_gpu and gpu_dev.startswith("cuda")

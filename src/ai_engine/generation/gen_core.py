@@ -1,10 +1,10 @@
 """Shared inference core for every QV-band interface.
 
-An interface (ai_engine.cli.chat, ai_engine.servers.llm_server, a future
+An interface (ai_engine.servers.llm_server, a future
 tool) differs from every other
 only in HOW a request arrives (argv, HTTP JSON, a tool call) and HOW its
 output is delivered (a stdout stream, SSE, a return value). Everything
-between -- device resolution and the tensor-parallel device remap, the
+between -- device resolution, the
 CPU thread guard, the memory ceiling, model load, the four drafter modes,
 the KV-cache presets, and the single speculative_generate() call with its
 KV-cache-preset -> parameter mapping -- is identical and lives here, so it
@@ -693,7 +693,7 @@ def add_generation_args(ap, *, include_device_mem: bool = True) -> None:
         "--kv-tau-threshold", dest="kv_tau", type=float, default=DEFAULTS.KV_TAU,
         metavar="TAU",
         help="Certified per-element KV error for the qvb8 preset (default "
-             "%(default)s): every cached K/V value decodes with an error below TAU. "
+             "%(default)s): every cached K/V value decodes within TAU. "
              "Smaller = more accurate, more bits; the codec raises bits per "
              "head until it holds. NOT the weight pack's tau.")
     ap.add_argument(
@@ -798,7 +798,7 @@ def params_from_args(args) -> GenParams:
     # GenParams requires an explicit DFlash checkpoint (no silent guessing inside the engine). A command-line entry point that was
     # NOT given --draft-model resolves it HERE, once, loudly: the model's own "<name>-DFlash2" / "-DFlash" next to the checkpoints
     # (the same rule llm_server.sh uses); a model without a drafter switches to n-gram with a printed warning. Without this
-    # `python -m ai_engine.cli.chat <pack>` died with a ValueError for every model.
+    # a launch without --draft-model died with a ValueError for every model.
     if kwargs.get("drafter") in ("dflash", "n-gram_with_dflash") and kwargs.get("draft_model") in (None, "", "auto"):
         model = getattr(args, "model", None)
         found = None
@@ -852,9 +852,7 @@ def resolve_device(device: str) -> tuple[str | None, bool, bool]:
     The logic itself moved to engine.runtime, which is also what the
     image, sonic, lipsync and TTS paths use, so one device value means one
     thing across every modality. See runtime.resolve_device for the accepted
-    values ("auto" / "all" / "cuda" / "cuda:<int>" / "xpu" / "cpu") and for the
-    tensor-parallel remap, which is why a rank handed the bare "cuda" still
-    ends up on cuda:{LOCAL_RANK} here.
+    values ("auto" / "all" / "cuda" / "cuda:<int>" / "xpu" / "cpu").
     """
     from ai_engine.runtime.device import resolve_device as _resolve
     plan = _resolve(device)
@@ -970,8 +968,8 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
 
     `fallback_to_ngram`: when a heavy drafter fails to build, return a
     plain n-gram drafter instead of raising -- so a missing MTP head
-    degrades a running server (llm_server.py) rather than killing it. chat.py
-    leaves this False to fail loudly at startup. The failure is never
+    degrades a running server (llm_server.py) rather than killing it. False fails
+    loudly at startup. The failure is never
     swallowed silently: `on_fallback(kind, exc)` is invoked when set (for
     the caller to log), otherwise the exception message is printed.
 
@@ -1025,12 +1023,7 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
                 hint = ""
             raise DrafterBuildError(
                 f"--draft-model {draft_dir!r} is not a directory{hint}")
-        # CUDA only (CPU/XPU have never run DFlash). Tensor parallel works:
-        # every rank runs the drafter on the same all-gathered hidden states,
-        # calls the sharded lm_head the same number of times (once per block,
-        # so the collectives stay paired), and speculative_generate syncs rank
-        # 0's draft after every propose() (a sampled draft is rank-local RNG)
-        # -- verified on 2x V100 with the 27B.
+        # CUDA only (CPU/XPU have never run DFlash).
         unsupported = None if use_cuda else "needs a CUDA launch"
         if unsupported:
             print(f"[gen_core] DFlash drafter {draft_dir} {unsupported}; "
@@ -1139,13 +1132,6 @@ def encode_prompt(bundle: ModelBundle, text: str, *, chat: bool,
     return ids
 
 
-# Sentinel: run_generate(abort_check=NO_ABORT) means "pass no abort_check
-# at all" (the tensor-parallel follower rank wants this -- only rank 0's
-# check is consulted, and it is broadcast). Omitting the argument, or
-# passing None, uses the VRAM-ceiling poll.
-NO_ABORT: Callable[[], bool] = lambda: False
-
-
 def run_generate(bundle: ModelBundle, drafter, ids, params: GenParams, *,
                  stream: bool = False,
                  abort_check: Callable[[], bool] | None = None,
@@ -1160,8 +1146,7 @@ def run_generate(bundle: ModelBundle, drafter, ids, params: GenParams, *,
 
     `abort_check`: a zero-arg predicate polled once per decode step; True
     stops generation cleanly. None (the default) uses the --max-memory-gb
-    VRAM-ceiling poll. Pass NO_ABORT to opt out entirely (the TP follower
-    rank does -- see gen_core.NO_ABORT).
+    VRAM-ceiling poll.
 
     `prefix_cache` / `return_cache`: single-conversation KV-cache reuse
     (see qv_band.decode.spec_decode.PrefixCache) -- pass back a cache saved from a
@@ -1177,9 +1162,10 @@ def run_generate(bundle: ModelBundle, drafter, ids, params: GenParams, *,
     added here.
     """
     from qv_band.decode.spec_decode import speculative_generate
-    if getattr(bundle.model, "_qv_nemotron", False):
-        # Nemotron-H hybrid: own cache type, no drafting (qv_band/decode/nemotron_generate.py)
-        from qv_band.decode.nemotron_generate import nemotron_generate as speculative_generate
+    _adapter = getattr(bundle.model, "_qv_adapter", None)
+    _own_loop = _adapter.generate_fn() if _adapter is not None else None
+    if _own_loop is not None:                 # a model whose stack needs another loop kind (decode/hybrid_generate)
+        speculative_generate = _own_loop
 
     if abort_check is None:
         from ai_engine.runtime.memlimit import vram_abort_check

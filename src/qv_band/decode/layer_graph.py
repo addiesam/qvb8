@@ -57,7 +57,9 @@ class _LayerGraph:
             # the first layer of each card gets its input from the other card / the host: the cross-card copy is
             # not ordered with the replay (measured: graph state off by 10-50), so those 2 of 48 layers stay eager
             return None
-        if past is None or getattr(past, "_ring", None) is not None or getattr(past, "_step_segments", None):
+        from qv_band.kv.step_ctx import current as _step_ctx
+        _ctx = _step_ctx()
+        if past is None or getattr(past, "_ring", None) is not None or (_ctx is not None and _ctx.segs is not None):
             return None                                  # batched engine steps: per-slot hooks, not this path
         try:
             cl = past.layers[self.idx]

@@ -229,6 +229,16 @@ class QVBandLinearV8R(nn.Module):
         """bf16 GEMM, the bias fused into it (one rounding, as QVB8's cuBLASLt epilogue): the result already holds the bias."""
         y = torch.empty(x2.shape[0], self.out_features, device=x2.device, dtype=torch.bfloat16)
         bias = None if self.bias is None else self.bias.to(torch.bfloat16)
+        if len(self.chunks_bf16) == 1 and x2.shape[0] >= self.in_features:
+            # ONE chunk and more rows of X than columns of W (image / video token counts): put the decoded WEIGHT rows back in
+            # output order (a contiguous Q x P row copy) and let the GEMM write y directly, as _chunked does. The y[:, orows]
+            # below is a strided column scatter of the whole M x Q result -- Qwen-Image-Edit 1 MP: 0.9 s of index_put per
+            # call, 11%. Same values: each output element is the same row . column product plus the same bias.
+            b0, nb, base, rows, o0, o1, e0, e1 = self.chunks_bf16[0]
+            W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 1, b0, nb, base, rows)
+            if e1 > e0:
+                W.view(-1)[self.chunk_eflat_bf16[e0:e1]] = self.chunk_evals_bf16[e0:e1].to(torch.bfloat16)
+            return F.linear(x2, torch.empty_like(W).index_copy_(0, self.chunk_orows[o0:o1], W), bias)
         for b0, nb, base, rows, o0, o1, e0, e1 in self.chunks_bf16:
             W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 1, b0, nb, base, rows)
             if e1 > e0:
@@ -267,6 +277,7 @@ class QVBandLinearV8R(nn.Module):
         return y
 
     _PATHS = ("_gemv",) * 2 + ("_multi",) * 7 + ("_tc",) * 8 + ("_chunked",)   # index = min(M, 17)
+    _TC_SPLIT_MAX = 48                                                         # see forward
 
     def forward(self, x):
         shp = x.shape; x2 = x.reshape(-1, shp[-1])
@@ -286,7 +297,17 @@ class QVBandLinearV8R(nn.Module):
         path = self._PATHS[min(x2.shape[0], 17)]
         if self.bf16_gemm and self.bf16_certified and x2.dtype == torch.bfloat16 and x2.shape[0] > 8:
             path = "_chunked_bf16"
-        y = getattr(self, path)(x2)
+        M = x2.shape[0]
+        if path == "_chunked" and M <= self._TC_SPLIT_MAX and _sm80(x2.device):
+            # 17..48 rows (a verify step of 2-3 requests): equal tensor-core passes of <= 16 rows instead of decoding the
+            # whole matrix for one GEMM. Ripple-65B qvb8r 2.5e-3, all linears, the dev GPU: 32 rows 2276 -> 1207 ms, 48 rows
+            # 2292 -> 1809 ms; at 64 rows the GEMM is level again. Each row's result does not depend on its pass.
+            # Measured on sm_121 only, so pre-Ampere cards keep the old route until measured there.
+            n = -(-M // 16)
+            step = -(-M // n)
+            y = torch.cat([getattr(self, self._PATHS[min(M - i, step)])(x2[i:i + step]) for i in range(0, M, step)])
+        else:
+            y = getattr(self, path)(x2)
         if self.bias is not None and path != "_chunked_bf16":
             y = y + self.bias.to(y.dtype)
         return y.to(out_dtype).reshape(*shp[:-1], self.out_features)
@@ -302,6 +323,17 @@ class QVBandLinearV8R(nn.Module):
         if ef.numel():
             W.view(-1)[ef] = ev.to(W.dtype)
         return W.to(dtype)
+
+
+_SM80 = {}
+
+
+def _sm80(dev) -> bool:
+    """Ampere or newer (cached per device)."""
+    r = _SM80.get(dev)
+    if r is None:
+        r = _SM80[dev] = dev.type == "cuda" and torch.cuda.get_device_capability(dev)[0] >= 8
+    return r
 
 
 class QVBandEmbeddingV8R(nn.Module):

@@ -1,6 +1,6 @@
 """Tensor-key <-> module-path resolution shared by every run_inference*
-variant (CUDA, CPU, tensor-parallel). Pure name-mangling, no device/backend
-logic, so one copy serves all three loaders.
+variant (CUDA, CPU). Pure name-mangling, no device/backend
+logic, so one copy serves both loaders.
 """
 from __future__ import annotations
 

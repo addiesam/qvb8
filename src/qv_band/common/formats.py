@@ -29,7 +29,6 @@ class FormatSpec:
     linear: type
     embedding: type
     experts: type | None
-    sharded_linear: type | None = None   # tensor-parallel reader
     cpu_linear: type | None = None       # CPU-only reader
     # CPU embedding reader, when the format has one whose constructor
     # differs from `embedding` (the earlier format's takes mmap_file/cache_rows, not
@@ -71,11 +70,9 @@ def _build_registry() -> None:
                                   lin.esc_idx, lin.esc_vals)
 
     from qv_band.formats.qvb8.backends_experts import (QVBandExpertsV8,
-                                                 QVBandShardedLinearV8,
                                                  QVBandLinearCPUV8)
     _REGISTRY["qvb8"] = FormatSpec("qvb8", QVBandLinearV8,
                                    QVBandEmbeddingV8, QVBandExpertsV8,
-                                   sharded_linear=QVBandShardedLinearV8,
                                    cpu_linear=QVBandLinearCPUV8,
                                    decoder=_decode_v8)
     # fp8n/fp8q (native hardware FP8, FP8Linear/FP8Experts) moved to the
@@ -117,8 +114,7 @@ def get_format(name: str | None) -> FormatSpec:
 def require(spec: FormatSpec, backend: str):
     """The class `spec` provides for `backend`, or a clear error.
 
-    Lets a path that only some formats support (tensor-parallel, CPU,
-    MoE experts) state its requirement once instead of testing format
+    Lets a path that only some formats support (CPU, MoE experts) state its requirement once instead of testing format
     names.
     """
     cls = getattr(spec, backend, None)

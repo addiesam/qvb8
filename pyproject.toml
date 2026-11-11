@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qvb8"
-version = "1.0.1"
+version = "1.1.0"
 description = "QVB8: certified-error compressed weights and a fast inference engine for large AI models (first supported model: Ripple-65B)"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -20,8 +20,8 @@ Sponsor = "https://github.com/sponsors/addiesam"
 flash = ["flash-attn>=2.8"]
 
 [project.scripts]
-ripple-serve = "ai_engine.cli.serve_ripple:main"
-ripple-chat = "ai_engine.cli.chat_ripple:main"
+ripple-serve = "ai_engine.cli.serve:main"
+ripple-chat = "ai_engine.cli.chat_client:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

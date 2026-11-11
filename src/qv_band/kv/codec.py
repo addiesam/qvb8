@@ -117,15 +117,19 @@ class BandedKV:
     def decode_all_torch(self, device, dtype=torch.float32) -> torch.Tensor:
         seq, hd = self.orig_shape
         dev = torch.device(device)
-        if self.packed.device != dev:        # cold segment: keep device copy
-            self.packed, self.min_s, self.tau_s = (
-                self.packed.to(dev), self.min_s.to(dev), self.tau_s.to(dev))
+        if dev.type == "cuda" and dev.index is None:          # "cuda" = the current card (pipeline: the layer's)
+            dev = torch.device("cuda", torch.cuda.current_device())
+        # a segment in host RAM (--kv-host) is read through a temporary device copy: it STAYS on the host
+        packed, min_s, tau_s = self.packed, self.min_s, self.tau_s
+        if packed.device != dev:
+            packed = packed.to(dev, non_blocking=packed.is_pinned())
+            min_s, tau_s = min_s.to(dev), tau_s.to(dev)
         if dev.type == "cuda" and 1 <= self.bits <= 16:
             from . import codec_kernels
-            return codec_kernels.dequant(self.packed, self.bits, seq * hd, self.min_s, self.tau_s,
+            return codec_kernels.dequant(packed, self.bits, seq * hd, min_s, tau_s,
                                          hd, dtype).reshape(seq, hd)
-        ids = _unpack_dev(self.packed, self.bits, seq * hd).reshape(seq, hd)
-        return (self.min_s + ids.to(torch.float32) * self.tau_s).to(dtype)
+        ids = _unpack_dev(packed, self.bits, seq * hd).reshape(seq, hd)
+        return (min_s + ids.to(torch.float32) * tau_s).to(dtype)
 
     def truncate(self, n_rows: int) -> "BandedKV":
         """First `n_rows` tokens as a new segment, with NO re-quantisation.

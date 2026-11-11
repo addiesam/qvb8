@@ -103,7 +103,7 @@ from qv_band.kv.codec import (
     unband_kv_4d, KV_DEFAULT_TAU, KV_BITS_FLOOR, band_kv_heads,
 )
 
-__all__ = ["BandedKVLayer", "BandedKVCache", "NemotronHBandedCache"]
+__all__ = ["BandedKVLayer", "BandedKVCache", "HybridBandedCache"]
 
 
 # Byte budget for ONE layer's dense-reconstruction cache (see
@@ -226,6 +226,10 @@ _GLOBAL_UNBAND_BYTES = 0
 _GLOBAL_DENSE_FALLBACK_BYTES = 0
 _GLOBAL_JOINED_BYTES = 0
 _GLOBAL_SM_BYTES = 0
+# _GLOBAL_SM_BYTES is read (budget) and written across several statements; overlapped multi-card prefill runs layers
+# of different cards in different threads at once
+import threading as _threading
+_SM_LOCK = _threading.RLock()
 
 
 def _unband_global_add(n: int) -> None:
@@ -259,6 +263,68 @@ def _joined_global_add(n: int) -> None:
 def _joined_global_subtract(n: int) -> None:
     global _GLOBAL_JOINED_BYTES
     _GLOBAL_JOINED_BYTES = max(0, _GLOBAL_JOINED_BYTES - n)
+
+
+# --kv-host (QV_KV_HOST=1): each slot's packed segments that attention no longer reads go to pinned host RAM.
+#   sliding-window layer: everything older than window + _HOST_LAG tokens (attention reads only the last window)
+#   full-attention layer: everything older than _HOST_LAG tokens, once the slot attends through the fused kernel
+#                         (it reads its own uint8 id buffer, not the packed data)
+# The newest _HOST_LAG tokens stay on the GPU for rollback. Prefix restore, deep crops and dense-view rebuilds read a
+# host segment through a temporary copy (codec.BandedKV.decode_all_torch); it stays on the host.
+_KV_HOST = os.environ.get("QV_KV_HOST", "0") == "1"
+_HOST_LAG = 1024
+_HOST_BATCH = 4096     # move at least this many tokens at a time (one pinned buffer, async copies)
+
+
+class PackedHostTier:
+    """One slot's packed segments [0, upto) are in (or on their way to) pinned host RAM."""
+    __slots__ = ("upto", "last", "moves", "ev")
+
+    def __init__(self):
+        self.upto, self.last, self.moves, self.ev = 0, None, [], None
+
+    def finish(self):
+        """Swap in the host copies issued earlier (long finished by now: the event wait costs nothing)."""
+        if self.moves:
+            if self.ev is not None:
+                self.ev.synchronize()
+            for bk, pin in self.moves:
+                bk.packed = pin
+        self.moves, self.ev = [], None
+
+    def poll(self):
+        """finish() if the copies are done (non-blocking check): called on ordinary steps, so a batch queued after
+        the last flush does not keep its GPU copy alive."""
+        if self.moves and (self.ev is None or self.ev.query()):
+            self.finish()
+
+    def step(self, sk, sv, lens, keep, dev):
+        self.finish()
+        n = len(sk)
+        if self.upto > n or (self.upto and sk[self.upto - 1] is not self.last):
+            self.upto, self.last = 0, None                   # history rewritten below upto: rescan
+        end = sum(lens) - keep
+        pos0 = pos = sum(lens[:self.upto])
+        j = self.upto
+        while j < n and pos + lens[j] <= end:
+            pos += lens[j]
+            j += 1
+        if j <= self.upto or pos - pos0 < _HOST_BATCH:
+            return
+        items = [bk for si in range(self.upto, j) for st in (sk, sv) for bk in st[si] if bk.packed.is_cuda]
+        self.upto, self.last = j, sk[j - 1]
+        if not items:
+            return
+        pin = torch.empty(sum(bk.packed.numel() for bk in items), dtype=torch.uint8, pin_memory=True)
+        off = 0
+        for bk in items:
+            nb = bk.packed.numel()
+            dst = pin[off:off + nb]
+            dst.copy_(bk.packed, non_blocking=True)
+            self.moves.append((bk, dst))
+            off += nb
+        self.ev = torch.cuda.Event()
+        self.ev.record(torch.cuda.current_stream(dev))
 
 
 class BandedKVLayer(DynamicLayer):
@@ -327,6 +393,15 @@ class BandedKVLayer(DynamicLayer):
         self._resid_v: list = []
         self._dtype: torch.dtype | None = None
         self._device = None
+        # Fused qvb8 attention (fused_attn.py): each slot (request) owns its FusedKV (uint8 id buffers, high-byte
+        # pool, host tier), kept in step with the other per-slot lists; None until the slot first goes fused.
+        self._fused_slots: list = []
+        self._host_tiers: list = []         # each slot's PackedHostTier (--kv-host), same alignment
+        # bumped by EVERY change of any slot's segment lists (flush, crop, forget, import, add / drop / reset): lets the
+        # fused path skip its per-segment identity walk on a step where nothing was banded
+        self._seg_gen = 0
+        # sliding layers: each slot's decoded window buffers (see _window_tail); keyed by slot index
+        self._win_tail: dict = {}
         # Lightweight, cumulative observability for profiling; no CUDA sync in
         # the request path.
         self.metrics = {
@@ -347,6 +422,7 @@ class BandedKVLayer(DynamicLayer):
         # (see _resid_k/_resid_v). Set the flag it manages ourselves instead.
         self.is_initialized = True
         batch = key_states.shape[0]
+        self._seg_gen = getattr(self, "_seg_gen", 0) + 1
         self._banded_k = [[] for _ in range(batch)]
         self._banded_v = [[] for _ in range(batch)]
         self._seg_len = [[] for _ in range(batch)]
@@ -366,6 +442,16 @@ class BandedKVLayer(DynamicLayer):
         # never a correctness event.
         self._joined_cache: "OrderedDict[int, tuple]" = OrderedDict()
         self._joined_bytes = 0
+
+    def _adopt_device(self, dev) -> None:
+        """Pipeline placement (several cards): a slot added before this layer saw real keys was built from a template
+        on the engine's main card. The layer lives where its keys arrive: move its still-EMPTY per-slot state there.
+        Real history on another card would be a placement error, not something to move silently."""
+        if any(self._banded_len) or any(r.shape[-2] for r in self._resid_k):
+            raise RuntimeError(f"BandedKVLayer: keys arrive on {dev} but this layer holds history on {self._device}")
+        self._resid_k = [r.to(dev) for r in self._resid_k]
+        self._resid_v = [r.to(dev) for r in self._resid_v]
+        self._device = dev
 
     def _empty_resid(self, like: torch.Tensor) -> torch.Tensor:
         """A (1, heads, 0, head_dim) placeholder for one slot's residual,
@@ -400,13 +486,20 @@ class BandedKVLayer(DynamicLayer):
             self.lazy_initialization(key_like, value_like)
             return 0
         bi = len(self._resid_k)
+        self._seg_gen += 1
         self._drop_joined_cache()
+        if len(self._fused_slots) == bi:
+            self._fused_slots.append(None)          # the new request's fused state, built on first use
+        if len(self._host_tiers) == bi:
+            self._host_tiers.append(None)
         self._banded_k.append([])
         self._banded_v.append([])
         self._seg_len.append([])
         self._banded_len.append(0)
-        self._resid_k.append(self._empty_resid(key_like))
-        self._resid_v.append(self._empty_resid(value_like))
+        # on THIS layer's card (pipeline placement: the engine's template lives on the main card)
+        dev = self._device if self._device is not None else key_like.device
+        self._resid_k.append(self._empty_resid(key_like).to(dev))
+        self._resid_v.append(self._empty_resid(value_like).to(dev))
         return bi
 
     def export_slot(self, bi: int) -> dict:
@@ -421,6 +514,7 @@ class BandedKVLayer(DynamicLayer):
         """Put a history from export_slot() into the (empty) slot `bi`."""
         if self._banded_len[bi] or self._resid_k[bi].shape[-2]:
             raise RuntimeError(f"import_slot: slot {bi} is not empty")
+        self._seg_gen += 1
         self._banded_k[bi] = list(state["banded_k"])
         self._banded_v[bi] = list(state["banded_v"])
         self._seg_len[bi] = list(state["seg_len"])
@@ -429,6 +523,11 @@ class BandedKVLayer(DynamicLayer):
             self._heads = state["heads"]
         self._resid_k[bi] = state["resid_k"].clone()
         self._resid_v[bi] = state["resid_v"].clone()
+        if bi < len(self._fused_slots):
+            self._fused_slots[bi] = None        # a new history: this slot's fused state is rebuilt on first use
+        if bi < len(self._host_tiers) and self._host_tiers[bi] is not None:
+            self._host_tiers[bi].finish()
+            self._host_tiers[bi] = None
         self._drop_joined_cache()
 
     def drop_slot(self, bi: int) -> None:
@@ -436,9 +535,18 @@ class BandedKVLayer(DynamicLayer):
         down one index -- callers (the scheduler) must remap their own
         slot->request tracking accordingly, the same contract array
         deletion always has."""
+        self._win_tail.clear()                      # slot indices shift: the others rebuild on their next step
+        self._seg_gen += 1
         for lst in (self._banded_k, self._banded_v, self._seg_len,
                     self._banded_len, self._resid_k, self._resid_v):
             del lst[bi]
+        # the request's fused state goes with it; later slots move down one index with their own (kept, not rebuilt)
+        if bi < len(self._fused_slots):
+            del self._fused_slots[bi]
+        if bi < len(self._host_tiers):
+            t = self._host_tiers.pop(bi)
+            if t is not None:
+                t.finish()
         # _joined_cache is keyed by slot index, and every slot after bi
         # just moved -- a stale entry would hand one slot another's
         # history. Drop it wholesale; it refills on the next forward.
@@ -488,6 +596,7 @@ class BandedKVLayer(DynamicLayer):
                                   (self._banded_v, self._resid_v)):
             seg = self._band_tensor(resid[bi], bi)
             slot_store[bi].append(seg)
+            self._seg_gen += 1
             outliers = sum(bk.outlier_count for bk in seg)
             self.metrics["outliers"] += outliers
             # The dense decode is the expensive part: it materialises a
@@ -507,6 +616,26 @@ class BandedKVLayer(DynamicLayer):
         self._banded_len[bi] += s
         self._resid_k[bi] = self._resid_k[bi][..., :0, :]
         self._resid_v[bi] = self._resid_v[bi][..., :0, :]
+        if _KV_HOST:
+            self._host_step(bi)
+
+    def _host_step(self, bi: int) -> None:
+        """--kv-host: move slot `bi`'s packed segments that attention no longer reads to pinned host RAM."""
+        win = getattr(self, "window", None)
+        if win is None:
+            fs = self._fused_slots
+            if bi >= len(fs) or fs[bi] is None:
+                return                      # this slot's attention still decodes the packed data every step
+            keep = _HOST_LAG
+        else:
+            keep = win + _HOST_LAG
+        tiers = self._host_tiers
+        if len(tiers) < len(self._banded_k):
+            tiers.extend([None] * (len(self._banded_k) - len(tiers)))
+        if tiers[bi] is None:
+            tiers[bi] = PackedHostTier()
+        dev = self._device if self._device is not None else torch.device("cuda")
+        tiers[bi].step(self._banded_k[bi], self._banded_v[bi], self._seg_len[bi], keep, dev)
 
     @staticmethod
     def _dense_fallback_enabled() -> bool:
@@ -632,19 +761,12 @@ class BandedKVLayer(DynamicLayer):
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reads self._step_real_lens (continuous-batching callers only,
-        see ContinuousBatchEngine.step) instead of taking a real_lens
-        KWARG -- the stock model forward (Qwen3_5TextModel.forward ->
-        past_key_values.update(key_states, value_states, self.layer_idx))
-        calls update() itself with no way for an outside caller to inject
-        an extra per-call argument through that path, so the only place
-        left to hand this cache extra per-step information is an
-        attribute set on the cache object BEFORE calling model(...) --
-        ContinuousBatchEngine.step() does exactly that
-        (self.past._step_real_lens = [...]) right before its forward, and
-        clears it right after. None (the default outside that one caller)
-        preserves the exact old behaviour: every column of
-        key_states[bi] is real.
+        """Reads the engine's step layout from qv_band.kv.step_ctx (this thread's packed segments / real lengths;
+        continuous-batching callers only, see ContinuousBatchEngine) instead of taking a real_lens KWARG -- the
+        stock model forward (Qwen3_5TextModel.forward -> past_key_values.update(key_states, value_states,
+        self.layer_idx)) calls update() itself with no way for an outside caller to inject an extra per-call
+        argument. It is per thread so several chunks can be in flight (overlapped multi-card prefill). No step
+        context (every other caller) preserves the exact old behaviour: every column of key_states[bi] is real.
 
         real_lens[bi]'s columns are taken from the END of
         key_states[bi]/value_states[bi] (the LAST real_lens[bi] columns),
@@ -673,7 +795,15 @@ class BandedKVLayer(DynamicLayer):
         """
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
-        segs = getattr(self, "_step_segments", None)
+        elif key_states.device != self._device:
+            self._adopt_device(key_states.device)
+        if _KV_HOST and self._host_tiers:           # --kv-host: complete host moves whose copies are done
+            for t in self._host_tiers:
+                if t is not None:
+                    t.poll()
+        from .step_ctx import current as _step_ctx
+        ctx = _step_ctx()                           # this thread's engine step (step_ctx.py), or None
+        segs = ctx.segs if ctx is not None else None
         if segs is not None:
             # PACKED step (ContinuousBatchEngine, pure-attention models): one row holding every slot's
             # tokens back to back, no padding; segment j = (slot, offset, length) of that row.
@@ -696,7 +826,7 @@ class BandedKVLayer(DynamicLayer):
         # re-synced, or batch=1), making a caller apply a mask for
         # padding that is not actually in this call's returned tensor.
         self._pad_lens = None
-        real_lens = getattr(self, "_step_real_lens", None)
+        real_lens = ctx.real_lens if ctx is not None else None
 
         for bi in range(b):
             k_bi = key_states[bi:bi + 1]
@@ -746,7 +876,7 @@ class BandedKVLayer(DynamicLayer):
         # request. That is the opposite of what a certified-bounded
         # compressed cache is for, and it is where this server's VRAM
         # was actually going.
-        if getattr(self, "_step_real_lens", None) is not None:
+        if real_lens is not None:
             return key_states, value_states
 
         if self.window is not None:
@@ -769,10 +899,7 @@ class BandedKVLayer(DynamicLayer):
         if (FUSED_ENABLED and b == 1 and 1 <= key_states.shape[-2] and (_mq is None or key_states.shape[-2] <= _mq)
                 and self._banded_len[0] >= _FUSED_MIN_BANDED):
             from . import fused_attn
-            fk = getattr(self, "_fused", None)
-            if fk is None:
-                fk = self._fused = fused_attn.FusedKV()
-            if fk.sync(self) is not None:
+            if fused_attn.slot_fused(self, 0) is not None:
                 fused_attn.set_pending(self)
                 return key_states, value_states
 
@@ -812,6 +939,9 @@ class BandedKVLayer(DynamicLayer):
         r = rk.shape[-2]
         if r >= need or not self._banded_k[bi]:
             return rk[..., r - min(r, need):, :], rv[..., r - min(r, need):, :]
+        nb_need = need - r
+        if self.window is not None and nb_need <= self.window - 1 and dev.type == "cuda":
+            return self._window_tail(bi, need, dtype, dev)
         ks, vs, have = [rk], [rv], r
         for seg_k, seg_v, n_seg in zip(reversed(self._banded_k[bi]), reversed(self._banded_v[bi]),
                                        reversed(self._seg_len[bi])):
@@ -825,6 +955,63 @@ class BandedKVLayer(DynamicLayer):
         n = min(need, k.shape[-2])
         return k[..., k.shape[-2] - n:, :], v[..., v.shape[-2] - n:, :]
 
+    def _window_tail(self, bi: int, need: int, dtype: torch.dtype, dev) -> tuple[torch.Tensor, torch.Tensor]:
+        """window_kv_slot for a decode / verify step of a sliding layer, without rebuilding the window every step.
+
+        The slot keeps one buffer per K and V in attention layout (1, tokens, heads, head_dim): the decoded last
+        window-1 banded tokens, then room for the residual. A step copies only the residual behind the banded part
+        (<= residual_length + a verify block, not the whole window) and returns a view. The banded part is rebuilt
+        only when the slot's segment list changes (a flush every residual_length tokens, a crop into the banded
+        store, import): the entry holds the slot's last segment object, so `is` + segment count + banded length
+        identify the list (segments are immutable once flushed).
+        Before: every step decoded the trailing segments again when the unband cache had dropped them and
+        concatenated the whole window -- Ripple-65B (64 sliding layers), one request: ~36 ms of a 547 ms step."""
+        rk, rv = self._resid_k[bi], self._resid_v[bi]
+        r = rk.shape[-2]
+        segs_k = self._banded_k[bi]
+        ent = self._win_tail.get(bi)
+        blen = self._banded_len[bi]
+        nb = min(blen, self.window - 1)
+        if (ent is None or ent[0] is not segs_k[-1] or ent[1] != len(segs_k) or ent[2] != blen
+                or ent[3].dtype != dtype or ent[3].device != dev):
+            ks, vs, have = [], [], 0
+            for seg_k, seg_v, n_seg in zip(reversed(segs_k), reversed(self._banded_v[bi]),
+                                           reversed(self._seg_len[bi])):
+                ks.insert(0, self._unband_cached(seg_k, dtype, dev))
+                vs.insert(0, self._unband_cached(seg_v, dtype, dev))
+                have += n_seg
+                if have >= nb:
+                    break
+            cap = nb + max(self.residual_length + 64, r)
+            bufs = []
+            for parts in (ks, vs):
+                h, d = parts[0].shape[1], parts[0].shape[3]
+                buf = torch.empty((1, cap, h, d), dtype=dtype, device=dev)
+                o = nb
+                for t in reversed(parts):                      # newest segment first, filling backwards from nb
+                    take = min(o, t.shape[-2])
+                    buf[:, o - take:o] = t[..., t.shape[-2] - take:, :].transpose(1, 2)
+                    o -= take
+                    if o == 0:
+                        break
+                bufs.append(buf)
+            ent = (segs_k[-1], len(segs_k), blen, bufs[0], bufs[1])
+            self._win_tail[bi] = ent
+        kb, vb = ent[3], ent[4]
+        if nb + r > kb.shape[1]:                               # residual outgrew its room (rare): larger buffers
+            cap = nb + r + 64
+            kb2, vb2 = kb.new_empty((1, cap) + kb.shape[2:]), vb.new_empty((1, cap) + vb.shape[2:])
+            kb2[:, :nb] = kb[:, :nb]
+            vb2[:, :nb] = vb[:, :nb]
+            kb, vb = kb2, vb2
+            self._win_tail[bi] = ent[:3] + (kb, vb)
+        if r:
+            # the whole residual every step: a rejected draft cropped from it since the last step is simply overwritten
+            kb[:, nb:nb + r] = rk.transpose(1, 2)
+            vb[:, nb:nb + r] = rv.transpose(1, 2)
+        n = min(need, nb + r)
+        return kb[:, nb + r - n:nb + r].transpose(1, 2), vb[:, nb + r - n:nb + r].transpose(1, 2)
+
     def _decode_seg_dense(self, seg: list, dtype: torch.dtype, dev) -> torch.Tensor:
         """One segment decoded to (1, heads, seq, head_dim), uncached (the
         caller keeps the result in its own buffer). A registered dense
@@ -835,6 +1022,10 @@ class BandedKVLayer(DynamicLayer):
         return unband_kv_4d(seg, 1, self._heads, device=dev).to(dtype)
 
     def ragged_kv_views(self, dtype: torch.dtype, rows) -> dict | None:
+        with _SM_LOCK:
+            return self._ragged_kv_views(dtype, rows)
+
+    def _ragged_kv_views(self, dtype: torch.dtype, rows) -> dict | None:
         """Each listed slot's full (banded ++ residual) history as a pair of
         contiguous SEQ-MAJOR views (1, seq_i, heads, head_dim) into a
         per-slot buffer that persists across steps -- or None when a buffer
@@ -1138,6 +1329,7 @@ class BandedKVLayer(DynamicLayer):
         # the certified error bound is not loosened); every later segment is
         # dropped.
         if max_length == 0:
+            self._seg_gen += 1
             self._banded_k[bi], self._banded_v[bi], self._seg_len[bi] = [], [], []
             self._banded_len[bi] = 0
             self._drop_dense_fallbacks()
@@ -1159,6 +1351,7 @@ class BandedKVLayer(DynamicLayer):
                 kept_len.append(need)
                 acc += need
             break
+        self._seg_gen += 1
         self._banded_k[bi], self._banded_v[bi], self._seg_len[bi] = kept_k, kept_v, kept_len
         self._banded_len[bi] = acc
         self._drop_dense_fallbacks()
@@ -1246,6 +1439,7 @@ class BandedKVLayer(DynamicLayer):
                     new_v.append([bk.take_rows(rows) for bk in self._banded_v[bi][si]])
                     new_len.append(int(rows.numel()))
                 acc += seg_len
+            self._seg_gen += 1
             self._banded_k[bi], self._banded_v[bi], self._seg_len[bi] = new_k, new_v, new_len
             self._banded_len[bi] = sum(new_len)
             if n_resid:
@@ -1279,6 +1473,7 @@ class BandedKVLayer(DynamicLayer):
             valid = set(range(len(self._seg_len[bi])))
             drop = wanted & valid
             keep = sorted(valid - drop)
+            self._seg_gen += 1
             self._banded_k[bi] = [self._banded_k[bi][i] for i in keep]
             self._banded_v[bi] = [self._banded_v[bi][i] for i in keep]
             self._seg_len[bi] = [self._seg_len[bi][i] for i in keep]
@@ -1316,13 +1511,23 @@ class BandedKVLayer(DynamicLayer):
         self._joined_bytes = 0
         self._drop_sm_views()
 
+    def release_sm_view(self, bi: int) -> None:
+        """Free slot `bi`'s append-in-place dense view (it attends through the fused path now)."""
+        global _GLOBAL_SM_BYTES
+        with _SM_LOCK:
+            e = getattr(self, "_sm_views", {}).pop(bi, None)
+            if e is not None:
+                _GLOBAL_SM_BYTES = max(0, _GLOBAL_SM_BYTES - e["bytes"])
+                self._sm_bytes -= e["bytes"]
+
     def _drop_sm_views(self) -> None:
         """Release the append-in-place dense views and their accounting."""
         global _GLOBAL_SM_BYTES
-        for e in getattr(self, "_sm_views", {}).values():
-            _GLOBAL_SM_BYTES = max(0, _GLOBAL_SM_BYTES - e["bytes"])
-        self._sm_views = {}
-        self._sm_bytes = 0
+        with _SM_LOCK:
+            for e in getattr(self, "_sm_views", {}).values():
+                _GLOBAL_SM_BYTES = max(0, _GLOBAL_SM_BYTES - e["bytes"])
+            self._sm_views = {}
+            self._sm_bytes = 0
 
     def _drop_unband_cache(self) -> None:
         for _k, (_seg, _dev, _dt, t) in self._unband_cache.items():
@@ -1344,6 +1549,8 @@ class BandedKVLayer(DynamicLayer):
         # Deliberately NOT calling super().reset(): DynamicLayer.reset()
         # touches self.keys/self.values, which this class no longer uses.
         batch = len(self._banded_k) if self._banded_k else 0
+        self._seg_gen = getattr(self, "_seg_gen", 0) + 1
+        self._win_tail = {}
         self._banded_k = [[] for _ in range(batch)]
         self._banded_v = [[] for _ in range(batch)]
         self._seg_len = [[] for _ in range(batch)]
@@ -1359,7 +1566,8 @@ class BandedKVLayer(DynamicLayer):
         # stale entry would risk _unband_cached returning the OLD
         # conversation's (freed, stale) reconstructed tensor for what
         # looks like the same id(), a real cross-conversation data leak.
-        self._fused = None            # uint8 id buffers of the fused decode path
+        self._fused_slots = []        # each slot's fused-attention state (rebuilt on first use)
+        self._host_tiers = []
         self._drop_joined_cache()
         self._drop_unband_cache()
         self._drop_dense_fallbacks()
@@ -1385,13 +1593,14 @@ class BandedKVLayer(DynamicLayer):
         result read as "50%", which is what made this codec look no better
         than the int8 layer when it was in fact better.
         """
-        banded = 0
-        for slot in self._banded_k:
-            for seg in slot:
-                banded += sum(bk.nbytes() for bk in seg)
-        for slot in self._banded_v:
-            for seg in slot:
-                banded += sum(bk.nbytes() for bk in seg)
+        banded = host = 0
+        for store in (self._banded_k, self._banded_v):
+            for slot in store:
+                for seg in slot:
+                    for bk in seg:
+                        banded += bk.nbytes()
+                        if not bk.packed.is_cuda:
+                            host += bk.packed.numel()       # --kv-host: payload in pinned host RAM
         residual = 0
         elems = 0
         esz = self._resid_k[0].element_size() if self._resid_k else 4
@@ -1407,6 +1616,7 @@ class BandedKVLayer(DynamicLayer):
         return {
             "dense_fallback_bytes": self._dense_fallback_bytes,
             "banded_bytes": banded,
+            "banded_host_bytes": host,
             "residual_bytes": residual,
             "total_bytes": banded + residual,
             "dense_bytes": elems * esz,
@@ -1432,13 +1642,13 @@ class _StatelessLayer:
         this on every non-BandedKVLayer layer)."""
 
 
-class NemotronHMambaLayer(LinearAttentionCacheLayerMixin):
+class Mamba2StateLayer(LinearAttentionCacheLayerMixin):
     """Per-layer Mamba-2 state (conv window + SSM) for one Nemotron-H
     mamba block.
 
     The model never calls update_conv_state/update_recurrent_state on
-    this layer: run/nemotron_h._mamba2_forward reads and writes the
-    tensors behind NemotronHBandedCache's conv_states/ssm_states views
+    this layer: layers/mamba2_hybrid._mamba2_forward reads and writes the
+    tensors behind HybridBandedCache's conv_states/ssm_states views
     (in-place .copy_), and those views read this layer's
     conv_states[0]/recurrent_states[0] on every access. That is what lets
     the engine's generic linear-attention helpers
@@ -1562,12 +1772,12 @@ class BandedKVCache(Cache):
         return {k: sum(int(r.get(k, 0)) for r in reports) for k in keys}
 
     def memory_report(self) -> dict:
-        tot = {"banded_bytes": 0, "residual_bytes": 0, "total_bytes": 0,
+        tot = {"banded_bytes": 0, "banded_host_bytes": 0, "residual_bytes": 0, "total_bytes": 0,
                "dense_bytes": 0, "elems": 0, "layers": 0}
         for layer in self.layers:
             if isinstance(layer, BandedKVLayer) and layer.is_initialized:
                 m = layer.memory_bytes()
-                for k in ("banded_bytes", "residual_bytes", "total_bytes",
+                for k in ("banded_bytes", "banded_host_bytes", "residual_bytes", "total_bytes",
                           "dense_bytes", "elems"):
                     tot[k] += m[k]
                 tot["layers"] += 1
@@ -1681,7 +1891,7 @@ class BandedKVCache(Cache):
                 layer.crop(max_length)
 
 
-class NemotronHBandedCache(BandedKVCache):
+class HybridBandedCache(BandedKVCache):
     """BandedKVCache for a Nemotron-H hybrid stack (Mamba-2 / attention /
     LatentMoE, one block type per layer, config.layers_block_type).
 
@@ -1693,7 +1903,7 @@ class NemotronHBandedCache(BandedKVCache):
     (AttributeError: 'BandedKVCache' object has no attribute
     'conv_states'). This subclass builds the real layout instead:
       - "attention" -> BandedKVLayer (banded KV, unchanged)
-      - "mamba"     -> NemotronHMambaLayer (per-slot conv + SSM state)
+      - "mamba"     -> Mamba2StateLayer (per-slot conv + SSM state)
       - "moe"/"mlp" -> _StatelessLayer (no state)
     and exposes the model-level surface the shipped modeling code reads:
     conv_states / ssm_states dicts keyed by layer index,
@@ -1709,7 +1919,7 @@ class NemotronHBandedCache(BandedKVCache):
         block_types = [str(t) for t in getattr(decoder_config, "layers_block_type", [])]
         if not block_types:
             raise ValueError(
-                "NemotronHBandedCache requires a config with "
+                "HybridBandedCache requires a config with "
                 "layers_block_type (the Nemotron-H puzzle config)")
         # Mamba state geometry, uniform across mamba blocks -- the same
         # derivation as the model's own NemotronHMamba2Mixer.__init__ /
@@ -1723,7 +1933,7 @@ class NemotronHBandedCache(BandedKVCache):
         conv_kernel = int(getattr(decoder_config, "conv_kernel", 4))
         if not (mamba_heads and mamba_head_dim and ssm_state_size):
             raise ValueError(
-                "NemotronHBandedCache: the config is missing the mamba "
+                "HybridBandedCache: the config is missing the mamba "
                 "state dimensions (mamba_num_heads/mamba_head_dim/"
                 "ssm_state_size)")
         inter = mamba_heads * mamba_head_dim
@@ -1735,7 +1945,7 @@ class NemotronHBandedCache(BandedKVCache):
             if bt == "attention":
                 layers.append(BandedKVLayer(tau=tau, residual_length=residual_length))
             elif bt == "mamba":
-                layers.append(NemotronHMambaLayer(
+                layers.append(Mamba2StateLayer(
                     conv_dim, conv_kernel,
                     (mamba_heads, mamba_head_dim, ssm_state_size), ssm_dtype))
             else:                                   # moe / mlp: no state
@@ -1758,13 +1968,13 @@ class NemotronHBandedCache(BandedKVCache):
         writes in place (.copy_) through this view, which is why a
         read-only view is sufficient."""
         return {i: lyr.conv_states[0] for i, lyr in enumerate(self.layers)
-                if isinstance(lyr, NemotronHMambaLayer)}
+                if isinstance(lyr, Mamba2StateLayer)}
 
     @property
     def ssm_states(self) -> dict:
         """layer index -> that mamba block's SSM state (see conv_states)."""
         return {i: lyr.recurrent_states[0] for i, lyr in enumerate(self.layers)
-                if isinstance(lyr, NemotronHMambaLayer)}
+                if isinstance(lyr, Mamba2StateLayer)}
 
     def _qv_ensure_mamba_batch(self, b: int, dtype, device) -> None:
         """Allocate (or re-allocate) every mamba block's conv/SSM state at
@@ -1775,14 +1985,14 @@ class NemotronHBandedCache(BandedKVCache):
         engine's grow/drop). Zero state == start of sequence, so
         re-allocation is a clean reset in every case it is reached."""
         for lyr in self.layers:
-            if isinstance(lyr, NemotronHMambaLayer):
+            if isinstance(lyr, Mamba2StateLayer):
                 cs, rs = lyr.conv_states[0], lyr.recurrent_states[0]
                 if cs is None or rs is None or cs.shape[0] != b or rs.shape[0] != b:
                     break
         else:
             return
         for lyr in self.layers:
-            if not isinstance(lyr, NemotronHMambaLayer):
+            if not isinstance(lyr, Mamba2StateLayer):
                 continue
             lyr.conv_states[0] = torch.zeros(b, lyr._qv_conv_dim, lyr._qv_kernel_size,
                                              dtype=dtype, device=device)

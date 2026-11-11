@@ -98,6 +98,20 @@ class QVHTTPHandler(BaseHTTPRequestHandler):
     timeout = int(os.environ.get("QV_SOCKET_TIMEOUT", "120"))
     MAX_BODY: int | "Callable[[], int]" = 50_000_000
     ENABLE_CORS = True
+
+    def handle(self):
+        # A client that hangs up before its reply is written (a probe with a short timeout, an editor extension that
+        # cancels a request, a closed tab) is not a server error: one line naming WHAT it had asked for.
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            what = getattr(self, "requestline", "") or "a request not read yet"
+            if what.startswith("GET /health"):
+                # the launcher's readiness probe (curl -m 3 every 5 s): while the model loads, the probes queue on
+                # the already-bound socket and have all timed out by the time the server answers. Not reported.
+                return
+            print(f"[http] client {self.client_address[0]}:{self.client_address[1]} hung up before the reply to "
+                  f"\"{what}\" was sent ({type(e).__name__}); nothing wrong on the server", flush=True)
     FORCE_CLOSE = True
 
     def _end_close(self):
