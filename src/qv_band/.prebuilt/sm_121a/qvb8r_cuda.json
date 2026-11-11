@@ -1,0 +1,8 @@
+{
+ "key": "a73394d36db4",
+ "arch": "sm_121a",
+ "torch": "2.14.0+cu130",
+ "cuda": "13.0",
+ "platform": "aarch64-linux",
+ "built": "2026-11-11"
+}

@@ -44,11 +44,12 @@ identical to the original's, or correct. See the disclaimer at the end of this f
 
 ## Requirements
 
-- An NVIDIA GPU with about 62 GB of GPU memory for the qvb8 1e-3 pack (about 50 GB for the qvb8r 1e-3 pack), and the CUDA toolkit with `nvcc`.
+- An NVIDIA GPU with about 62 GB of GPU memory for the qvb8 1e-3 pack (about 50 GB for the qvb8r 1e-3 pack).
 - **Provided build:** NVIDIA DGX Spark (GB10, sm_121, aarch64), Ubuntu 24.04, driver 580, CUDA 13.0, Python 3.12, PyTorch 2.14.
-  This is the build that has been tested.
+  This is the build that has been tested. Its prebuilt CUDA kernels are bundled in the tree
+  (`src/qv_band/.prebuilt/sm_121a/`), so a GB10 needs no CUDA toolkit: download, install the packages, run.
 - **Other GPUs:** the source is not tied to one GPU. The kernels compile for your GPU on first use (for example sm_120 on an
-  RTX PRO 6000), but only the DGX Spark build is tested for Ripple.
+  RTX PRO 6000; a few minutes, the CUDA toolkit with `nvcc` is required), but only the DGX Spark build is tested for Ripple.
 - **Compute dtype, `--dtype bf16|fp16`:** the server launcher passes `--dtype fp16`; add `--dtype bf16` after it to
   run in bf16, for example `scripts/ripple_server.sh start --dtype bf16`. Nothing
   is chosen automatically. A GPU without bf16 support (for example the V100, sm_70) emulates bf16 and is slow, so run it
@@ -96,7 +97,8 @@ pip install -r requirements.txt
 #    It must be built against your PyTorch:  pip install flash-attn==2.8.3.post1 --no-build-isolation
 ```
 
-The CUDA kernels compile automatically on first use (a few minutes) into `.ext_cache/` and are reused after that.
+On a GB10 the bundled prebuilt kernels are used as-is: no compile, no CUDA toolkit. On any other GPU the CUDA
+kernels compile automatically on first use (a few minutes, `nvcc` required) into `.ext_cache/` and are reused after that.
 
 
 <div align="center">
@@ -201,6 +203,10 @@ exact near-tie, the choice can differ.
 - The launcher keeps a startup log (`scripts/logs/Ripple-65B.startup.log`, action `startup`): the command line and
   everything the server printed until it answered the health check -- the load, placement, kernel and memory lines,
   apart from the request log.
+- The prebuilt CUDA kernels of the provided build (DGX Spark, sm_121a) are bundled in the tree
+  (`src/qv_band/.prebuilt/sm_121a/`): a GB10 runs without a CUDA toolkit. The sidecar next to each kernel records
+  the sources, torch and platform it was built for; anything else (another GPU, another torch) compiles on first
+  use as before.
 
 **v1.0.1**
 - One switch for the compute dtype: `--dtype bf16|fp16` (replaces the `QV_MODEL_DTYPE` variable). The launchers set

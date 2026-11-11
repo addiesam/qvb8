@@ -12,6 +12,9 @@ source bytes + flags + target (GPU arch / XPU / CPU machine) + torch version + c
   * the first run on a machine, or after a source change (a new tree copied over), compiles once (announced on stdout); later
     starts import the cached build;
   * machines sharing a checkout keep separate builds; nothing stale or ABI-mismatched can be loaded.
+  * a release may bundle the built kernel (qv_band/.prebuilt/sm_<arch>/): it is loaded without a
+    toolkit, so a download-and-run machine needs no nvcc.
+
 
 A new format (qvb9, ...) needs nothing beyond calling these from its loader -- no setup.py, no build.py.
 
@@ -123,6 +126,44 @@ def _toolkit_for(cc: int) -> tuple[str, tuple[int, int]]:
     return h, v
 
 
+# -- prebuilt kernels (release) --------------------------------------------------------------------------------------
+def _prebuilt_key(name: str, sources, cflags, cuda_cflags, ldflags, arch: str, torch) -> str:
+    """The sidecar key of a bundled kernel: the build inputs minus the toolkit version (a bundled .so must load on
+    a machine without nvcc, so the toolkit version cannot be part of it; the torch version already names its CUDA
+    variant)."""
+    return _key(name, sources, cflags, cuda_cflags, ldflags, arch, torch.__version__, _torch_home(torch))
+
+
+def _prebuilt(name: str, sources, cflags, cuda_cflags, ldflags, arch: str, torch):
+    """A kernel bundled with the tree for this arch (qv_band/.prebuilt/sm_<arch>/<name>.so + <name>.json sidecar):
+    loaded without a CUDA toolkit, so a download-and-run machine needs no nvcc. None when absent, or built from
+    different sources / torch / platform (the sidecar key), in which case the caller compiles as usual; a failed
+    load (e.g. a torch build the .so was not linked against) falls back to compiling as well."""
+    import importlib.util
+    import json
+    d = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".prebuilt", f"sm_{arch}")
+    so, meta = os.path.join(d, f"{name}.so"), os.path.join(d, f"{name}.json")
+    if not (os.path.isfile(so) and os.path.isfile(meta)):
+        return None
+    try:
+        m = json.load(open(meta))
+    except (OSError, ValueError):
+        return None
+    if m.get("key") != _prebuilt_key(name, sources, cflags, cuda_cflags, ldflags, arch, torch) or \
+            m.get("platform") != f"{platform.machine()}-{sys.platform}":
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(name, so)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        print(f"[qv_band] {name}: using the bundled kernel for sm_{arch} "
+              f"(built {m.get('built', '?')}, torch {m.get('torch')}, CUDA {m.get('cuda')}) -- no compile", flush=True)
+        return mod
+    except Exception as e:
+        print(f"[qv_band] {name}: the bundled kernel for sm_{arch} failed to load ({e}); compiling instead", flush=True)
+        return None
+
+
 def load_cuda_ext(name: str, sources: list[str], *, cflags=(), cuda_cflags=(), ldflags=(), device=None):
     """Extension `name` built from `sources` for the GPU `device` (default: current), built here if needed.
     Cheap to call per launch: after the first call per card it is a dict lookup, so callers need not (and must
@@ -139,6 +180,10 @@ def load_cuda_ext(name: str, sources: list[str], *, cflags=(), cuda_cflags=(), l
     if (name, arch) in _LOADED:
         _LOADED[(name, "dev", dev)] = _LOADED[(name, arch)]
         return _LOADED[(name, arch)]
+    mod = _prebuilt(name, sources, cflags, cuda_cflags, ldflags, arch, torch)   # release: a bundled kernel, no toolkit needed
+    if mod is not None:
+        _LOADED[(name, arch)] = _LOADED[(name, "dev", dev)] = mod
+        return mod
     home, ver = _toolkit_for(cc)
     bdir = os.path.join(_CACHE, f"{name}-sm{arch}-{_key(name, sources, cflags, cuda_cflags, ldflags, arch, torch.__version__, _torch_home(torch), ver)}")
     os.makedirs(bdir, exist_ok=True)

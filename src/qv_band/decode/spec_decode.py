@@ -1375,6 +1375,35 @@ def _forward_batched_with_hidden(model, input_ids, attention_mask, position_ids,
     return _ResultWithHidden(logits, outputs.past_key_values, hidden, features)
 
 
+
+def _install_decode_graphs(model, layer_graphs: bool) -> None:
+    """Dense models, opt-in QVB8_MLP_GRAPH=1 (the V100 launchers): replay each MLP as a CUDA graph at decode
+    (moe_graph.install_mlp_graphs) and each linear-attention layer's input projections as one graph (proj_graph).
+    layer_graphs: also each whole linear-attention decoder layer as ONE graph at verify (layer_graph) -- the
+    one-request path only; the scheduler's packed steps re-split a row per slot inside that layer. Once per model
+    (the layer graphs once more when a later caller asks for them); an optimisation only."""
+    done = model.__dict__.setdefault("_qv_decode_graphs", set())
+    try:
+        if "mlp" not in done:
+            done.add("mlp")
+            from qv_band.formats.qvb8.moe_graph import install_mlp_graphs
+            _n = install_mlp_graphs(model)
+            if _n:
+                print(f"[mlp-graph] {_n} MLPs replay as CUDA graphs at decode", flush=True)
+                from qv_band.decode.proj_graph import install as _install_proj
+                _np = _install_proj(model)
+                if _np:
+                    print(f"[proj-graph] {_np} projection groups replay as CUDA graphs at decode", flush=True)
+                done.add("on")
+        if layer_graphs and "on" in done and "layer" not in done:
+            done.add("layer")
+            from qv_band.decode.layer_graph import install as _install_layers
+            _nl = _install_layers(model)
+            if _nl:
+                print(f"[layer-graph] {_nl} linear-attention layers replay as CUDA graphs at verify", flush=True)
+    except Exception as _e:                       # noqa: BLE001 - optional accelerator
+        print(f"[mlp-graph] not installed: {_e!r}", flush=True)
+
 @torch.no_grad()
 def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                          max_new: int = 40, stream: bool = True,
@@ -1628,28 +1657,7 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
     except Exception as _e:                       # noqa: BLE001 - optional accelerator
         print(f"[gdn] not installed: {_e!r}", flush=True)
 
-    # Dense models: replay each MLP as a CUDA graph at decode (moe_graph.py's
-    # install_mlp_graphs). Once per model; an optimisation only.
-    if not getattr(model, "_qv_mlp_graphs", False):
-        model._qv_mlp_graphs = True
-        try:
-            from qv_band.formats.qvb8.moe_graph import install_mlp_graphs
-            _n = install_mlp_graphs(model)
-            if _n:
-                print(f"[mlp-graph] {_n} MLPs replay as CUDA graphs at decode", flush=True)
-                # same opt-in: the linear-attention input projections as one graph per layer (decode/proj_graph.py)
-                from qv_band.decode.proj_graph import install as _install_proj
-                _np = _install_proj(model)
-                if _np:
-                    print(f"[proj-graph] {_np} projection groups replay as CUDA graphs at decode", flush=True)
-                # and each whole linear-attention decoder layer as ONE graph at verify (decode/layer_graph.py);
-                # the MLP / projection graphs above still serve every other call
-                from qv_band.decode.layer_graph import install as _install_layers
-                _nl = _install_layers(model)
-                if _nl:
-                    print(f"[layer-graph] {_nl} linear-attention layers replay as CUDA graphs at verify", flush=True)
-        except Exception as _e:                       # noqa: BLE001 - optional accelerator
-            print(f"[mlp-graph] not installed: {_e!r}", flush=True)
+    _install_decode_graphs(model, layer_graphs=True)
 
     _heartbeat = _Heartbeat(on_heartbeat)
 
@@ -3560,12 +3568,16 @@ class ContinuousBatchEngine:
         eos = tok.eos_token_id
         self.eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         self.past = None            # BandedKVCache, built lazily on first admit
+        # the V100's decode needs the MLP / projection CUDA graphs here too (CPU-bound launches); not the whole-layer graph
+        _install_decode_graphs(model, layer_graphs=False)
         # Decoder layers on other machines (decode/remote_stage.py); empty on one machine. Every cache action below
         # is repeated on each stage for the layers it holds.
         self._stages = getattr(model, "_qv_remote_stages", ())
         self._remote_layers = getattr(model, "_qv_remote_layers", frozenset())
-        for _st in self._stages:
-            _st.reset(kv_tau or KV_DEFAULT_TAU, int8_residual_length)
+        if self._stages:
+            from qv_band.kv.codec import KV_DEFAULT_TAU
+            for _st in self._stages:
+                _st.reset(kv_tau or KV_DEFAULT_TAU, int8_residual_length)
         self.slots: list[_BatchSlot | None] = []
         self._pending_prompts: dict[int, torch.Tensor] = {}   # bi -> prompt ids, this-step admits
         self._prefix_store: list[dict] = []        # saved prompt prefixes, most recently used first
