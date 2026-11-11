@@ -1,0 +1,8 @@
+{
+ "key": "03cdbd879b86",
+ "arch": "sm_70",
+ "torch": "2.14.1+cu126",
+ "cuda": "12.6",
+ "platform": "x86_64-linux",
+ "built": "2026-11-11"
+}

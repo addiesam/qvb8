@@ -48,6 +48,8 @@ identical to the original's, or correct. See the disclaimer at the end of this f
 - **Provided build:** NVIDIA DGX Spark (GB10, sm_121, aarch64), Ubuntu 24.04, driver 580, CUDA 13.0, Python 3.12, PyTorch 2.14.
   This is the build that has been tested. Its prebuilt CUDA kernels are bundled in the tree
   (`src/qv_band/.prebuilt/sm_121a/`), so a GB10 needs no CUDA toolkit: download, install the packages, run.
+- **V100:** prebuilt kernels are bundled for it as well (`src/qv_band/.prebuilt/sm_70/`, built with PyTorch 2.14.1
+  for CUDA 12.6): a V100 with that PyTorch also runs without a CUDA toolkit.
 - **Other GPUs:** the source is not tied to one GPU. The kernels compile for your GPU on first use (for example sm_120 on an
   RTX PRO 6000; a few minutes, the CUDA toolkit with `nvcc` is required), but only the DGX Spark build is tested for Ripple.
 - **Compute dtype, `--dtype bf16|fp16`:** the server launcher passes `--dtype fp16`; add `--dtype bf16` after it to
@@ -97,8 +99,9 @@ pip install -r requirements.txt
 #    It must be built against your PyTorch:  pip install flash-attn==2.8.3.post1 --no-build-isolation
 ```
 
-On a GB10 the bundled prebuilt kernels are used as-is: no compile, no CUDA toolkit. On any other GPU the CUDA
-kernels compile automatically on first use (a few minutes, `nvcc` required) into `.ext_cache/` and are reused after that.
+On a GB10 (or a V100 with the matching PyTorch) the bundled prebuilt kernels are used as-is: no compile, no CUDA
+toolkit. On any other GPU the CUDA kernels compile automatically on first use (a few minutes, `nvcc` required) into
+`.ext_cache/` and are reused after that.
 
 
 <div align="center">
@@ -203,10 +206,11 @@ exact near-tie, the choice can differ.
 - The launcher keeps a startup log (`scripts/logs/Ripple-65B.startup.log`, action `startup`): the command line and
   everything the server printed until it answered the health check -- the load, placement, kernel and memory lines,
   apart from the request log.
-- The prebuilt CUDA kernels of the provided build (DGX Spark, sm_121a) are bundled in the tree
-  (`src/qv_band/.prebuilt/sm_121a/`): a GB10 runs without a CUDA toolkit. The sidecar next to each kernel records
-  the sources, torch and platform it was built for; anything else (another GPU, another torch) compiles on first
-  use as before.
+- Prebuilt CUDA kernels are bundled in the tree (`src/qv_band/.prebuilt/`): sm_121a for the DGX Spark (PyTorch
+  2.14.0 for CUDA 13.0) and sm_70 for the V100 (PyTorch 2.14.1 for CUDA 12.6). A machine with the matching PyTorch
+  runs without a CUDA toolkit; the sidecar next to each kernel records the sources, torch and platform it was built
+  for, and anything else compiles on first use as before. The sidecar match no longer binds to the torch install
+  path.
 
 **v1.0.1**
 - One switch for the compute dtype: `--dtype bf16|fp16` (replaces the `QV_MODEL_DTYPE` variable). The launchers set

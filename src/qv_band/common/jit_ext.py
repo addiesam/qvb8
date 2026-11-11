@@ -128,10 +128,10 @@ def _toolkit_for(cc: int) -> tuple[str, tuple[int, int]]:
 
 # -- prebuilt kernels (release) --------------------------------------------------------------------------------------
 def _prebuilt_key(name: str, sources, cflags, cuda_cflags, ldflags, arch: str, torch) -> str:
-    """The sidecar key of a bundled kernel: the build inputs minus the toolkit version (a bundled .so must load on
-    a machine without nvcc, so the toolkit version cannot be part of it; the torch version already names its CUDA
-    variant)."""
-    return _key(name, sources, cflags, cuda_cflags, ldflags, arch, torch.__version__, _torch_home(torch))
+    """The sidecar key of a bundled kernel: the build inputs minus the toolkit version and the torch install path
+    (a bundled .so travels to other machines: the torch version -- with its CUDA variant -- names the ABI, the
+    local path does not)."""
+    return _key(name, sources, cflags, cuda_cflags, ldflags, arch, torch.__version__, "prebuilt")
 
 
 def _prebuilt(name: str, sources, cflags, cuda_cflags, ldflags, arch: str, torch):
