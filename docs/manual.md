@@ -283,7 +283,7 @@ Cline → Settings → API Provider **OpenAI Compatible**:
 Cline sends a long system prompt (many thousand tokens) at every step. That is exactly what a saved prefix is for: after the
 first step the server restores it instead of computing it again. Reasoning (`<think>`) makes answers slower; start the
 server with `--no-think` if you want direct answers for editing work.
-We tested the request format Cline sends; we have not run a long Cline session ourselves.
+Used with Cline in VS Code for long coding tasks on V100 cards: slower than a big GPU, but a long task runs to the end.
 
 ### 9.2 Why the conversation can move
 

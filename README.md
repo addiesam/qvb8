@@ -9,8 +9,7 @@ client, with DFlash2 speculative decoding.
 > bound), defined by its numbers and not by a GPU. A prompt prefilled on a DGX Spark (Blackwell) is restored on a V100
 > (Volta) instead of being computed again, with the same answer: [see how and what we measured](#kv-cache-shared-between-machines-and-between-different-gpus).
 > **A 27B model on one 16 GB GPU:** Qwen3.8-27B (QVB8R 2e-3) with its QVB8R DFlash2 drafter runs on a single V100 16 GB
-> (`./qvb8 get qwen-27b && ./qvb8 start qwen-27b`), or on two 16 GB cards with `--pipeline auto`. On one card the memory is
-> tight: short prompts work; the limit for long prompts and the V100 speed are **TBA** (measurements in progress).
+> (`./qvb8 get qwen-27b && ./qvb8 start qwen-27b`), or on two 16 GB cards with `--pipeline auto`.
 > New too: `./install.sh` and `./qvb8 start qwen-9b` for a three-step start, and `--pipeline auto` for several cards.
 
 The engine is general CUDA code. **Version 1 provides a build for the NVIDIA DGX Spark (GB10, sm_121, aarch64).**
@@ -114,7 +113,7 @@ Download one target pack and one matching draft pack:
 
 The compressed size depends on the format and the error bound tau: `qvb8` is faster, `qvb8r` is smaller, a larger tau is
 smaller still. Each pack's size, format and tau are on its Hugging Face page. Rule of thumb: the pack must fit in GPU
-memory with some room for the KV cache; **a 16 GB card runs the 27B** (QVB8R 2e-3, 13.6 GB; long prompts on one card: TBA).
+memory with some room for the KV cache; **a 16 GB card runs the 27B** (QVB8R 2e-3, 13.6 GB; on one card with the DRAM offload, see the V100 speed table).
 
 Every pack: [huggingface.co/addiesam](https://huggingface.co/addiesam).
 
@@ -229,8 +228,8 @@ Settings → API Provider **OpenAI Compatible**, then
 | Model ID | any text with one model up; with a router and several models, a name from `GET /v1/models` |
 | Context window | what you want to use, up to the server's limit (a 16 GB V100: 32768 is a good start) |
 
-We have tested the request format Cline sends (content-part lists, streaming, tool calls); we have not run a long Cline
-session ourselves. The same settings work for Continue, Open WebUI, `curl` and the OpenAI Python client.
+Used with Cline in VS Code for long coding tasks on V100 cards: slower than a big GPU, but a long task runs through to the
+end. The same settings work for Continue, Open WebUI, `curl` and the OpenAI Python client.
 
 ### Keep the conversation going, also on another machine
 
@@ -250,6 +249,27 @@ with the same answers; only the **speed** depends on whether the new server has 
 A prefix matches only if the beginning is **identical**: same system prompt, same chat template, same `think` setting.
 The terminal chat (`scripts/chat.sh`) keeps its history only in that window; to continue elsewhere use a client that
 stores the conversation, such as Cline. Details and commands: [docs/manual.md](docs/manual.md), section 9.
+
+### Why it matters: a change of paradigm, and sample use cases
+
+Certified L∞-bounded compression changes what can be assumed about a compressed model: every restored weight and every saved
+KV value is within a known bound, so the same model needs far less memory and the saved state stays valid on any GPU.
+The cases below are **samples**, from small to large. They are only the first ones we tried; with a bound that is proven
+rather than hoped for, new uses are open to test, and we are waiting for you to try, see, and report new use cases.
+
+- **One old card.** A 27B model runs on one V100 16 GB. It is not a 4-bit (Q4) model: every weight has a proven error
+  bound. With VS Code + Cline it finished coding tasks of 600+ conversation rounds. It is slower than a big GPU, but it
+  finishes the job. Speed: about 10 tok/s in real Cline use; the [V100 table](#speed-on-v100-16-gb-volta-measured-2026-11-16-on-an-idle-machine) has the benchmark numbers.
+- **Local setups.** 16 GB or 24 GB cards, several cards in one machine or several machines, hold a 27B or larger model
+  split by layers (`--pipeline auto`, or a network stage between machines): local coding agents and other AI work
+  without a big single GPU.
+- **Data centers.** New and old cards work together: the saved KV state moves between GPU generations (GB10 and V100
+  tested), and one model can be split over machines of different generations (two V100 to a GB10, tested over Wi-Fi).
+  A **super DRAM pool**, machines with a lot of RAM and no GPU, takes saved prefixes and old KV blocks, so GPU memory is
+  spent on live work and fewer GPUs are needed.
+
+The H100 / H200 / 288 GB layouts and many-cluster layouts below are **simulations**, not results. To test them for real,
+see [Support this project](#support-this-project). Found a new use? Open an issue and tell us.
 
 ## Use cases: one card, many cards, many machines
 
@@ -472,7 +492,18 @@ Code is faster than prose because the drafter guesses code better (more drafted 
 Speculative decoding is verified by the full model; in our tests greedy output matched plain decoding, and where two
 tokens are an exact near-tie the choice can differ.
 
-**V100 (16 GB) speed: TBA.** The V100 decode and prefill numbers for this release are being measured and will be added here.
+### Speed on V100 16 GB (Volta, measured 2026-11-16 on an idle machine)
+
+Qwen3.8-27B qvb8r 2e-3 + DFlash2 qvb8r 5e-3 (K=7), `ATTN=sdpa`, one live request (`MAX_LIVE=1`), same prompts and settings as above, prefill with a 15,263-token prompt.
+
+| V100 setup | Decode, code | Decode, prose | **Prefill** (15k-token prompt) | GPU memory used |
+|---|---|---|---|---|
+| **One card**, DRAM offload (`--prefill-chunk 512 --kv-window 4096 --kv-cold-block 8192 --prefix-store host --vision-tower host`) | 4.9 tok/s | 3.1 tok/s | about 135 tok/s (113 s) | 14.8 GB of 16 |
+| **Two cards**, `--pipeline auto --prefill-chunk 2048` | 7.9 tok/s | 5.8 tok/s | about 310 tok/s (49 s) | split over both cards |
+
+One card needs the DRAM offload (older KV blocks, saved prefixes and the vision tower live in host RAM), and it did
+complete the 15k-token prompt in this test. The V100 has no `causal_conv1d` kernel and no flash-attn, so it uses the
+plain PyTorch paths; it is the slow, small-memory case, not the speed case.
 
 ## Update history
 

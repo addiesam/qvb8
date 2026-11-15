@@ -52,8 +52,8 @@ case "$cmd" in
     echo "GPU memory needed: about $NEED. The first start takes a few minutes."
     EXTRA=()
     if [ "$1" = qwen-27b ] && [ -n "$GPU_MB" ] && [ "$GPU_MB" -lt 24000 ]; then   # 27B on a 16 GB card: small chunk, KV window, one request
-      export MAX_LIVE="${MAX_LIVE_27B:-1}"; EXTRA=(--prefill-chunk 512 --kv-window 4096 --kv-cold-block 8192)
-      echo "16 GB card: the 27B runs with a small chunk (512), a KV window (4096) and one live request."
+      export MAX_LIVE="${MAX_LIVE_27B:-1}"; EXTRA=(--prefill-chunk 512 --kv-window 4096 --kv-cold-block 8192 --prefix-store host --vision-tower host)
+      echo "16 GB card: the 27B runs with a small chunk (512), a KV window (4096), one live request, and saved prefixes and the vision tower in host RAM."
     fi
     MODEL="$MODELS_DIR/$MODEL_REPO" DRAFT="$MODELS_DIR/$DRAFT_REPO" DRAFT_K=$DRAFT_K exec scripts/qwen_server.sh start "${EXTRA[@]}" ;;
   stop|status|log|startup)
