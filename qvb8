@@ -25,7 +25,7 @@ fi
 preset() {
   case "$1" in
     qwen-9b)  MODEL_REPO=Qwen3.5-9B_qvb8_1e-3_fp16;      DRAFT_REPO=Qwen3.5-9B-DFlash_qvb8_1e-3;            DRAFT_K=15; SIZE="9.0 GB"; NEED="16 GB" ;;
-    qwen-27b) MODEL_REPO=Qwen3.8-27B_qvb8r_2e-3_fp16;    DRAFT_REPO=Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16;    DRAFT_K=7;  SIZE="15.1 GB"; NEED="30 GB" ;;
+    qwen-27b) MODEL_REPO=Qwen3.8-27B_qvb8r_2e-3_fp16;    DRAFT_REPO=Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16;    DRAFT_K=7;  SIZE="15.1 GB"; NEED="16 GB" ;;
     *) echo "unknown model '$1'. Run: ./qvb8 list" >&2; exit 1 ;;
   esac
 }
@@ -36,7 +36,7 @@ case "$cmd" in
   list)
     printf '%-10s %-12s %-14s %s\n' MODEL DOWNLOAD "GPU MEMORY" NOTE
     printf '%-10s %-12s %-14s %s\n' qwen-9b  "9.0 GB"  "16 GB" "Qwen3.5-9B, fast, good for a first try"
-    printf '%-10s %-12s %-14s %s\n' qwen-27b "15.1 GB" "30 GB" "Qwen3.8-27B, stronger" ;;
+    printf '%-10s %-12s %-14s %s\n' qwen-27b "15.1 GB" "16 GB" "Qwen3.8-27B, stronger: fits one 16 GB card (V100)" ;;
   get)
     need_install; preset "${1:-}"
     mkdir -p "$MODELS_DIR"
@@ -50,7 +50,12 @@ case "$cmd" in
     need_install; preset "${1:-}"
     [ -d "$MODELS_DIR/$MODEL_REPO" ] && [ -d "$MODELS_DIR/$DRAFT_REPO" ] || { echo "Model not downloaded. Run: ./qvb8 get $1" >&2; exit 1; }
     echo "GPU memory needed: about $NEED. The first start takes a few minutes."
-    MODEL="$MODELS_DIR/$MODEL_REPO" DRAFT="$MODELS_DIR/$DRAFT_REPO" DRAFT_K=$DRAFT_K exec scripts/qwen_server.sh start ;;
+    EXTRA=()
+    if [ "$1" = qwen-27b ] && [ -n "$GPU_MB" ] && [ "$GPU_MB" -lt 24000 ]; then   # 27B on a 16 GB card: small chunk, KV window, one request
+      export MAX_LIVE="${MAX_LIVE_27B:-1}"; EXTRA=(--prefill-chunk 512 --kv-window 4096 --kv-cold-block 8192)
+      echo "16 GB card: the 27B runs with a small chunk (512), a KV window (4096) and one live request."
+    fi
+    MODEL="$MODELS_DIR/$MODEL_REPO" DRAFT="$MODELS_DIR/$DRAFT_REPO" DRAFT_K=$DRAFT_K exec scripts/qwen_server.sh start "${EXTRA[@]}" ;;
   stop|status|log|startup)
     exec scripts/qwen_server.sh "$cmd" ;;
   chat)

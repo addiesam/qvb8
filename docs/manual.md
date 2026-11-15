@@ -265,3 +265,179 @@ Then start the PC store and the router as in section 6. A long document prefille
 a request for it reaches the V100, the router pulls the prefix there (if copying is faster than recomputing) and the V100
 prefills only the new part. On a V100 add `--vision off` if the vision tower does not fit next to the model.
 
+---
+
+## 9. Editors (Cline) and keeping a conversation going
+
+### 9.1 Cline in VS Code
+
+Cline → Settings → API Provider **OpenAI Compatible**:
+
+| Field | Value |
+|---|---|
+| Base URL | `http://HOST:8080/v1`, or the router `http://HOST:8000/v1` |
+| API Key | any non-empty text; the server does not check it (`QV_POOL_TOKEN` is only for server-to-server pool traffic) |
+| Model ID | any text with one model up; behind a router with several models use an id from `GET /v1/models` |
+| Context window | your choice, up to the server's limit (`--max-live-tokens`); 16 GB V100: start with 32768 |
+
+Cline sends a long system prompt (many thousand tokens) at every step. That is exactly what a saved prefix is for: after the
+first step the server restores it instead of computing it again. Reasoning (`<think>`) makes answers slower; start the
+server with `--no-think` if you want direct answers for editing work.
+We tested the request format Cline sends; we have not run a long Cline session ourselves.
+
+### 9.2 Why the conversation can move
+
+The API is stateless: the client sends the full message list every time. The server stores only the computed state of
+the beginning of the list (the prefix) under a key made from the exact tokens. Any server that can get that state
+continues without computing it; any server that cannot computes it again and gives the same answer.
+
+### 9.3 All cases
+
+| # | Situation | Setup | What happens | Speed |
+|---|---|---|---|---|
+| 1 | Same server, next message | any | own pool restores the prefix | fast |
+| 2 | Server restarted | `--prefix-backup http://pc:8082` (the PC copy survives a restart of the server and of the GPU machine) | restored from the PC copy when the router pulls it | fast if the link is fast |
+| 3 | Other card, same machine | both servers `--prefix-store shared --prefix-shared-name X` | one pool, one copy | fast |
+| 4 | Other machine, router + PC store | `--prefix-backup http://pc:8082` on the servers; router with `--store` (section 6) | router pulls the prefix when copying is faster than computing (`--pull cost`) | fast if the link is fast; on slow Wi-Fi it may prefer computing |
+| 5 | Other machine, nothing shared | none | whole history computed again | slow, same answer |
+| 6 | Other card, other GPU type (GB10 ↔ V100) | same pack, `--dtype`, KV τ and residual, checkpoint grid (section 8) | the saved state is certified data, so it restores on any card | as case 4 |
+| 7 | Different pack, τ, KV setting | — | refused by the signature check, computed again | slow |
+| 8 | History changed at the start (new system prompt, other template, `think` flipped) | — | the prefix matches only up to the first difference | partly fast |
+
+Case 8 is the one that surprises people: Cline changing mode, or a different system prompt, moves the first difference
+towards the beginning, and everything after it is computed again.
+
+### 9.4 Moving a Cline task to another machine
+
+1. Start the other server (or the router) as in section 6 or 8, with the same pack and the same KV settings.
+2. In Cline change **Base URL** to the other server and send the next message. Cline sends the whole history.
+3. Behind the router nothing changes at all: keep one Base URL; the router picks the server that has the longest
+   matching prefix, or pulls it.
+
+The terminal chat keeps its history only in memory; use `/reset` or a new window to start again. It cannot hand a
+conversation to another machine; Cline (which stores the history itself) can.
+
+
+---
+
+## 10. Several rounds, in detail (Cline, OpenCode and other agents)
+
+An agent such as Cline or OpenCode works in many rounds: read a file, think, call a tool, read the result, think again.
+**Every round is a new HTTP request that contains the whole history again.** The server keeps no conversation. What it
+keeps is *computed state* for the beginning of the history, found again by the exact token ids. This is why the same
+engine is fast for an agent: round 2 is the same long beginning plus a little new text.
+
+![round 1, round 2, round n (sequence)](img/fig7_two_rounds.svg)
+
+What happens, in order (the numbers are an example: 27B on a GB10, prefill about 880 tokens/s, chunk 4096):
+
+| Step | Round 1 (23,300 tokens) | Round 2 (24,300 tokens) |
+|---|---|---|
+| 1. Request arrives | system prompt + tools 9,000, files 14,000, question 300 | the same 23,300 tokens, the answer 600, the new question 400 |
+| 2. Look-up | nothing saved | the first 20,480 token ids equal a saved state → found |
+| 3. Compute | all 23,300 tokens, about 26 s | restore the state (no computing), compute the other 3,820 tokens, about 4.3 s |
+| 4. Save | state at 20,480 tokens (a multiple of the chunk) into the pool | a new, longer state for round 3 |
+| 5. Answer | 600 tokens | the same answer as without any saving |
+
+What is saved: the attention KV of the full-attention layers (compressed, with a proven error bound) and the state of
+the linear-attention layers, at a chunk boundary of the prompt. It lives in the pool you chose with `--prefix-store`
+(`gpu`, `host`, or `shared`) and, with `--prefix-backup`, as a copy on the PC.
+
+**Round 2 on another machine or card.** The client sends the same request to the router; the router knows which server
+holds the longest match and may move it:
+
+![two rounds, other machine](img/fig8_two_rounds_other_machine.svg)
+
+Same card pair, same machine: a shared pool, no copy at all (section 2). Another machine: the router pulls the saved
+state (section 4) when copying is faster than computing; it is checked by hash and by the transfer signature, and a
+failed pull costs nothing but the prefill it would have saved.
+
+**What spoils the match** (Cline, OpenCode):
+- a system prompt, tool list, mode, date or working-directory line that changes between rounds: everything after the change is computed again;
+- another chat template or thinking switched on/off between rounds;
+- a client that removes old tool results from the history ("context pruning"): the match stops where the history was cut.
+  Appending is cheap, editing the beginning is not.
+
+---
+
+## 11. From a toy to a real server
+
+The same engine runs on one 16 GB card on a desk and on a rack server. Nothing changes in the design: a **replica** is
+one server on one card, a **split** is one server over several cards, the **pool** is host RAM, the **router** is one
+URL. A big machine just has more of each. The picture below is a deployment for an 8-GPU machine with 288 GB per card;
+**we have only simulated it and never run it on H100 / H200 / H300 hardware**; the settings extend the ones we did run (GB10,
+V100 cards, a PC store). To test it for real the project needs hardware: a donated card, GPU server access, or money for
+rented GPU time (see Support this project in the README).
+
+![big server](img/fig6_big_server.svg)
+
+| Part | In the picture | Flag / command | Tested on |
+|---|---|---|---|
+| Replicas of one model | Model A on GPU 6, 7 | one `qwen_server.sh` per card: `CUDA_VISIBLE_DEVICES=i INSTANCE=ai PORT=808x` | two V100 cards, one GB10 |
+| One model over several cards | Model B (Qwen/Qwen3.8-2.4T-A95B) on GPU 0–5 | `--pipeline auto` (all visible cards) or `--pipeline cuda:0,cuda:1,...,cuda:5` | two V100 cards (27B); more than two cards simulated only |
+| Shared prefix pool | green strip | `--prefix-store shared --prefix-shared-name NAME --prefix-shared-gb N` (the host's `/dev/shm` must be big enough) | yes |
+| Copies and overflow on another machine | amber box | `--prefix-backup`, `--kv-remote`, `prefix_store`, `kv_host` | yes (PC with 16 GB) |
+| One URL, routing by model name | router | `servers.router --backend NAME=URL ... --store ...` | yes |
+
+**Commands for the 8-GPU machine of the picture** (`QV_POOL_TOKEN` exported as in section 6; replace the pack paths):
+
+```bash
+# Model B: Qwen/Qwen3.8-2.4T-A95B over cards 0-5. No pack of it exists yet: this is the shape of the command.
+# Estimated size: about 1.2 TB at 0.5 byte per parameter (our 27B QVB8R 2e-3 pack); 6 x 288 GB = 1.7 TB leaves room for KV cache.
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 INSTANCE=big PORT=8083 ATTN=flash_attention_2 MAX_MEM=280 \
+  MODEL=./models/<2.4T pack> DRAFT=./models/<its drafter> DRAFT_K=<its K> \
+  scripts/qwen_server.sh start --pipeline auto --prefix-store shared --prefix-shared-name big --prefix-shared-gb 400
+
+# Model A: Qwen3.6-35B-A3B, two replicas (cards 6 and 7), one pool "modelA"
+for i in 6 7; do
+  CUDA_VISIBLE_DEVICES=$i INSTANCE=a$i PORT=$((8074+i)) ATTN=flash_attention_2 MAX_MEM=280 MAX_LIVE=32 \
+  MODEL=./models/Qwen3.6-35B-A3B_qvb8_5e-4_fp16 DRAFT=./models/Qwen3.6-35B-A3B-DFlash2_qvb8_1e-3 DRAFT_K=7 \
+  scripts/qwen_server.sh start --prefill-chunk 12288 --prefix-checkpoint-every 12288 \
+      --prefix-store shared --prefix-shared-name modelA --prefix-shared-gb 100
+done
+
+# the router: one URL; the "model" field of the request picks B or A, the router picks the replica of A
+python -m ai_engine.servers.router --port 8000 \
+  --backend big=http://127.0.0.1:8083 --backend a6=http://127.0.0.1:8080 --backend a7=http://127.0.0.1:8081 \
+  --max-inflight a6=8 --max-inflight a7=8
+```
+
+Rules for a big machine: servers share a pool only with the same pack, τ and KV settings (one pool name per model);
+`MAX_MEM` is the ceiling per server, set it near the card's memory; raise `--max-live` / `--max-live-tokens` with the
+free memory; `--prefill-chunk 12288` prefills a long prompt faster when memory allows.
+
+### 11.1 One big model over three 24 GB cards
+
+![three cards](img/fig9_three_cards.svg)
+
+The pack is cut into blocks of consecutive layers, one block per card; each token passes the cards in order and only a
+hidden-state vector crosses between them. Example: the Ripple-65B QVB8R 2e-3 pack (38 GB, 80 layers) on 3 × 24 GB:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 MODEL=./models/Ripple-65B-Preview-QVB8R-2e-3 DRAFT=./models/Ripple-65B-Preview-DFlash2-QVB8R-5e-3 \
+  scripts/ripple_server.sh start --pipeline auto
+# or choose the first layer of cards 2 and 3 yourself:  --pipeline cuda:0,cuda:1,cuda:2 --pipeline-split 27,54
+```
+
+`--pipeline auto` splits by weight bytes and each card's free memory (minus `--pipeline-reserve-mb`, default 2048 MB), so
+unequal cards are fine. We ran a two-card split (27B on two V100s); the three-card layout is the same code with N = 3 and
+has not been run on real cards.
+
+### 11.2 A data center: many isolated clusters, one super DRAM pool
+
+![data center](img/fig10_data_center.svg)
+
+- A **cluster** is one server that holds one model over several GPUs: each GPU has a block of consecutive layers
+  (`--pipeline`), and a token goes down from GPU to GPU. Nothing is sent between clusters: they are isolated and run in
+  parallel, so more clusters mean more requests at once.
+- The picture has two models: **Model 1, Qwen/Qwen3.8-2.4T-A95B**, two clusters of 6 GPUs; **Model 2, Ripple-65B**, two
+  clusters of 3 cards. Add more clusters of the same pack as needed: start the server, register it in the router with
+  `--backend NAME=URL`, done.
+- Every cluster pushes what does not fit in its GPUs to the **super DRAM pool**: machines with terabytes of RAM and no GPU
+  that run the prefix store (`--prefix-backup`) and the KV host (`--kv-remote`), see section 3. The router lists the pool
+  and pulls a saved prefix to the cluster that needs it, when copying is faster than computing.
+
+What has run and what has not: replicas, the router, the RAM pool (a PC store and KV host), a split over two cards and
+over two machines (Wi-Fi) have run. A split over more than two cards, clusters of 6 GPUs, 288 GB cards and many clusters
+have **only been simulated**. The Model 1 pack does not exist yet, and its size (about 1.2 TB) is an estimate. Real tests
+need hardware (see Support this project in the README).

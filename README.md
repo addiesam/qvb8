@@ -8,6 +8,9 @@ client, with DFlash2 speculative decoding.
 > **New in v1.2.0 — certified KV cache that moves between machines.** The saved KV state is certified data (a proven error
 > bound), defined by its numbers and not by a GPU. A prompt prefilled on a DGX Spark (Blackwell) is restored on a V100
 > (Volta) instead of being computed again, with the same answer: [see how and what we measured](#kv-cache-shared-between-machines-and-between-different-gpus).
+> **A 27B model on one 16 GB GPU:** Qwen3.8-27B (QVB8R 2e-3) with its QVB8R DFlash2 drafter runs on a single V100 16 GB
+> (`./qvb8 get qwen-27b && ./qvb8 start qwen-27b`), or on two 16 GB cards with `--pipeline auto`. On one card the memory is
+> tight: short prompts work; the limit for long prompts and the V100 speed are **TBA** (measurements in progress).
 > New too: `./install.sh` and `./qvb8 start qwen-9b` for a three-step start, and `--pipeline auto` for several cards.
 
 The engine is general CUDA code. **Version 1 provides a build for the NVIDIA DGX Spark (GB10, sm_121, aarch64).**
@@ -66,8 +69,9 @@ git clone https://github.com/addiesam/qvb8.git && cd qvb8
 ./qvb8 stop                  # when you are done
 ```
 
-`./qvb8 list` shows the models you can run (`qwen-9b`, about 16 GB of GPU memory; `qwen-27b`, about 30 GB). Settings
-for a smaller card are chosen automatically from its memory. Attention uses `sdpa`, which works on every card; on an
+`./qvb8 list` shows the models you can run: `qwen-9b` and **`qwen-27b`, which fits one 16 GB card** (a V100: the 27B
+QVB8R pack 2e-3 plus its QVB8R DFlash2 drafter run on 16 GB of GPU memory). Settings for a small card (smaller chunk,
+KV window, one live request) are chosen automatically from its memory. Attention uses `sdpa`, which works on every card; on an
 Ampere or newer card `ATTN=flash_attention_2 ./qvb8 start qwen-9b` is faster but needs flash-attn (see Install below).
 Tested GPUs: DGX Spark (GB10) and V100. Several cards, several machines, Ripple and Nemotron: see the sections below.
 
@@ -101,20 +105,21 @@ Tested GPUs: DGX Spark (GB10) and V100. Several cards, several machines, Ripple 
 The packs are published separately on Hugging Face, from [huggingface.co/addiesam](https://huggingface.co/addiesam).
 Download one target pack and one matching draft pack:
 
-| Pack | Format | tau | Size | Download |
+| Model | Original (bf16, about) | Compressed with QVB8 / QVB8R | Small draft pack | All packs |
 |---|---|---|---|---|
-| Ripple-65B-Preview | qvb8 | 1e-3 | 57 GB | [Ripple-65B-Preview-QVB8-1e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8-1e-3) |
-| Ripple-65B-Preview | qvb8r | 1e-3 | 47 GB | [Ripple-65B-Preview-QVB8R-1e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8R-1e-3) |
-| Ripple-65B-Preview | qvb8 | 2e-3 | 49 GB | [Ripple-65B-Preview-QVB8-2e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8-2e-3) |
-| Ripple-65B-Preview | qvb8r | 2e-3 | 38 GB | [Ripple-65B-Preview-QVB8R-2e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8R-2e-3) |
-| Ripple-65B-Preview | qvb8r | 2.5e-3 | 35.5 GB | [Ripple-65B-Preview-QVB8R-2.5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-QVB8R-2.5e-3) |
-| DFlash2 draft model | qvb8 | 5e-3 | 4.1 GB | [Ripple-65B-Preview-DFlash2-QVB8-5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-DFlash2-QVB8-5e-3) |
-| DFlash2 draft model | qvb8r | 5e-3 | 3.4 GB | [Ripple-65B-Preview-DFlash2-QVB8R-5e-3](https://huggingface.co/addiesam/Ripple-65B-Preview-DFlash2-QVB8R-5e-3) |
-| Qwen3.8-27B | qvb8 | 1e-3 | 21.6 GB | [Qwen3.8-27B_qvb8_1e-3_fp16](https://huggingface.co/addiesam/Qwen3.8-27B_qvb8_1e-3_fp16) |
-| Qwen3.8-27B | qvb8r | 2e-3 | 13.6 GB | [Qwen3.8-27B_qvb8r_2e-3_fp16](https://huggingface.co/addiesam/Qwen3.8-27B_qvb8r_2e-3_fp16) |
-| Qwen3.8-27B DFlash2 draft model | qvb8r | 5e-3 | 1.5 GB | [Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16](https://huggingface.co/addiesam/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16) |
-| Qwen3.5-9B | qvb8 | 1e-3 | 7.6 GB | [Qwen3.5-9B_qvb8_1e-3_fp16](https://huggingface.co/addiesam/Qwen3.5-9B_qvb8_1e-3_fp16) |
-| Qwen3.5-9B DFlash draft model | qvb8 | 1e-3 | 1.4 GB | [Qwen3.5-9B-DFlash_qvb8_1e-3](https://huggingface.co/addiesam/Qwen3.5-9B-DFlash_qvb8_1e-3) |
+| Qwen3.5-9B | 18 GB | **7.6 GB** | 1.4 GB | [collection](https://huggingface.co/collections/addiesam/qwen35-9b) |
+| Qwen3.8-27B | 54 GB | **13.6 – 21.6 GB** | 1.5 GB | [collection](https://huggingface.co/collections/addiesam/qwem38-27b) |
+| Qwen3.6-35B-A3B | 70 GB | **about 30 GB** | 0.6 GB | [collection](https://huggingface.co/collections/addiesam/qwen36-35b-a3b) |
+| Ripple-65B-Preview | 130 GB | **35.5 – 57 GB** | 3.4 – 4.1 GB | [collection](https://huggingface.co/collections/addiesam/ripple-65b-preview-qvb8) |
+
+The compressed size depends on the format and the error bound tau: `qvb8` is faster, `qvb8r` is smaller, a larger tau is
+smaller still. Each pack's size, format and tau are on its Hugging Face page. Rule of thumb: the pack must fit in GPU
+memory with some room for the KV cache; **a 16 GB card runs the 27B** (QVB8R 2e-3, 13.6 GB; long prompts on one card: TBA).
+
+Every pack: [huggingface.co/addiesam](https://huggingface.co/addiesam).
+
+Each target pack is used together with a drafter pack (`./qvb8 get/start` downloads and starts the pair for you): `qwen-27b`
+= Qwen3.8-27B qvb8r 2e-3 + its DFlash2 qvb8r 5e-3 drafter, `qwen-9b` = Qwen3.5-9B qvb8 1e-3 + its DFlash qvb8 1e-3 drafter.
 
 ```bash
 pip install -U huggingface_hub
@@ -142,7 +147,6 @@ On a GB10 (or a V100 with the matching PyTorch) the bundled prebuilt kernels are
 toolkit. On any other GPU the CUDA kernels compile automatically on first use (a few minutes, `nvcc` required) into
 `.ext_cache/` and are reused after that.
 
-
 <div align="center">
 
 # ❤️ SUPPORT THIS WORK ❤️
@@ -155,7 +159,6 @@ toolkit. On any other GPU the CUDA kernels compile automatically on first use (a
 [![Sponsor](https://img.shields.io/badge/SPONSOR-GitHub%20Sponsors-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/addiesam)
 
 </div>
-
 
 ## Run the server
 
@@ -214,6 +217,40 @@ URL=http://host:8080 scripts/chat.sh --no-think  # a server on another machine
 
 In the chat: `/reset` starts a new conversation, `/exit` (or Ctrl-D) leaves, Ctrl-C stops the current answer.
 
+## Use it from VS Code (Cline) and other clients
+
+The server speaks the OpenAI chat API, so any client that lets you set a base URL works. For **Cline** in VS Code:
+Settings → API Provider **OpenAI Compatible**, then
+
+| Cline field | Value |
+|---|---|
+| Base URL | `http://HOST:8080/v1` (a single server) or `http://HOST:8000/v1` (the router) |
+| API Key | any text (the server does not check it) |
+| Model ID | any text with one model up; with a router and several models, a name from `GET /v1/models` |
+| Context window | what you want to use, up to the server's limit (a 16 GB V100: 32768 is a good start) |
+
+We have tested the request format Cline sends (content-part lists, streaming, tool calls); we have not run a long Cline
+session ourselves. The same settings work for Continue, Open WebUI, `curl` and the OpenAI Python client.
+
+### Keep the conversation going, also on another machine
+
+The server keeps no conversation. The client (Cline, your script) sends the **whole history** with every message. What
+the server saves is the *computed state of the beginning of that history* (the prefix), so the next message does not
+compute it again. Therefore you can point the client at another server at any moment and the conversation continues
+with the same answers; only the **speed** depends on whether the new server has the prefix:
+
+| Where the next message goes | What happens |
+|---|---|
+| Same server | the saved prefix is restored: only the new part is computed |
+| Another server on the same machine (another card) | restored from the shared pool (`--prefix-store shared`), instantly |
+| Another machine, through the **router** with a PC store | the router pulls the prefix there when that is faster than computing it (also from a GB10 to a V100) |
+| Another machine, no router / no store | the whole history is computed again: same answer, slower |
+| A server with another pack, τ or KV setting | the prefix is refused (different signature) and computed again |
+
+A prefix matches only if the beginning is **identical**: same system prompt, same chat template, same `think` setting.
+The terminal chat (`scripts/chat.sh`) keeps its history only in that window; to continue elsewhere use a client that
+stores the conversation, such as Cline. Details and commands: [docs/manual.md](docs/manual.md), section 9.
+
 ## Use cases: one card, many cards, many machines
 
 Three independent switches decide where the bytes live. Full manual with every command: [docs/manual.md](docs/manual.md).
@@ -230,9 +267,6 @@ prompt: **269 s → 66 s** (V100 pair).
 
 ### Split: one model over several cards or machines
 
-<img src="docs/img/scene_split.png" alt="one model cut into three consecutive parts on three cards" width="520">
-
-
 ![split](docs/img/fig1_split.svg)
 
 ```bash
@@ -241,9 +275,6 @@ ATTN=sdpa MAX_LIVE=1 scripts/qwen_server.sh start --pipeline cuda:0,cuda:1
 ```
 
 ### Share: one prefix pool per machine
-
-<img src="docs/img/scene_share.png" alt="two cards share one memory block that holds a document once" width="520">
-
 
 ![share](docs/img/fig2_share.svg)
 
@@ -256,9 +287,6 @@ A document prefilled on card 0 is restored on card 1: stored once, not twice.
 
 ### PC DRAM pool: overflow to a machine that only has RAM
 
-<img src="docs/img/scene_pcpool.png" alt="a full GPU box spills memory blocks into a plain PC full of RAM" width="520">
-
-
 ![pc pool](docs/img/fig4_pc_pool.svg)
 
 ```bash
@@ -269,18 +297,47 @@ scripts/qwen_server.sh start --prefix-backup http://pc:8082 --kv-remote http://p
 
 ### Everything together: router, replicas, pools, PC
 
-<img src="docs/img/scene_stack.png" alt="a router in front of three machines that share copies" width="520">
-
-
 ![full stack](docs/img/fig5_full_stack.svg)
 
 One router URL for all clients; the router chooses the replica by queue, prefix hit and link speed.
 Step-by-step start-up of the whole stack: [docs/manual.md](docs/manual.md#6-the-full-stack-step-by-step).
 
+### Several rounds with an agent (Cline, OpenCode): what is computed, what is saved
+
+An agent sends the **whole history again in every round**. The server keeps no conversation; it keeps the computed state
+of the beginning of the history. Round 1 computes everything and saves that state; round 2 finds the same beginning,
+restores it and computes **only the difference**:
+
+![round 1, round 2, round n (sequence)](docs/img/fig7_two_rounds.svg)
+
+If round 2 reaches another machine or card, the router moves the saved state there (when that is faster than computing):
+
+![the same conversation over several machines (sequence)](docs/img/fig8_two_rounds_other_machine.svg)
+
+Step by step, with all cases: [docs/manual.md](docs/manual.md), section 10.
+
+### It is a toy on a desk, and it scales to a real server
+
+A replica, a split, a pool and a router are the same four parts on a 16 GB card and on a rack machine; a big server just
+has more of each. Below: a deployment for an 8-GPU machine with 288 GB per card. One huge model, `Qwen/Qwen3.8-2.4T-A95B`
+(2.4 trillion parameters, estimated pack about 1.2 TB), is split over 6 cards; another model runs as two replicas on the
+other 2 cards; a shared pool and one router sit in front. **We have only simulated this layout; we have never run it on H100 /
+H200 / H300 cards.** The settings extend the ones we did run (GB10, V100, a PC store).
+**To test it for real I need the hardware: GPU time, a card, or money to rent one. If you can donate any of these, please
+see [Support this project](#support-this-project).** Commands in [docs/manual.md](docs/manual.md), section 11.
+
+![big server](docs/img/fig6_big_server.svg)
+
+A data center: many isolated clusters run in parallel (each cluster = one model over several GPUs, layers in order), and every cluster offloads to a super DRAM pool. Again simulated only:
+
+![data center](docs/img/fig10_data_center.svg)
+
+One model too big for one card, over three 24 GB cards (each card holds a block of consecutive layers; `--pipeline auto`):
+(We ran the split over two cards only; three or more cards have been simulated, not run on real cards.)
+
+![three cards](docs/img/fig9_three_cards.svg)
+
 ## KV cache shared between machines and between different GPUs
-
-<img src="docs/img/scene_cross.png" alt="a small sealed crate of KV data travels from a new machine to an old one" width="520">
-
 
 ![cross machine](docs/img/fig3_cross_machine.svg)
 
@@ -394,17 +451,28 @@ The release supports GPU only. These are the supported settings (the defaults ar
 
 `--device cpu` is listed by the CLI help but is not part of this release.
 
-## Performance (DGX Spark, qvb8 1e-3 + 5e-3 drafter, greedy)
+## Speed (measured 2026-11-16, DGX Spark GB10)
 
-| Workload | Speed |
-|---|---|
-| Decode, code | ~15.8 tok/s |
-| Decode, prose | ~4.5 tok/s |
-| Two concurrent requests | ~18.7 tok/s aggregate |
-| Prefill, 75k-token prompt | ~386 tok/s |
+Release code and launcher as shipped (`./qvb8 start`-style settings, `ATTN=sdpa`, KV cache qvb8, speculative decoding),
+greedy (temperature 0), thinking off, 400 generated tokens, streaming; the second of two runs of each prompt. One
+measurement per row on an otherwise idle machine, so read the numbers as a reference, not a promise.
 
-Speculative decoding is verified by the full model. In our tests, greedy output matched plain decoding; where two tokens are an
-exact near-tie, the choice can differ.
+| Pair (target + drafter) | Decode, code | Decode, prose | Two requests at once (total) | **Prefill** (57k-token prompt) |
+|---|---|---|---|---|
+| Qwen3.8-27B **qvb8 1e-3** + DFlash2 qvb8r 5e-3 (K=7), `--prefill-chunk 12288` | **18.7 tok/s** | **14.4 tok/s** | **23.9 tok/s** | **about 980 tok/s** (58 s) |
+| Qwen3.6-35B-A3B qvb8 5e-4 + DFlash2 qvb8 1e-3 (K=7) | **53.6 tok/s** | **37.2 tok/s** | **50.2 tok/s** | **about 1,920 tok/s** (30 s) |
+| Qwen3.8-27B qvb8r 2e-3 + DFlash2 qvb8r 5e-3 (K=7), the 16 GB-card pack | 15.5 tok/s | 12.0 tok/s | 18.9 tok/s | about 760 tok/s (75 s) |
+| Qwen3.5-9B qvb8 1e-3 + DFlash qvb8 1e-3 (K=15) | 62.7 tok/s | 45.1 tok/s | 68.8 tok/s | about 2,700 tok/s (21 s) |
+
+The 27B qvb8 row was also measured with chunk 4096 (about 880 tok/s) and 24576 (about 855 tok/s): 12288 is the fastest on the GB10.
+The qvb8 pack is faster than the qvb8r pack (qvb8r is smaller: 13.6 GB instead of 21.6 GB, which is what lets the 27B fit
+one 16 GB card). Prefill uses the int8 path (`--prefill-linear qvb8`) on a qvb8 pack.
+
+Code is faster than prose because the drafter guesses code better (more drafted tokens are accepted per step).
+Speculative decoding is verified by the full model; in our tests greedy output matched plain decoding, and where two
+tokens are an exact near-tie the choice can differ.
+
+**V100 (16 GB) speed: TBA.** The V100 decode and prefill numbers for this release are being measured and will be added here.
 
 ## Update history
 
@@ -490,6 +558,9 @@ The model weights are not part of this repository and keep their own license.
 
 - **Individuals:** if this project is useful to you, please consider
   [sponsoring Dr. Addie Sam on GitHub](https://github.com/sponsors/addiesam).
+- **Hardware or GPU time:** I have not been able to test on H100 / H200 / H300 servers or on three or more cards. A donated card,
+  access to a GPU server, or money for rented GPU hours directly decides what gets tested next. Open an issue or contact
+  the author through [github.com/addiesam](https://github.com/addiesam).
 - **Companies:** for custom model packs (other models, other GPUs) or support, open a GitHub issue or contact the author through [github.com/addiesam](https://github.com/addiesam).
 
 ## Disclaimer — no warranty, no liability
