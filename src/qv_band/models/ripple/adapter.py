@@ -13,8 +13,8 @@ import os
 
 from qv_band.engine.adapter import ModelAdapter, ServeDefaults, register
 
-DRAFT_DIR = "/mnt/backup/models/ricursiveAI/Ripple-65B-Preview-DFlash2"
-DRAFT_PACK = "/mnt/backup/qvb8/Ripple-65B-Preview-DFlash2_qvb8_5e-3"
+DRAFT_DIR = "./models/Ripple-65B-Preview-DFlash2"
+DRAFT_PACK = "./models/Ripple-65B-Preview-DFlash2_qvb8_5e-3"
 
 
 class RippleAdapter(ModelAdapter):

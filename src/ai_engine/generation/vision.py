@@ -106,6 +106,94 @@ def _patch_conv_cls():
     return PatchConvAsLinear
 
 
+class _OnHost:
+    """A card tensor kept in pinned host RAM by _to_host: the copy and the card it came from."""
+    __slots__ = ("t", "dev")
+
+    def __init__(self, t, dev):
+        self.t, self.dev = t, dev
+
+
+def _to_host(obj, memo):
+    """A copy of `obj` (a cache: lists / dicts / tuples / objects holding tensors) whose card tensors are in pinned host
+    RAM (_OnHost), copied one at a time: no second copy of the cache on the card."""
+    import torch
+    k = id(obj)
+    if k in memo:
+        return memo[k]
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            h = torch.empty(obj.shape, dtype=obj.dtype, pin_memory=True)
+            h.copy_(obj)
+            out = _OnHost(h, obj.device)
+        else:
+            out = obj.clone()
+    elif isinstance(obj, list):
+        out = memo[k] = []
+        out.extend(_to_host(v, memo) for v in obj)
+        return out
+    elif isinstance(obj, tuple):
+        out = tuple(_to_host(v, memo) for v in obj)
+    elif isinstance(obj, dict):
+        out = memo[k] = {}
+        out.update({kk: _to_host(v, memo) for kk, v in obj.items()})
+        return out
+    elif hasattr(obj, "__dict__") and not isinstance(obj, type):
+        out = memo[k] = copy.copy(obj)
+        for kk, v in vars(obj).items():
+            setattr(out, kk, _to_host(v, memo))
+        return out
+    else:
+        out = copy.deepcopy(obj)
+    memo[k] = out
+    return out
+
+
+def _host_bytes(obj, seen) -> int:
+    """Pinned host bytes of the _OnHost tensors reachable from a _to_host copy."""
+    if isinstance(obj, _OnHost):
+        return obj.t.untyped_storage().nbytes()
+    if id(obj) in seen or isinstance(obj, (int, float, str, bytes, bool, type(None))):
+        return 0
+    seen.add(id(obj))
+    if isinstance(obj, dict):
+        return sum(_host_bytes(v, seen) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_host_bytes(v, seen) for v in obj)
+    if hasattr(obj, "__dict__") and not isinstance(obj, type):
+        return sum(_host_bytes(v, seen) for v in vars(obj).values())
+    return 0
+
+
+def _from_host(obj, memo=None):
+    """The inverse of _to_host: a fresh cache with every _OnHost back on its card (the saved copy stays as it is)."""
+    memo = {} if memo is None else memo
+    k = id(obj)
+    if k in memo:
+        return memo[k]
+    if isinstance(obj, _OnHost):
+        out = obj.t.to(obj.dev, non_blocking=True)
+    elif isinstance(obj, list):
+        out = memo[k] = []
+        out.extend(_from_host(v, memo) for v in obj)
+        return out
+    elif isinstance(obj, tuple):
+        out = tuple(_from_host(v, memo) for v in obj)
+    elif isinstance(obj, dict):
+        out = memo[k] = {}
+        out.update({kk: _from_host(v, memo) for kk, v in obj.items()})
+        return out
+    elif hasattr(obj, "__dict__") and not isinstance(obj, type):
+        out = memo[k] = copy.copy(obj)
+        for kk, v in vars(obj).items():
+            setattr(out, kk, _from_host(v, memo))
+        return out
+    else:
+        out = copy.deepcopy(obj)
+    memo[k] = out
+    return out
+
+
 class VisionAdapter:
     def __init__(self, bundle, verbose: bool = True):
         import torch
@@ -126,7 +214,7 @@ class VisionAdapter:
             source = json.load(open(man)).get("hf_model") or pack
         # The manifest's "hf_model" is the checkpoint the pack was built FROM.
         # It may have been moved or deleted since (here the bf16 source under
-        # /mnt/backup/models is gone, only the FP8 one survives), so a missing
+        # ./models is gone, only the FP8 one survives), so a missing
         # source must not kill vision -- look for another dense checkpoint of
         # the same model instead. The pack itself always keeps the dense
         # remainder (biases/norms/embeddings) in model.safetensors.
@@ -192,21 +280,31 @@ class VisionAdapter:
                 dim = mod_.inv_freq.shape[0] * 2
                 theta = getattr(mod_, "theta", 10000.0)
                 mod_.inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.visual = visual.to(dev).eval()
+        # --vision-tower host (LLM_VISION_TOWER=host): the tower lives in pinned host RAM and visits the card only while it
+        # encodes a picture -- a 16 GB card holding the whole 27B has no room left for it beside a long prompt
+        self.tower_host = os.environ.get("LLM_VISION_TOWER", "gpu") == "host" and str(dev) != "cpu"
+        if self.tower_host:
+            self.visual = visual.to("cpu").eval()
+            # one pinned host copy per tensor; _tower_to swaps which copy the module points at
+            self._host_tensors = [(t_, t_.data.pin_memory()) for t_ in list(self.visual.parameters()) + list(self.visual.buffers())]
+            for t_, h_ in self._host_tensors:
+                t_.data = h_
+        else:
+            self.visual = visual.to(dev).eval()
         self.dev = dev
         if verbose:
             n = sum(p.numel() for p in self.visual.parameters()) / 1e6
             print(f"[vision] tower {n:.0f}M dense params + {self.n_packed} qvb8 tensors "
                   f"from {self.weights_from} "
-                  f"({time.time() - t0:.1f}s)", flush=True)
+                  f"({time.time() - t0:.1f}s)"
+                  + ("; kept in pinned host RAM, on the card only while encoding" if self.tower_host else ""), flush=True)
 
     n_packed = 0
 
     # Where a dense vision source may live when the manifest's "hf_model" is
     # gone. Same spirit as qv_band's DRAFT_ROOTS: the boot disk gets pruned
     # and the checkpoint moves to the backup volume.
-    SOURCE_ROOTS = ("/mnt/backup/models", "/mnt/backup/models_raw",
-                    "/mnt/data/models_raw", "/mnt/data/models")
+    SOURCE_ROOTS = ("./models",)
 
     def _resolve_source(self, source: str, pack: str) -> str:
         """A checkpoint we can actually read the DENSE vision weights from.
@@ -400,6 +498,8 @@ class VisionAdapter:
         self._prefixes.insert(0, best)
         print(f"[prefix] vision: restored {best['n']} of {len(key)} prompt tokens, "
               f"prefilling {len(key) - best['n']}", file=sys.__stdout__, flush=True)
+        if best.get("host"):
+            return _from_host(best["past"]), best["n"], len(best["hashes"])
         return copy.deepcopy(best["past"]), best["n"], len(best["hashes"])
 
     def _prefix_save(self, key, hashes, runs, n, past) -> None:
@@ -412,12 +512,14 @@ class VisionAdapter:
         self._prefixes = [e for e in self._prefixes
                           if not (e["n"] <= n and tokens[:e["n"]] == e["tokens"]
                                   and hashes[:len(e["hashes"])] == e["hashes"])]
-        snap = copy.deepcopy(past)
-        size = _bytes_of(snap, set())
+        host = os.environ.get("QV_PREFIX_STORE", "gpu") == "host"
+        # --prefix-store host: copied straight from the live cache into pinned host RAM, never a second copy on the card
+        snap = _to_host(past, {}) if host else copy.deepcopy(past)
+        size = _host_bytes(snap, set()) if host else _bytes_of(snap, set())   # the same budget for host RAM
         if size > self._PREFIX_BYTES:
             return                                   # one snapshot alone would exceed the budget
         self._prefixes.insert(0, {"tokens": tokens, "hashes": hashes[:n_cov], "n": n,
-                                  "past": snap, "bytes": size})
+                                  "past": snap, "bytes": size, "host": host})
         del self._prefixes[self._PREFIX_KEEP:]
         while sum(e["bytes"] for e in self._prefixes) > self._PREFIX_BYTES:
             self._prefixes.pop()                     # drop the least recently used
@@ -481,7 +583,16 @@ class VisionAdapter:
             if n_cov < len(hashes):
                 p_cov = sum(patches[:n_cov])
                 pv = pv_cpu[p_cov:].to(self.dev, torch.bfloat16)
-                feats = self.visual(pv, grid_thw=grid[n_cov:], return_dict=True).pooler_output
+                if self.tower_host:
+                    for t_, h_ in self._host_tensors:
+                        t_.data = h_.to(self.dev, non_blocking=True)
+                try:
+                    feats = self.visual(pv, grid_thw=grid[n_cov:], return_dict=True).pooler_output
+                finally:
+                    if self.tower_host:
+                        for t_, h_ in self._host_tensors:
+                            t_.data = h_                # the card copies are freed with this
+                        torch.cuda.empty_cache()
                 mask = (ids[:, start:] == img_id).unsqueeze(-1).expand_as(emb)
                 emb = emb.masked_scatter(mask, feats.to(emb.dtype))
             pos, delta = self._rope_index(ids, mm, grid)

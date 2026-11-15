@@ -6,13 +6,18 @@ One persistent TCP connection per neighbour. A message is a small JSON header pl
 
     header = {"op": str, "f": {small JSON fields}, "t": [[name, dtype, shape], ...]}
 
-Nothing is pickled: a peer can only make this side build tensors of the dtypes listed in _DTYPES.
+Nothing is pickled: a peer can only make this side build tensors of the dtypes listed in _DTYPES, of at most
+_MAX_TENSOR bytes each.
 Failure rule: any error on the connection raises StageLost. The caller stops the requests in flight; there is no
 reconnect and no retry here.
+Dead peers: TCP keep-alive (probes after 30 s of silence, every 10 s, 3 unanswered = lost) and a 60 s limit on unsent
+data, so a neighbour that lost power or its cable ends in StageLost within about a minute instead of a step that never
+returns. A neighbour that is only slow (a long prefill chunk) answers the probes and is waited for.
+Who may connect is checked by the stage (decode/remote_stage.py: the "hello" message carries QV_POOL_TOKEN).
 
 Link test (gate N0):
-    python -m qv_band.run.stage_link serve --port 50818            # on the other machine
-    python -m qv_band.run.stage_link test  HOST:50818              # here
+    python -m qv_band.run.stage_link serve --port 8081            # on the other machine
+    python -m qv_band.run.stage_link test  HOST:8081              # here
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import torch
 MAGIC = b"QVSL"
 _HEAD = struct.Struct("<4sI")
 _MAX_HEADER = 1 << 20
+_MAX_TENSOR = 16 << 30          # bytes of one received tensor (a 12288-token chunk of hidden states is 126 MB)
 _DTYPES = {str(d).split(".")[1]: d for d in (
     torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64,
     torch.bool)}
@@ -48,6 +54,10 @@ class Link:
 
     def __init__(self, sock: socket.socket, peer: str):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3), ("TCP_USER_TIMEOUT", 60000)):
+            if hasattr(socket, opt):                 # Linux; elsewhere the system's keep-alive defaults apply
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
         self.sock, self.peer = sock, peer
         self.sent = self.received = 0          # bytes, for the link report
 
@@ -105,22 +115,29 @@ class Link:
         magic, n = _HEAD.unpack(bytes(self._read(_HEAD.size)))
         if magic != MAGIC or n > _MAX_HEADER:
             raise StageLost(f"stage {self.peer}: not a stage message")
-        head = json.loads(bytes(self._read(n)))
+        try:
+            head = json.loads(bytes(self._read(n)))
+            metas = [(str(name), str(dt), [int(s) for s in shape]) for name, dt, shape in head["t"]]
+            op, fields = str(head["op"]), head["f"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise StageLost(f"stage {self.peer}: not a stage message ({type(e).__name__})") from e
         tensors = {}
-        for name, dt, shape in head["t"]:
+        for name, dt, shape in metas:
             if dt not in _DTYPES:
                 raise StageLost(f"stage {self.peer}: unknown tensor dtype {dt!r}")
             dtype = _DTYPES[dt]
             count = 1
             for s in shape:
-                count *= int(s)
+                count *= s
+            if any(s < 0 for s in shape) or count * torch.empty((), dtype=dtype).element_size() > _MAX_TENSOR:
+                raise StageLost(f"stage {self.peer}: tensor {name!r} of shape {shape} is not acceptable")
             if count == 0:
                 t = torch.empty(shape, dtype=dtype)
             else:
                 raw = self._read(count * torch.empty((), dtype=dtype).element_size())
                 t = torch.frombuffer(raw, dtype=torch.uint8).view(dtype).reshape(shape)
             tensors[name] = t.to(device, non_blocking=True) if device is not None else t
-        return head["op"], head["f"], tensors
+        return op, fields, tensors
 
     def call(self, op: str, fields: dict | None = None, tensors: dict | None = None, device=None):
         """Send one message and wait for its reply. A reply with op "error" raises StageLost with the peer's text."""

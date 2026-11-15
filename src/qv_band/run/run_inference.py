@@ -14,8 +14,8 @@ src_tau_comp/run_hf_adapter.py:
   4. generate, reporting weights-resident and transient-peak VRAM + tok/s
 
   PYTHONPATH=. python -m qv_band.run.run_inference \
-      --model /mnt/backup/models/Qwen3.5-0.8B \
-      --pack-dir /mnt/data/models/Qwen3.5-9B_qvb8_fp16_1e-3 \
+      --model ./models/Qwen3.5-0.8B \
+      --pack-dir ./models/Qwen3.5-9B_qvb8_fp16_1e-3 \
       --prompt "Explain entropy in one sentence." --max-new-tokens 128
 """
 from __future__ import annotations
@@ -373,6 +373,19 @@ def _install_pipeline_hooks(model, place, pl=None) -> int:
         ndev = torch.device(place("model.norm.weight"))
         norm.register_forward_pre_hook(
             lambda mod, args: tuple(_move(a, ndev) for a in args))
+    # The non-layer modules (embedding, final norm, lm_head) live on the main card, but their forwards run on the
+    # CALLER's thread, whose current device is thread-local and cuda:0 in every new thread: on a pipeline whose main
+    # card is not cuda:0 their Triton / qvb8 kernels launched on the wrong card (github issue #1, 3 cards: "Pointer
+    # argument cannot be accessed from Triton"). Layers pin their own card above; the outer forwards pin the main card.
+    if pl is not None:
+        main = torch.device(pl.main)
+        for owner in (model.model, model):
+            outer = owner.forward
+
+            def pinned(*a, _outer=outer, _main=main, **k):
+                with torch.cuda.device(_main):
+                    return _outer(*a, **k)
+            owner.forward = pinned
     return n
 
 

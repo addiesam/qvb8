@@ -243,10 +243,10 @@ KV_CACHE_PRESETS: dict[str, str] = {
     "int8":                "int8",
     "qvb8":                "qvb8-resident",
 }
-KV_CACHE_CHOICES = tuple(KV_CACHE_PRESETS)
+KV_CACHE_CHOICES = tuple(k for k in KV_CACHE_PRESETS if k != "int8")   # the int8 KV baseline is not in the release
 
 
-DRAFTER_CHOICES = ("dflash", "n-gram", "mtp", "dspark", "n-gram_with_mtp", "n-gram_with_dflash")
+DRAFTER_CHOICES = ("dflash", "n-gram", "n-gram_with_dflash")
 
 # Which weights the DFlash drafter runs -- see DEFAULTS.DRAFT_PACK.
 #   dense = the plain HF checkpoint (fastest on the 27B/9B; the default)
@@ -719,10 +719,8 @@ def add_generation_args(ap, *, include_device_mem: bool = True) -> None:
         help="compute dtype of the model (default: the model's own, from its config). fp16 for a GPU without bf16 "
              "(V100); an fp16+bf16 pack then needs its escape_tables.json. Never chosen automatically.")
     ap.add_argument(
-        "--prefill-linear", dest="prefill_linear", choices=("qvb8", "int8"), default="qvb8",
-        help="prefill linears (calls of >= 256 tokens): qvb8 = certified (default); int8 = opt-in int8 tensor cores on the "
-             "pack's own qvb8 ids (weights exact) with per-token int8 activations and 2%% escape channels; decode is unchanged. "
-             "Needs a one-off calibration: python -m ai_engine.generation.int8_prefill calibrate <pack>.")
+        "--prefill-linear", dest="prefill_linear", choices=("qvb8",), default="qvb8",
+        help="prefill linears: qvb8, the pack's own certified kernels (the only choice in this release)")
     ap.add_argument(
         "--draft", dest="draft_k", type=int, default=None,
         metavar="N",
@@ -739,7 +737,7 @@ def add_generation_args(ap, *, include_device_mem: bool = True) -> None:
         help="speculative drafter, mutually exclusive (default: %(default)s, "
              "or QV_USE_DSPARK=1 / QV_USE_MTP=1). dflash: the model's own "
              "trained DFlash/DFlash 2 block drafter (--draft-model DIR is "
-             "REQUIRED; a model with none falls back to n-gram). "
+             "REQUIRED; without it the launch stops with an error). "
              "n-gram: prompt-lookup, "
              "near-zero cost. mtp: the checkpoint's MTP head, one pass per "
              "drafted token. dspark: MTP head as a two-pass whole-block draft "
@@ -751,7 +749,7 @@ def add_generation_args(ap, *, include_device_mem: bool = True) -> None:
         help="DFlash draft model dir for --drafter dflash (REQUIRED -- there "
              "is no auto-discovery any more; a wrong path fails at startup "
              "instead of silently degrading to n-gram). Example: "
-             "/mnt/backup/models/incoai/Qwen3.8-27B-DFlash2")
+             "./models/Qwen3.8-27B-DFlash2")
     ap.add_argument(
         "--draft-pack", dest="draft_pack", default=DEFAULTS.DRAFT_PACK,
         choices=list(DRAFT_PACK_CHOICES), metavar="MODE",
@@ -797,7 +795,7 @@ def params_from_args(args) -> GenParams:
         kwargs[field] = none_maps_to if val is None else val
     # GenParams requires an explicit DFlash checkpoint (no silent guessing inside the engine). A command-line entry point that was
     # NOT given --draft-model resolves it HERE, once, loudly: the model's own "<name>-DFlash2" / "-DFlash" next to the checkpoints
-    # (the same rule llm_server.sh uses); a model without a drafter switches to n-gram with a printed warning. Without this
+    # (the same rule llm_server.sh uses); a model without a drafter stops with an error. Without this
     # a launch without --draft-model died with a ValueError for every model.
     if kwargs.get("drafter") in ("dflash", "n-gram_with_dflash") and kwargs.get("draft_model") in (None, "", "auto"):
         model = getattr(args, "model", None)
@@ -812,9 +810,8 @@ def params_from_args(args) -> GenParams:
             kwargs["draft_model"] = found
             print(f"[gen_core] DFlash drafter: {found}", flush=True)
         else:
-            kwargs["drafter"] = "n-gram"
-            print(f"[gen_core] WARNING: no DFlash drafter found for {model}; using n-gram "
-                  f"(~40% slower; pass --draft-model DIR to use one)", flush=True)
+            raise SystemExit(f"[gen_core] ERROR: no DFlash drafter found for {model}: pass --draft-model DIR "
+                             f"(or --drafter n-gram to run without one)")
     return GenParams(**kwargs)
 
 
@@ -932,6 +929,12 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
         from qv_band.run.run_inference_cpu import load_qv_model_cpu
         model, tok = load_qv_model_cpu(model_dir, pack, verbose=verbose)
     load_seconds = time.time() - t0
+    if use_cuda:
+        # the device WITH its index (the pipeline's main card): "cuda" alone is each thread's own current device
+        from qv_band.run.placement import home_device
+        home = home_device(model)
+        if home is not None:
+            gpu_dev = str(home)
 
     params.resolve_ctx_size(model)
 
@@ -946,15 +949,11 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
 
 
 class DrafterBuildError(RuntimeError):
-    """A heavy drafter (mtp/dspark/n-gram_with_mtp) failed to build. Raised
-    unless build_drafter(fallback_to_ngram=True), in which case the caller
-    gets a plain n-gram drafter and this is logged instead of raised."""
+    """A drafter failed to build. Always raised: there is no fallback to another drafter."""
 
 
 def build_drafter(kind: str, bundle: ModelBundle, *,
                   max_ctx: int = DEFAULTS.DRAFT_CTX,
-                  fallback_to_ngram: bool = False,
-                  on_fallback: Callable[[str, BaseException], None] | None = None,
                   params: "GenParams | None" = None):
     """Build the drafter object for `kind` ("dflash" | "n-gram" | "mtp" |
     "dspark" | "n-gram_with_mtp"), or None when kind is falsy or draft is
@@ -966,15 +965,7 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
     The CUDA vs CPU builder split is handled here so no interface repeats
     it.
 
-    `fallback_to_ngram`: when a heavy drafter fails to build, return a
-    plain n-gram drafter instead of raising -- so a missing MTP head
-    degrades a running server (llm_server.py) rather than killing it. False fails
-    loudly at startup. The failure is never
-    swallowed silently: `on_fallback(kind, exc)` is invoked when set (for
-    the caller to log), otherwise the exception message is printed.
-
-    An n-gram build failure is always raised -- there is nothing to fall
-    back to, and it means the environment itself is broken.
+    A drafter that cannot be built raises DrafterBuildError: not found is not found, nothing is replaced by n-gram.
     """
     if not kind:
         return None
@@ -996,7 +987,6 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
         from qv_band.decode.dflash_draft import (build_dflash_drafter,
                                                  find_dflash_pack_for)
         draft_dir = getattr(params, "draft_model", DEFAULTS.DRAFT_MODEL)
-        fallback = "n-gram"
         # The drafter checkpoint is EXPLICIT: no auto-discovery, no guessing.
         # A wrong path must fail loudly at startup rather than silently
         # degrade to n-gram (which costs ~40% throughput and looks like
@@ -1024,13 +1014,8 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
             raise DrafterBuildError(
                 f"--draft-model {draft_dir!r} is not a directory{hint}")
         # CUDA only (CPU/XPU have never run DFlash).
-        unsupported = None if use_cuda else "needs a CUDA launch"
-        if unsupported:
-            print(f"[gen_core] DFlash drafter {draft_dir} {unsupported}; "
-                  f"using {fallback}", flush=True)
-            return build_drafter(fallback, bundle, max_ctx=max_ctx,
-                                 fallback_to_ngram=fallback_to_ngram,
-                                 on_fallback=on_fallback, params=params)
+        if not use_cuda:
+            raise DrafterBuildError(f"DFlash drafter {draft_dir!r} needs a CUDA launch")
         # A qvb8 pack of the drafter cuts its weights to ~52-62%, but the
         # drafter only ever proposes a BLOCK of 8-16 tokens, so it runs its
         # GEMMs at M=8..16 where the packed path's overhead dominates its
@@ -1059,17 +1044,8 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
                 print(f"n-gram_with_dflash: n-gram window {max_ctx} + DFlash tail", flush=True)
             return d
         except Exception as exc:
-            if not fallback_to_ngram:
-                raise DrafterBuildError(
-                    f"dflash drafter failed to build: {exc!r}") from exc
-            if on_fallback is not None:
-                on_fallback(kind, exc)
-            else:
-                print(f"[gen_core] dflash drafter unavailable ({exc!r}); "
-                      f"using {fallback}", flush=True)
-            return build_drafter(fallback, bundle, max_ctx=max_ctx,
-                                 fallback_to_ngram=True,
-                                 on_fallback=on_fallback, params=params)
+            raise DrafterBuildError(
+                f"dflash drafter failed to build: {exc!r}") from exc
 
     try:
         if kind == "n-gram_with_mtp":
@@ -1093,19 +1069,12 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
             return build_drafter_cuda(model, pack, model_dir, device=gpu_dev)
         # NOTE: alias the import -- importing it under the name
         # "build_drafter" would shadow THIS function inside its own body and
-        # make the recursive n-gram fallback below raise UnboundLocalError.
+        # make a recursive call below raise UnboundLocalError.
         from qv_band.decode.spec_decode import build_drafter as build_mtp_drafter
         return build_mtp_drafter(model, pack, model_dir)
     except Exception as exc:
-        if not fallback_to_ngram:
-            raise DrafterBuildError(
-                f"{kind} drafter failed to build: {exc!r}") from exc
-        if on_fallback is not None:
-            on_fallback(kind, exc)
-        else:
-            print(f"[gen_core] {kind} drafter unavailable ({exc!r}); "
-                  f"falling back to n-gram", flush=True)
-        return _ngram()
+        raise DrafterBuildError(
+            f"{kind} drafter failed to build: {exc!r}") from exc
 
 
 # ---------------------------------------------------------------------------

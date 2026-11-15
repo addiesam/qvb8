@@ -28,8 +28,8 @@ Set "stream": true on any generate route for Server-Sent Events, which matters
 at this speed -- a 200-token answer takes minutes, and you want the tokens as
 they arrive rather than after.
 
-  python -m ai_engine.servers.llm_server /mnt/backup/models/Qwen3.5-9B_qvb8_fp16_1e-3 --port 8080
-  python -m ai_engine.servers.llm_server /mnt/data/qvb8/Qwen3.8-27B_qvb8_1e-3_fp16 --host 0.0.0.0
+  python -m ai_engine.servers.llm_server ./models/Qwen3.5-9B_qvb8_fp16_1e-3 --port 8080
+  python -m ai_engine.servers.llm_server ./models/Qwen3.8-27B_qvb8_1e-3_fp16 --host 0.0.0.0
 
 First argument is a self-contained pack folder (config, tokenizer and
 weights all live there) -- just a model path, nothing else needed to pick
@@ -281,6 +281,43 @@ def _batch_paused():
     return sch.exclusive() if sch is not None else contextlib.nullcontext()
 
 
+class Overloaded(Exception):
+    """The server cannot take this request now (waiting queue full, or it waited longer than --queue-wait): HTTP 429 /
+    503 with Retry-After. Never a fault of the request itself, so a router tries another replica."""
+
+    def __init__(self, msg: str, code: int = 429, retry_after: int = 5):
+        super().__init__(msg)
+        self.code, self.retry_after = code, retry_after
+
+
+@dataclass
+class Limits:
+    """Admission control of the batch scheduler (2026-11-14). 0 = no limit.
+
+    WHY. The scheduler used to admit every queued request into the live batch at once; under a burst the only brake was
+    the VRAM ceiling check inside a step, which fails the WHOLE batch. Now a request enters the batch only when it fits:
+
+      max_live         requests decoding / prefilling together (slots). One request's speed falls as slots are added
+                       (each verify step covers every live slot), and a one-card V100 cannot prefill two long prompts.
+      max_live_tokens  sum over the live requests of prompt tokens + max output tokens: what their KV cache can grow
+                       to. This is the memory bound (KV bytes are proportional to tokens), stated in the unit a
+                       request is known by BEFORE it runs.
+      max_queue        requests waiting for admission; one more is refused at once with 429 + Retry-After (a client
+                       or router can go elsewhere instead of holding a socket open on a server that is hours behind).
+      queue_wait_s     a request that waited this long without being admitted gets 503 + Retry-After.
+
+    Order is strict first-in first-out: the head of the queue is admitted when it fits, nothing overtakes it (a short
+    request never starves a long one). An EMPTY batch always admits the head, whatever its size, so a request larger
+    than max_live_tokens still runs -- alone."""
+    max_live: int = 0
+    max_live_tokens: int = 0
+    max_queue: int = 0
+    queue_wait_s: float = 0.0
+
+    def any(self) -> bool:
+        return bool(self.max_live or self.max_live_tokens or self.max_queue or self.queue_wait_s)
+
+
 @dataclass
 class _PendingRequest:
     """One HTTP request waiting for admission into the live batch.
@@ -296,6 +333,8 @@ class _PendingRequest:
     # Wall-clock time this request entered the live batch, set on
     # admission -- used only to report its own tok/s when it finishes.
     t_admitted: float = 0.0
+    t_submitted: float = 0.0        # entered the waiting queue (Limits.queue_wait_s counts from here)
+    cost: int = 0                   # prompt tokens + max_new: what this request can add to the live KV
 
 
 class _StreamDone:
@@ -311,10 +350,17 @@ class BatchScheduler:
     """One instance per server process. start() launches the background
     step-loop thread; submit() is what the HTTP handlers below call."""
 
+    dead: str | None = None      # the reason, once the step-loop thread has ended for good (see _die)
+    limits = Limits()            # admission control (see Limits); an instance gets its own in __init__
+    refused = expired = 0
+    _excl_waiting = 0            # callers waiting for the model outside the batch (image requests)
+
     def __init__(self, model, tok, drafter_factory, k: int,
                  kv_tau: float, kv_residual: int,
                  idle_poll_s: float = 0.01,
-                 prefill_chunk: int | None = None):
+                 prefill_chunk: int | None = None, limits: "Limits | None" = None):
+        self.limits = limits or Limits()
+        self.refused = self.expired = 0          # counters for /health
         self.model = model
         self.tok = tok
         self.drafter_factory = drafter_factory
@@ -358,6 +404,9 @@ class BatchScheduler:
         self._cancel_ids: set[int] = set()
         self._queued_ids: set[int] = set()        # submitted, not yet admitted (guarded by _cancel_lock)
         self._cancel_lock = threading.Lock()
+        # Set (to the reason) when the step-loop thread ended for good: every waiting request has been failed, new
+        # ones fail at once, and the state endpoint answers 503 so a router stops sending here.
+        self.dead: str | None = None
 
     @contextlib.contextmanager
     def exclusive(self):
@@ -453,6 +502,55 @@ class BatchScheduler:
         if t is not None and t.is_alive():
             t.join(timeout)
 
+    def pool_state(self) -> dict:
+        """Load and restorable prefixes, for the router (servers/router.py). Read from the HTTP thread while the
+        engine runs: a best-effort snapshot (list copies), never a lock on the scheduler."""
+        from ai_engine.servers.pool_keys import prefix_key
+        with self._q.mutex:                      # a plain list(deque) can meet a put/get from another thread
+            queued = list(self._q.queue)
+        load = {"queued": len(queued), "queued_prompt_tokens": sum(int(r.ids.shape[-1]) for r in queued),
+                "queued_decode_tokens": sum(int(r.max_new) for r in queued), "running": 0,
+                "running_prefill_tokens": 0, "running_decode_tokens": 0}
+        prefixes, held = [], []
+        eng = self._engine
+        if eng is not None:
+            pending = dict(eng._pending_prompts)
+            for sl in list(eng.slots):
+                if sl is None or sl.done:
+                    continue
+                load["running"] += 1
+                p = pending.get(sl.bi)
+                load["running_prefill_tokens"] += int(p.shape[-1]) if p is not None else 0
+                load["running_decode_tokens"] += max(0, int(sl.max_new) - len(sl.out_ids))
+            sh = getattr(eng, "_shared", None)
+            if sh is not None:                      # the machine's pool: every entry by its last whole block
+                from ai_engine.servers.pool_xfer import keyed_entries
+                ke = keyed_entries(sh)
+                prefixes.extend(sorted({(L, h) for _, L, h, _ in ke}))
+                if not os.environ.get("QV_PREFIX_LOCAL_ONLY"):       # a split model's entries are not mirrored
+                    held.extend(sorted({(h, n) for _, _, h, n in ke}))
+            else:
+                cache = self.__dict__.setdefault("_pool_key_cache", {})
+                live = set()
+                for e in list(eng._prefix_store):
+                    t = e["tokens"]
+                    live.add(id(t))
+                    if id(t) not in cache:
+                        cache[id(t)] = (t, prefix_key(list(t)))  # the list is kept with its key: its id stays unique
+                    k = cache[id(t)][1]
+                    if k is not None:
+                        prefixes.append(k)
+                for i in [i for i in cache if i not in live]:
+                    del cache[i]
+        lim = self.limits
+        load["live_tokens"] = self.live_tokens()
+        # what a router needs to stop sending before it is refused: "accepting" False = the waiting queue is full
+        return {"load": load, "prefixes": prefixes, "held": held,
+                "limits": {"max_live": lim.max_live, "max_live_tokens": lim.max_live_tokens,
+                           "max_queue": lim.max_queue, "queue_wait_s": lim.queue_wait_s},
+                "accepting": not (lim.max_queue and load["queued"] >= lim.max_queue),
+                "refused": self.refused, "expired": self.expired}
+
     def submit(self, ids, max_new: int, temperature: float, top_k: int,
                top_p: float, req_id: int) -> "queue.Queue":
         """Push a request; returns the Queue the caller must block-read
@@ -463,10 +561,73 @@ class BatchScheduler:
         generation finishing first."""
         req = _PendingRequest(ids=ids, max_new=max_new, temperature=temperature,
                               top_k=top_k, top_p=top_p, req_id=req_id)
+        req.t_submitted = time.time()
+        req.cost = int(ids.shape[-1]) + int(max_new)
+        self.check_queue()                       # Overloaded when the waiting queue is full
+        if self.dead is not None:                # nobody would ever read the queue
+            req.out_q.put(RuntimeError(f"the server's scheduler stopped ({self.dead}): restart the server"))
+            return req.out_q
         with self._cancel_lock:
             self._queued_ids.add(req_id)
         self._q.put(req)
+        if self.dead is not None:                # it died between the check and the put: _die may have missed this one
+            self._fail_queued(RuntimeError(f"the server's scheduler stopped ({self.dead}): restart the server"))
         return req.out_q
+
+    def check_queue(self) -> None:
+        """Raise Overloaded when one more request may not wait here (Limits.max_queue). Called by submit, and by the
+        HTTP handler BEFORE it sends any header, so a refusal is a clean 429."""
+        lim = self.limits
+        # image requests wait for the model outside the batch queue (exclusive()): they count as waiting too
+        waiting = self._q.qsize() + self._excl_waiting
+        if lim.max_queue and waiting >= lim.max_queue:
+            self.refused += 1
+            raise Overloaded(f"{waiting} requests are already waiting on this server (--max-queue "
+                             f"{lim.max_queue}): try again shortly", 429, self.retry_after())
+
+    def retry_after(self) -> int:
+        """Seconds a refused client should wait: the time the work in front of it takes at the speed of the last
+        finished request, between 1 and 120."""
+        tps = getattr(self, "_last_tps", 0.0) or 10.0
+        with self._q.mutex:
+            ahead = sum(r.max_new for r in self._q.queue)
+        ahead += sum(max(0, r.max_new) for r in list(self._pending.values()))
+        return int(min(120, max(1, ahead / tps / max(1, self.limits.max_live or len(self._pending) or 1))))
+
+    def live_tokens(self) -> int:
+        return sum(r.cost for r in list(self._pending.values()))
+
+    def _fits(self, req: "_PendingRequest") -> bool:
+        """May `req` enter the live batch now? (Limits.) An empty batch always admits."""
+        lim, n = self.limits, len(self._pending)
+        if n == 0:
+            return True
+        if lim.max_live and n >= lim.max_live:
+            return False
+        return not (lim.max_live_tokens and self.live_tokens() + req.cost > lim.max_live_tokens)
+
+    def _fail_queued(self, err: Exception) -> None:
+        while True:
+            try:
+                req = self._q.get_nowait()
+            except queue.Empty:
+                return
+            with self._cancel_lock:
+                self._queued_ids.discard(req.req_id)
+            req.out_q.put(err)
+
+    def _die(self, e: BaseException) -> None:
+        """The step loop cannot go on (it raised outside a step, or the engine could not be rebuilt after a failed
+        step). Before 2026-11-14 the thread just ended: every client kept waiting on its queue and the server looked
+        healthy. Now every admitted and queued request gets the error, and the server reports itself unusable."""
+        self.dead = f"{type(e).__name__}: {e}"
+        print(f"[scheduler] FATAL: the step loop ended: {self.dead} -- every request fails until the server is "
+              f"restarted", file=sys.__stdout__, flush=True)
+        err = RuntimeError(f"the server's scheduler stopped ({self.dead}): restart the server")
+        for req in list(self._pending.values()):
+            req.out_q.put(err)
+        self._pending.clear()
+        self._fail_queued(err)
 
     def _drain_new_requests(self) -> None:
         """Admit every currently-queued request into the engine's live
@@ -477,8 +638,26 @@ class BatchScheduler:
         the loop below (worst case one in-flight step's latency, not one
         whole generation)."""
         while True:
+            # Strict FIFO with admission control: look at the head; a cancelled or expired head leaves the queue, a
+            # head that does not fit the live batch STAYS (and nothing behind it is admitted before it).
+            with self._q.mutex:
+                head = self._q.queue[0] if self._q.queue else None
+            if head is None:
+                return
+            with self._cancel_lock:
+                cancelled = head.req_id in self._cancel_ids
+            waited = time.time() - head.t_submitted
+            expired = bool(self.limits.queue_wait_s and waited > self.limits.queue_wait_s and self._pending)
+            if not cancelled and not expired and not self._fits(head):
+                if not getattr(head, "_held_logged", False):
+                    head._held_logged = True
+                    print(f"[scheduler] req #{head.req_id} waits for room: {len(self._pending)} live "
+                          f"(max {self.limits.max_live or 'none'}), {self.live_tokens()} live tokens + {head.cost} "
+                          f"(max {self.limits.max_live_tokens or 'none'}); {self._q.qsize()} waiting",
+                          file=sys.__stdout__, flush=True)
+                return
             try:
-                req = self._q.get_nowait()
+                req = self._q.get_nowait()       # this thread is the only consumer: it is the head just looked at
             except queue.Empty:
                 return
             with self._cancel_lock:
@@ -488,6 +667,13 @@ class BatchScheduler:
                     print(f"[scheduler] req #{req.req_id} cancelled before admission",
                           file=sys.__stdout__, flush=True)
                     continue
+            if expired:
+                self.expired += 1
+                print(f"[scheduler] req #{req.req_id} waited {waited:.0f}s for a slot (--queue-wait "
+                      f"{self.limits.queue_wait_s:g}): refused", file=sys.__stdout__, flush=True)
+                req.out_q.put(Overloaded(f"waited {waited:.0f}s for a free slot on this server: try again", 503,
+                                         self.retry_after()))
+                continue
             thread_name = threading.current_thread().name
             print(f"[scheduler] admitting req #{req.req_id} on thread="
                   f"{thread_name}, prompt {req.ids.shape[-1]} tok, "
@@ -524,9 +710,17 @@ class BatchScheduler:
                   file=sys.__stdout__, flush=True)
 
     def _run(self) -> None:
+        try:
+            self._run_loop()
+        except BaseException as e:               # noqa: BLE001 - the thread is ending either way: say so
+            traceback.print_exc(file=sys.__stdout__)
+            self._die(e)
+
+    def _run_loop(self) -> None:
         from qv_band.decode.spec_decode import ContinuousBatchEngine
         print("[scheduler] continuous-batching engine thread started",
               file=sys.__stdout__, flush=True)
+        _enter_home(self.model)              # this thread's kernels launch on the model's card, not on cuda:0
         self._engine = ContinuousBatchEngine(
             self.model, self.tok, drafter_factory=self.drafter_factory,
             k=self.k, kv_tau=self.kv_tau, int8_residual_length=self.kv_residual,
@@ -543,9 +737,13 @@ class BatchScheduler:
                 # Nothing live: block on the queue instead of busy-polling
                 # an idle engine. As soon as one request arrives it is
                 # admitted and stepping starts immediately.
-                try:
-                    first = self._q.get(timeout=0.5)
-                except queue.Empty:
+                # (wait WITHOUT taking the request out: taking it and putting it back moved it behind requests that
+                # arrived meanwhile, which broke the first-in first-out order admission control relies on)
+                with self._q.not_empty:
+                    if not self._q.queue:
+                        self._q.not_empty.wait(0.5)
+                    first = bool(self._q.queue)
+                if not first:
                     # Idle long enough: hand the allocator's cached-but-unused
                     # blocks back to the driver once (weights stay resident).
                     if (not trimmed and
@@ -567,8 +765,7 @@ class BatchScheduler:
                             print(f"[scheduler] idle trim failed: {e!r}",
                                   file=sys.__stdout__, flush=True)
                     continue
-                trimmed = False
-                self._q.put(first)   # let _drain_new_requests below consume it uniformly
+                trimmed = False              # _drain_new_requests below admits it
 
             while self._excl_waiting and not self._stop.is_set():
                 time.sleep(0.002)
@@ -592,6 +789,15 @@ class BatchScheduler:
             if step_err is not None:
                 e = step_err
                 print(f"[scheduler] step failed: {e!r}", file=sys.__stdout__, flush=True)
+                # The traceback pins every frame of the failed forward, and with them its GPU tensors (~1.3 GB
+                # measured on a one-card V100 after an OOM). Clients only need the message: drop the frames.
+                import traceback as _tb
+                _tb.clear_frames(e.__traceback__)
+                try:
+                    e = type(e)(*e.args)
+                except Exception:
+                    e = RuntimeError(repr(e))
+                step_err = None
                 # A step-level failure can't be attributed to one slot
                 # cleanly (the batched forward covers all of them) --
                 # fail every currently-admitted request the same way the
@@ -647,6 +853,8 @@ class BatchScheduler:
                 req.out_q.put(_StreamDone(stats))
                 dt = time.time() - getattr(req, "t_admitted", time.time())
                 n = len(_out_ids)
+                if n and dt > 0:
+                    self._last_tps = n / dt      # for Retry-After estimates
                 live = [s.req_id for s in engine.slots if s is not None]
                 # Cheap here: a completion is rare compared to a step.
                 kv = ""
@@ -669,11 +877,9 @@ def load(model_dir: str, think: bool, params: "GenParams"):
     ai_engine.generation.loader so every caller does them identically; this
     function is now just: load it, keep the result, print the server's banner.
 
-    llm_server.py is the ONE caller that degrades a heavy drafter to n-gram rather
-    than dying: a running server must survive a drafter it cannot build.
+    A drafter that cannot be built stops the server with an error (no fallback).
     """
-    llm = load_qvb8_llm(model_dir, params, verbose=True,
-                        fallback_to_ngram=True)
+    llm = load_qvb8_llm(model_dir, params, verbose=True)
     bundle, drafter_obj, shadow = llm.bundle, llm.drafter, llm.shadow
 
     print(f"[serve] backend {bundle.gpu_dev or 'cpu'}   pack {bundle.pack}",
@@ -711,6 +917,73 @@ def load(model_dir: str, think: bool, params: "GenParams"):
     # tensor lives on its layer's card (BandedKVLayer._adopt_device / add_slot) and drafter taps are gathered on the
     # main card (unified_scheduler.md section 4).
     _pipeline = bool(os.environ.get("QV_PIPELINE", "").strip())      # N-card placement: served by the scheduler too
+    # The checkpoint grid must sit on chunk boundaries: refuse a wrong --prefix-checkpoint-every HERE, at start, not
+    # inside the scheduler thread (2026-11-12: a check there killed the thread and every request hung).
+    if params.qvb8_resident and not _SCHEDULER_OFF:
+        from qv_band.decode.spec_decode import ckpt_every_for
+        try:
+            ckpt_every_for(int(params.prefill_chunk))
+        except ValueError as e:
+            raise SystemExit(str(e))
+    # --prefix-state qvb8: the checkpointed linear-attention state at the MODEL's tau, read here from the pack manifest
+    # and handed to the engine (QV_PREFIX_STATE_TAU, internal). Heads that cannot meet it in 16 bits stay exact.
+    if os.environ.get("QV_PREFIX_STATE", "exact") == "qvb8" and not params.qvb8_resident:
+        print("[prefix] --prefix-state qvb8 has no effect here: the KV cache is not qvb8 (no prefix checkpoints of the "
+              "linear-attention state) -- exact", flush=True)
+        os.environ["QV_PREFIX_STATE"] = "exact"
+    if os.environ.get("QV_PREFIX_STATE", "exact") == "qvb8":
+        try:
+            with open(os.path.join(str(bundle.pack), "manifest.json")) as _f:
+                _ptau = json.load(_f).get("tau")
+        except OSError as e:
+            raise SystemExit(f"--prefix-state qvb8: cannot read the pack manifest for the model's tau ({e})")
+        if not _ptau:
+            raise SystemExit(f"--prefix-state qvb8: {bundle.pack}/manifest.json has no tau")
+        os.environ["QV_PREFIX_STATE_TAU"] = str(float(_ptau))
+    else:
+        os.environ.pop("QV_PREFIX_STATE_TAU", None)
+    if os.environ.get("QV_PREFIX_STORE") == "shared":
+        # One pool per machine for every server with the SAME configuration (decode/shared_prefix.py): its name comes
+        # from everything that decides a saved slot's bytes.
+        if not (params.qvb8_resident and not _SCHEDULER_OFF):
+            raise SystemExit("--prefix-store shared needs the scheduler (--kv-cache qvb8, no --no-scheduler)")
+        # A split model (remote stages): this pool holds the layers that run HERE, each stage worker keeps its layers in
+        # its own machine's pool (start it with --prefix-store shared too). The pool's fingerprint and the transfer
+        # signature carry the split, so a whole-model server never meets these partial entries.
+        _split = (os.environ.get("QV_STAGES", "").strip(), os.environ.get("QV_LAYERS_HERE", "").strip())
+        from qv_band.decode.shared_prefix import config_tag, pack_signature
+        from qv_band.decode.spec_decode import ckpt_every_for
+        _dm = str(getattr(params, "draft_model", "") or "")
+        os.environ["QV_PREFIX_SHARED_TAG"] = config_tag(
+            pack_signature(str(bundle.pack)), os.environ.get("QV_PREFIX_STATE_TAU"), params.effective_kv_tau, int(params.kv_residual),
+            int(params.prefill_chunk), ckpt_every_for(int(params.prefill_chunk)), str(getattr(bundle.model, "dtype", "")),
+            os.environ.get("QV_PIPELINE", ""), params.drafter, pack_signature(_dm) if _dm else "",
+            int(params.draft_ctx), int(params.draft_k), _split)
+        # Between MACHINES only what decides a saved prefix's bytes must match: not the prefill chunk (checkpoints sit
+        # on the grid, the same positions for 512 and 12288) nor the card layout.
+        _xparts = (pack_signature(str(bundle.pack)), os.environ.get("QV_PREFIX_STATE_TAU"), params.effective_kv_tau,
+                   int(params.kv_residual), ckpt_every_for(int(params.prefill_chunk)),
+                   params.drafter,                   # (model dtype: cast at restore, shared_prefix.get)
+                   pack_signature(_dm) if _dm else "",      # (drafter context length: speed only)
+                   *((_split,) if any(_split) else ()))
+        os.environ["QV_PREFIX_XFER_SIG"] = config_tag(*_xparts)
+        print(f"[prefix] transfer signature {os.environ['QV_PREFIX_XFER_SIG']} = {_xparts}", flush=True)
+        if not os.environ.get("QV_POOL_TOKEN"):
+            print("[prefix] WARNING: QV_POOL_TOKEN is not set: /v1/pool/export, /piece and /pull are open to the LAN "
+                  "(saved prefixes hold prompt token ids). Set the same token on servers, router and prefix store.",
+                  flush=True)
+        os.environ.setdefault("QV_PREFIX_SHARED_NAME", "qv_prefix_" + os.path.basename(str(bundle.pack).rstrip("/"))
+                              + ("_main" + _split[1].rstrip(":").replace(":", "-") if any(_split) else ""))
+        if any(_split):
+            os.environ["QV_PREFIX_LOCAL_ONLY"] = "1"       # partial entries: not exported, not mirrored
+        from qv_band.decode.shared_prefix import store_from_env
+        try:
+            store_from_env()                   # opens (or creates) the pool now: a mismatch stops the server at start
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"--prefix-store shared: {e}")
+        if os.environ.get("QV_PREFIX_BACKUP"):
+            from ai_engine.servers.pool_xfer import start_backup_watch
+            start_backup_watch(os.environ["QV_PREFIX_BACKUP"])
     if os.environ.get("QV_STAGES", "").strip():
         # Layers on another machine (--pipeline HOST:PORT,local): the scheduler is the only path that serves them.
         if not (params.qvb8_resident and not _SCHEDULER_OFF):
@@ -726,13 +999,21 @@ def load(model_dir: str, think: bool, params: "GenParams"):
         else:
             drafter_factory = (
                 (lambda: build_drafter(params.drafter, bundle,
-                                       max_ctx=params.draft_ctx,
-                                       fallback_to_ngram=True, params=params))
+                                       max_ctx=params.draft_ctx, params=params))
                 if params.draft_k > 0 else None)
         scheduler = BatchScheduler(
             bundle.model, bundle.tok, drafter_factory, params.draft_k,
             params.effective_kv_tau, params.kv_residual,
-            prefill_chunk=params.prefill_chunk)
+            prefill_chunk=params.prefill_chunk, limits=STATE.get("limits"))
+        lim = scheduler.limits
+        if lim.any():
+            print(f"[serve] admission: at most {lim.max_live or 'any number of'} live requests, "
+                  f"{lim.max_live_tokens or 'any number of'} live tokens (prompt + output), "
+                  f"{lim.max_queue or 'any number'} waiting, wait limit {lim.queue_wait_s or 'none'} s", flush=True)
+        else:
+            print("[serve] WARNING: no admission limits (--max-live / --max-live-tokens / --max-queue / --queue-wait): "
+                  "every request is admitted at once and a burst is stopped only by the memory ceiling, which fails "
+                  "the whole batch", flush=True)
         scheduler.start()
         STATE["scheduler"] = scheduler
         print("[serve] continuous-batching scheduler ACTIVE "
@@ -1086,10 +1367,38 @@ def _timings_str(t: dict) -> str:
     return "  |  ".join(parts)
 
 
+def _model_family() -> str:
+    """The source model's name from the pack manifest (Qwen3.8-27B for every pack of it), cached; the pack folder's
+    name when the manifest has none."""
+    fam = STATE.get("family")
+    if fam is None:
+        pack = str(STATE.get("pack") or "")
+        try:
+            with open(os.path.join(pack, "manifest.json")) as f:
+                fam = os.path.basename(str(json.load(f).get("hf_model", "")).rstrip("/"))
+        except (OSError, ValueError):
+            fam = ""
+        fam = STATE["family"] = fam or os.path.basename(pack.rstrip("/"))
+    return fam
+
+
+def _enter_home(model) -> None:
+    """Make the model's home card (the pipeline's main card) the CURRENT device of the calling thread. Triton and the
+    qvb8 extension launch on the current device, which is cuda:0 in every new thread (github issue #1)."""
+    try:
+        from qv_band.run.placement import home_device
+        home = home_device(model)
+        if home is not None and home.type == "cuda":
+            import torch
+            torch.cuda.set_device(home)
+    except Exception:                        # noqa: BLE001 - CPU / XPU backends have no current CUDA device
+        pass
+
+
 def generate(text: str, max_tokens: int, draft: int, on_token=None,
              temperature: float | None = None, top_k: int | None = None,
              top_p: float | None = None, think: bool = True,
-             req_id: int = 0) -> dict:
+             req_id: int = 0, client_gone=None) -> dict:
     """One generation, serialised.  Returns text and timing.
 
     `req_id`: the server-side log tag for this request. The non-streaming
@@ -1098,6 +1407,7 @@ def generate(text: str, max_tokens: int, draft: int, on_token=None,
     """
     bundle = STATE["bundle"]
     tok = bundle.tok          # model is reached via run_generate(bundle, ...)
+    _enter_home(bundle.model)
     ids = tok(text, return_tensors="pt").input_ids
     if bundle.use_gpu:
         ids = ids.to(bundle.gpu_dev)
@@ -1117,8 +1427,15 @@ def generate(text: str, max_tokens: int, draft: int, on_token=None,
         print(f"[serve] {_ts()} req #{req_id} scheduler path", file=sys.__stdout__, flush=True)
         out_q = sch.submit(ids, rp.max_output_tokens, rp.temperature or 0.0, rp.top_k or 0, rp.top_p or 1.0, req_id)
         out, st, t0 = [], None, time.time()
+        t_peek = time.monotonic()
         try:
             while True:
+                # A non-streaming client that hung up: stop decoding for nobody (the streaming route always did). Checked
+                # once a second by the clock, not only when the queue is idle: tokens arrive several times a second.
+                if client_gone is not None and time.monotonic() - t_peek >= 1.0:
+                    t_peek = time.monotonic()
+                    if client_gone():
+                        raise _ClientGone()
                 try:
                     item = out_q.get(timeout=1.0)
                 except queue.Empty:
@@ -1195,6 +1512,9 @@ def generate(text: str, max_tokens: int, draft: int, on_token=None,
     }
 
 
+
+VISION_BODY_BYTES = 32 << 20     # image payload allowance per request with --vision on (base64 data URLs)
+
 class Handler(QVHTTPHandler):
     LOG_TAG = "serve"
 
@@ -1204,15 +1524,61 @@ class Handler(QVHTTPHandler):
     # authoritative limit, but only fires AFTER the full body is read into
     # memory and AFTER build_prompt()/tokenization has already paid the
     # cost of a huge string) would have accepted.
-    MAX_BODY = staticmethod(lambda: STATE["ctx_size"] * 6)
+    # text: ~6 bytes per token of --ctx-size; with --vision on also room for images sent as base64 data URLs (a 1 MP
+    # photo is ~1.8 MB of base64: the text-only limit, 983 KB at 163840 tokens, refused every real photo)
+    MAX_BODY = staticmethod(lambda: STATE["ctx_size"] * 6 + (VISION_BODY_BYTES if STATE.get("vision", True) else 0))
+
+    def _send_busy(self, e: "Overloaded") -> None:
+        """429 / 503 with Retry-After: the request is fine, this server has no room for it now."""
+        raw = json.dumps({"error": str(e), "retry_after": e.retry_after}).encode()
+        self.send_response(e.code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Retry-After", str(e.retry_after))
+        if self.ENABLE_CORS:
+            self.send_header("Access-Control-Allow-Origin", self._cors_value())
+            self.send_header("Vary", "Origin")
+        self._end_close()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _peer_closed(self) -> bool:
+        """True when the client has closed its side (a peek that reads end-of-stream); never blocks."""
+        try:
+            import select
+            # select first: the connection has a timeout, and a bare recv on it WAITS for that timeout (then raises a
+            # timeout, which is an OSError) -- an open, silent client must read as "still there", at once
+            r, _, _ = select.select([self.connection], [], [], 0)
+            return bool(r) and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
 
     def _body_too_large_message(self, n: int, max_body: int) -> str:
         return (f"request body is {n} bytes, over the {max_body}-byte limit "
-                f"derived from --ctx-size ({STATE['ctx_size']} tokens)")
+                f"derived from --ctx-size ({STATE['ctx_size']} tokens)"
+                + (f" + {VISION_BODY_BYTES >> 20} MB for images" if STATE.get("vision", True) else ""))
 
     # -- routes -----------------------------------------------------
 
     def do_GET(self):
+        from ai_engine.servers import pool_xfer
+        if pool_xfer.handle_get(self, self.path):        # /v1/pool/export, /v1/pool/piece (another machine pulls)
+            return
+        if self.path.rstrip("/") == "/v1/pool/state":
+            sch = STATE.get("scheduler")
+            if sch is not None and sch.dead is not None:
+                return self._send(503, {"error": f"scheduler stopped ({sch.dead}): restart the server"})
+            st = sch.pool_state() if sch is not None else {"load": None, "prefixes": []}
+            p = STATE.get("params")
+            st.update({"model": os.path.basename(str(STATE.get("pack") or "")), "pack": str(STATE.get("pack") or ""),
+                       "ctx_size": STATE.get("ctx_size"), "vision": STATE.get("vision", True),
+                       "kv_tau": getattr(p, "kv_tau", None), "dtype": getattr(p, "dtype", None),
+                       "scheduler": sch is not None})
+            st.update(pool_xfer.state_extra())           # which machine's pool, transfer signature
+            st["family"] = _model_family()               # the source model's name: the router's group
+            return self._send(200, st)
         if self.path.rstrip("/") in ("/health", ""):
             vram = {}
             if STATE.get("gpu_dev"):
@@ -1510,6 +1876,19 @@ class Handler(QVHTTPHandler):
         except Exception as e:
             return self._send(400, {"error": f"bad JSON: {e}"})
 
+        from ai_engine.servers import pool_xfer
+        if pool_xfer.handle_post(self, route, body):     # /v1/pool/pull, /v1/pool/release
+            return
+        if route == "/v1/pool/keys":
+            # the router's prefix keys of a request, from this server's own prompt builder and tokenizer
+            if STATE["model"] is None:
+                return self._send(503, {"error": "model still loading"})
+            try:
+                from ai_engine.servers.pool_keys import block_keys
+                ids = STATE["tok"](build_prompt(body), return_tensors="pt").input_ids[0].tolist()
+            except Exception as e:                  # noqa: BLE001 - a bad body is the client's error
+                return self._send(400, {"error": f"keys: {e}"})
+            return self._send(200, {"n_tokens": len(ids), "keys": block_keys(ids)})
         if route not in ("/generate", "/v1/completions", "/v1/chat/completions"):
             return self._send(404, {"error": "not found"})
 
@@ -1523,6 +1902,7 @@ class Handler(QVHTTPHandler):
         # just hung waiting for a response that was never coming, instead
         # of getting a clean 400. Every request-parsing step that can raise
         # belongs inside the try block below.
+        parsed = False                           # True once the request is understood: later errors are the server's
         try:
             # absent -> the server's base output budget (GenParams default),
             # NOT ctx_size (that binding once decoded 200k tokens on a
@@ -1570,6 +1950,8 @@ class Handler(QVHTTPHandler):
             if route == "/v1/chat/completions" and _vision.has_images(body["messages"]) and not STATE.get("vision", True):
                 return self._send(400, {"error": "image input is disabled on this server (started with --vision off; use --vision on, or LLM_VISION=on)"})
             if route == "/v1/chat/completions" and _vision.has_images(body["messages"]):
+                if STATE.get("scheduler") is not None:
+                    STATE["scheduler"].check_queue()     # image requests obey --max-queue as text requests do
                 return self._vision_chat(body, max_tokens, think_enabled,
                                          temperature, top_k, top_p, req_id=req_id)
             text = build_prompt(body)
@@ -1590,16 +1972,28 @@ class Handler(QVHTTPHandler):
                     f"context size of {STATE['ctx_size']} (--ctx-size). "
                     f"Send a shorter prompt or restart with a larger "
                     f"--ctx-size.")})
+            # The output budget is what is left of the context after the prompt (before 2026-11-14 only the prompt
+            # was checked: prompt + max_tokens could run past --ctx-size, the size the KV shadow is planned for).
+            if n_prompt + max_tokens > STATE["ctx_size"]:
+                max_tokens = STATE["ctx_size"] - n_prompt
+                if max_tokens < 1:
+                    return self._send(400, {"error": (
+                        f"prompt has {n_prompt} tokens: no room for an answer in the context size of "
+                        f"{STATE['ctx_size']} (--ctx-size)")})
+            stream_opts = body.get("stream_options") or {}
+            stops_in = _stop_list(body)
+            parsed = True
+            sch = STATE.get("scheduler")
+            if sch is not None:
+                sch.check_queue()            # full: 429 now, before a streamed answer has sent its 200
             if body.get("stream"):
                 return self._stream(text, max_tokens, draft, route,
                                     has_tools=bool(body.get("tools")),
                                     think=think_enabled,
-                                    stops=_stop_list(body),
+                                    stops=stops_in,
                                     temperature=temperature, top_k=top_k,
                                     top_p=top_p, req_id=req_id,
-                                    include_usage=body.get(
-                                        "stream_options", {}).get(
-                                            "include_usage", True))
+                                    include_usage=stream_opts.get("include_usage", True))
             # A non-streaming response holds a fully idle socket until the
             # whole generation finishes, and most HTTP clients (Cline
             # included) give up on a read timeout before that, showing a
@@ -1624,12 +2018,24 @@ class Handler(QVHTTPHandler):
                   file=sys.__stdout__, flush=True)
             r = generate(text, max_tokens, draft, temperature=temperature,
                         top_k=top_k, top_p=top_p, think=think_enabled,
-                        req_id=req_id)
+                        req_id=req_id, client_gone=self._peer_closed)
+        except Overloaded as e:
+            print(f"[serve] {_ts()} req #{req_id} refused ({e.code}): {e}", file=sys.__stdout__, flush=True)
+            return self._send_busy(e)
+        except _ClientGone:
+            print(f"[serve] {_ts()} req #{req_id} client left before the answer: generation stopped",
+                  file=sys.__stdout__, flush=True)
+            self.close_connection = True
+            return
         except Exception as e:
+            if not parsed and isinstance(e, (ValueError, TypeError, KeyError, AttributeError)):
+                # a field of the wrong type ("max_tokens": "abc", "stream_options": 3): the client's error, and a
+                # router must not try the same request on every other replica as it does for a 5xx
+                return self._send(400, {"error": f"bad request: {type(e).__name__}: {e}"})
             traceback.print_exc()
             return self._send(500, {"error": str(e)})
 
-        stops = _stop_list(body)
+        stops = stops_in
         r["text"], hit_stop = _truncate_at_stop(r["text"], stops)
 
         if route == "/generate":
@@ -1735,6 +2141,7 @@ class Handler(QVHTTPHandler):
 
         bundle = STATE["bundle"]
         tok = bundle.tok          # model is reached via run_generate(bundle, ...)
+        _enter_home(bundle.model)
         ids = tok(text, return_tensors="pt").input_ids
         if bundle.use_gpu:
             ids = ids.to(bundle.gpu_dev)
@@ -2530,13 +2937,27 @@ def main():
                     help="image input (image_url chat content). on (default): the vision tower is built lazily on "
                          "the first image request, so a text-only workload pays no memory for it; off: such "
                          "requests are refused with 400 and nothing vision-related is ever loaded. (Env: LLM_VISION.)")
+    ap.add_argument("--vision-tower", choices=("gpu", "host"), default=None,
+                    help="where the vision tower waits between image requests: gpu (default) or pinned host RAM, moved to "
+                         "the card only while it encodes a picture (a full 16 GB card: 27B on one V100). (Env: LLM_VISION_TOWER.)")
     ap.add_argument("--no-scheduler", dest="scheduler", action="store_false",
                     default=True,
                     help="do not start the continuous-batching scheduler; "
                          "serve requests one at a time behind a lock (slower "
                          "with several users). Works on every machine; decided "
                          "once at start-up. (Env: QV_NO_SCHEDULER=1.)")
+    ap.add_argument("--max-live", type=int, default=0, metavar="N",
+                    help="admission: at most N requests in the live batch (0 = no limit); the others wait in order")
+    ap.add_argument("--max-live-tokens", type=int, default=0, metavar="T",
+                    help="admission: sum of prompt + max output tokens over the live requests (0 = no limit): the bound "
+                         "on what their KV cache can grow to. A request larger than T still runs, alone")
+    ap.add_argument("--max-queue", type=int, default=0, metavar="N",
+                    help="admission: at most N requests waiting; one more gets 429 + Retry-After (0 = no limit)")
+    ap.add_argument("--queue-wait", type=float, default=0.0, metavar="S",
+                    help="admission: a request not admitted after S seconds gets 503 + Retry-After (0 = waits for ever)")
     args = ap.parse_args()
+    STATE["limits"] = Limits(max(0, args.max_live), max(0, args.max_live_tokens), max(0, args.max_queue),
+                             max(0.0, args.queue_wait))
     _set_scheduler(args.scheduler)
 
     args.temperature, args.top_k, args.top_p = resolve_sampling(
@@ -2546,6 +2967,8 @@ def main():
     # STATE["params"] and each request clones it (see _request_params).
     params = params_from_args(args)
     STATE["vision"] = (args.vision != "off")
+    if args.vision_tower is not None:
+        os.environ["LLM_VISION_TOWER"] = args.vision_tower
     # Bind the socket BEFORE loading the model: loading a 27B pack takes
     # minutes and ~24 GB of VRAM, and a port clash discovered afterwards
     # wastes all of that (the process then dies with "Address already in

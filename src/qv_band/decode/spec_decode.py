@@ -88,6 +88,7 @@ ADAPTIVE_K = os.environ.get("QV_BAND_ADAPTIVE_K", "0") == "1"
 ROW_BUDGET = int(os.environ.get("QV_BAND_ROW_BUDGET", "0"))
 _PROFILE_STEPS = [int(os.environ.get("QV_BAND_PROFILE_STEPS", "0"))]
 _PROFILE_PREFILL = [int(os.environ.get("QV_BAND_PROFILE_PREFILL", "0"))]   # profile N prefill chunk forwards
+_PROFILE_PREFILL_FROM = int(os.environ.get("QV_BAND_PROFILE_PREFILL_FROM", "0"))   # only chunks starting at >= this token
 # Prefill chunk while other requests are decoding: each decode step waits for one chunk, so keep it small
 # enough for streaming to stay responsive (1024 tok ~ 3-4 s on the 65B) -- prefill stays compute bound.
 INTERLEAVE_CHUNK = int(os.environ.get("QV_BAND_INTERLEAVE_CHUNK", "1024"))
@@ -2476,17 +2477,161 @@ def _seed_ngram_with_prompt(drafter, prompt_ids) -> None:
 _UNSUPPORTED = object()
 
 
-def _export_layer_slot(layer, bi: int):
-    """Slot `bi` of ONE cache layer, as an entry of _export_slot_state's list, or _UNSUPPORTED."""
+# Where saved prompt prefixes keep their copied tensors (--prefix-store, ai_engine/cli/kv_offload.py): "gpu" or "host"
+# (pinned host RAM, copied back to the card on a restore). The banded KV segments are shared by reference either way.
+# "shared": one pool in /dev/shm per machine for every server on it (decode/shared_prefix.py). A checkpoint is exported
+# to pinned host RAM as with "host" (an export on the card took ~270 MB of a full 16 GB V100 at each 8192-token
+# checkpoint, 2026-11-13), copied into the pool once, freed; a restore reads views of the pool -- no private copy kept.
+PREFIX_STORE_SHARED = os.environ.get("QV_PREFIX_STORE", "gpu") == "shared"
+PREFIX_STORE_HOST = os.environ.get("QV_PREFIX_STORE", "gpu") == "host" or PREFIX_STORE_SHARED
+# --prefix-checkpoint-every N: mid-prompt checkpoints sit on a FIXED grid of absolute positions (N, 2N, ...), the same
+# in every run whatever was cached before. With a qvb8 KV cache the linear-attention state is rounded to its qvb8 form
+# (the KV cache's own tau) at each grid position in EVERY prefill, and the checkpoint stores exactly that rounded
+# state: a restore continues from the very state a run without the cache used -> the answer does not depend on cache
+# hits. Prompt-end and branch checkpoints are not on the grid and stay exact copies.
+PREFIX_CKPT_EVERY = int(os.environ.get("QV_PREFIX_CKPT_EVERY", "0") or 0)   # 0 = the default below
+
+
+def ckpt_every_for(prefill_chunk: int) -> int:
+    """The checkpoint grid for a prefill chunk: --prefix-checkpoint-every if given (must be a multiple of the chunk:
+    checkpoints sit on chunk boundaries), else the smallest multiple of the chunk >= 8192 (8192 for 1024-token chunks,
+    12288 for the the dev GPU launchers' 12288). Raises ValueError for a given value that is not a multiple."""
+    if PREFIX_CKPT_EVERY:
+        if PREFIX_CKPT_EVERY % prefill_chunk:
+            raise ValueError(f"--prefix-checkpoint-every {PREFIX_CKPT_EVERY} must be a multiple of --prefill-chunk "
+                             f"{prefill_chunk}: checkpoints sit on chunk boundaries")
+        return PREFIX_CKPT_EVERY
+    return -(-8192 // prefill_chunk) * prefill_chunk
+# The state's tau is the MODEL's (the pack manifest's tau, set by the server: QV_PREFIX_STATE_TAU), not the KV cache's.
+# PoC (poc/state_ckpt, 2026-11-12, 27B, 17,408 tokens of real text, KV-cache codec per head and column): tau 2e-3
+# rounded once / on a 4096 grid / at every 1024-token chunk -> perplexity 4.3944 -> 4.3943 / 4.3935 / 4.3937, top-1
+# agreement 99.75 / 99.61 / 99.28 %, state 0.24x of fp32. (The KV cache's tau 0.2 gave 6.219: far too coarse.)
+# No tau set (no manifest tau, or not a qvb8 KV cache) -> grid checkpoints store exact states.
+
+
+class PackedState:
+    """A linear-attention recurrent state (heads, d_k, d_v) in the KV cache's qvb8 codec (kv/codec.band_kv_heads): per
+    head, per d_v column one (min, step) over the d_k rows; per-head bit width from the KV floor up, raised until the
+    decoded state meets |err| <= tau (verified on the real decode). A head that cannot meet tau within 16 bits (its
+    range is wider than 2 * tau * 65535: 65.5 at tau 5e-4) is ESCAPED WHOLE: stored as an exact copy. Per head, not per
+    element, so a decode never patches values; |err| <= tau holds everywhere (an escaped head has error 0)."""
+
+    def __init__(self, t, tau):
+        import contextlib
+        from qv_band.kv.codec import KV_BITS_FLOOR, MAX_BITS, KVCertificateError, band_kv_heads
+        with torch.cuda.device(t.device) if t.is_cuda else contextlib.nullcontext():   # Triton launches on the current card
+            x = t.detach().reshape(-1, t.shape[-2], t.shape[-1])        # (heads, d_k, d_v)
+            span = (x.float().amax(1) - x.float().amin(1)).amax(1)      # widest column per head
+            raw = set(torch.nonzero(span > 2.0 * tau * ((1 << MAX_BITS) - 1)).flatten().tolist())
+            while True:
+                keep = [h for h in range(x.shape[0]) if h not in raw]
+                try:
+                    banded = band_kv_heads(x[keep], t.dtype, KV_BITS_FLOOR, tau=tau) if keep else []
+                    break
+                except KVCertificateError as e:       # at the 16-bit edge the verified error decides: escape that head
+                    raw.add(keep[int(str(e).split()[1].rstrip(":"))])
+            self.heads = [None] * x.shape[0]
+            for h, b in zip(keep, banded):
+                self.heads[h] = b
+            for h in raw:
+                self.heads[h] = x[h].clone()
+        self.shape, self.dtype = tuple(t.shape), t.dtype
+        self.bits = sorted({b.bits for b in self.heads if not torch.is_tensor(b)})
+        self.escaped = len(raw)
+
+    def nbytes(self):
+        return sum(b.numel() * b.element_size() if torch.is_tensor(b) else b.nbytes() for b in self.heads)
+
+    def to_host(self):
+        for i, b in enumerate(self.heads):
+            if torch.is_tensor(b):
+                h = torch.empty(b.shape, dtype=b.dtype, pin_memory=True)
+                h.copy_(b)
+                self.heads[i] = h
+                continue
+            for k in ("packed", "min_s", "tau_s"):
+                v = getattr(b, k)
+                h = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
+                h.copy_(v)
+                setattr(b, k, h)
+        return self
+
+    def decode(self, dev):
+        import contextlib
+        dev = torch.device(dev)
+        with torch.cuda.device(dev) if dev.type == "cuda" else contextlib.nullcontext():
+            return torch.stack([b.to(dev, torch.float32) if torch.is_tensor(b) else b.decode_all_torch(dev, torch.float32)
+                                for b in self.heads]).reshape(self.shape).to(self.dtype)
+
+
+def _keep(t):
+    """A copy of `t` for the prefix store: on the card, or in pinned host RAM with --prefix-store host."""
+    if PREFIX_STORE_HOST and t.is_cuda:
+        h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        h.copy_(t)
+        return h
+    return t.clone()
+
+
+def _release_cached_blocks() -> None:
+    """Give the allocator's cached free blocks back to the card after a request leaves / a prefix is restored. Without
+    expandable segments (the V100 launchers) the cache fragments: 27B on one V100, a prefill after a mid-prompt restore
+    failed to get 68 MiB with 497 MiB cached but in pieces (2026-11-12). Memory housekeeping only: outputs unchanged."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _tensors_to(obj, where):
+    """--prefix-store host: a saved drafter state's tensors to pinned host RAM (where="host") or back to its card
+    (where = the drafter's device). Unchanged with --prefix-store gpu, or when `where` is None."""
+    if not (PREFIX_STORE_HOST or PREFIX_STORE_SHARED) or where is None:
+        return obj
+    if isinstance(obj, torch.Tensor):
+        if where == "host":
+            return _keep(obj)
+        return obj.to(where, non_blocking=True) if not obj.is_cuda else obj
+    if isinstance(obj, dict):
+        return {k: _tensors_to(v, where) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_tensors_to(v, where) for v in obj)
+    return obj
+
+
+def _round_layer_slot(layer, bi: int, tau: float):
+    """Grid position: round slot `bi`'s recurrent state of a linear-attention layer to its qvb8 form IN PLACE (the live
+    run continues from it) and return the packed form (what a checkpoint stores). None for any other layer."""
+    from transformers.cache_utils import DynamicLayer, LinearAttentionCacheLayerMixin
+    if not isinstance(layer, LinearAttentionCacheLayerMixin) or isinstance(layer, DynamicLayer):
+        return None
+    rs = layer.recurrent_states.get(0)
+    if rs is None or rs.shape[0] <= bi:
+        return None
+    p = PackedState(rs[bi], tau)
+    rs[bi].copy_(p.decode(rs.device))
+    return p
+
+
+def _export_layer_slot(layer, bi: int, packed=None):
+    """Slot `bi` of ONE cache layer, as an entry of _export_slot_state's list, or _UNSUPPORTED. packed: this layer's
+    recurrent state as a grid position rounded it (_round_layer_slot)."""
     from transformers.cache_utils import DynamicLayer, LinearAttentionCacheLayerMixin
     from qv_band.kv.banded_cache import BandedKVLayer
     if isinstance(layer, BandedKVLayer):
-        return ("kv", layer.export_slot(bi))
+        st = layer.export_slot(bi)
+        if PREFIX_STORE_HOST:
+            st["resid_k"], st["resid_v"] = _keep(st["resid_k"]), _keep(st["resid_v"])
+            # The packed segments stay shared by reference: --kv-host already moves a slot's old segments to pinned host
+            # RAM in batches (banded_cache.PackedHostTier swaps them in place, so checkpoints follow). Copying them here
+            # per checkpoint (thousands of tiny blocking copies) halved long-prompt prefill on a V100 (2026-11-13) and
+            # rested on a wrong diagnosis: the restore OOM was allocator fragmentation (expandable segments fix it).
+        return ("kv", st)
     if isinstance(layer, LinearAttentionCacheLayerMixin) and not isinstance(layer, DynamicLayer):
         cs, rs = layer.conv_states.get(0), layer.recurrent_states.get(0)
         if cs is None or rs is None or cs.shape[0] <= bi or rs.shape[0] <= bi:
             return _UNSUPPORTED
-        return ("lin", (cs[bi].clone(), rs[bi].clone()))
+        if packed is not None:            # a grid checkpoint: the recurrent state as the live run rounded it (qvb8)
+            return ("lin", (_keep(cs[bi]), packed.to_host() if PREFIX_STORE_HOST else packed, cs.device))
+        return ("lin", (_keep(cs[bi]), _keep(rs[bi]), cs.device))     # the card: a restore may seed a fresh layer
     if (getattr(layer, "conv_states", None) is None
             and getattr(layer, "recurrent_states", None) is None
             and getattr(layer, "keys", None) is None):
@@ -2497,11 +2642,12 @@ def _export_layer_slot(layer, bi: int):
     return _UNSUPPORTED
 
 
-def _export_slot_state(past, bi: int):
-    """Slot `bi` of every cache layer, or None if some layer type is not supported."""
+def _export_slot_state(past, bi: int, packed=None):
+    """Slot `bi` of every cache layer, or None if some layer type is not supported. packed: {layer index: PackedState}
+    from a grid position's rounding."""
     out = []
-    for layer in past.layers:
-        e = _export_layer_slot(layer, bi)
+    for li, layer in enumerate(past.layers):
+        e = _export_layer_slot(layer, bi, (packed or {}).get(li))
         if e is _UNSUPPORTED:
             return None
         out.append(e)
@@ -2525,11 +2671,18 @@ def _import_slot_state(past, bi: int, state) -> bool:
         return False             # other slots are waiting on a first forward that sizes the batch
     for layer, (kind, st) in zip(layers, state):
         if kind == "kv":
+            dev = layer._resid_k[bi].device
+            if st["resid_k"].device != dev:          # --prefix-store host: the residual comes back to the card
+                st = dict(st, resid_k=st["resid_k"].to(dev, non_blocking=True), resid_v=st["resid_v"].to(dev, non_blocking=True))
             layer.import_slot(bi, st)
             continue
         if kind == "none":
             continue             # stateless block: nothing to import
-        conv, rec = st
+        conv, rec, dev = st
+        if isinstance(rec, PackedState):        # a grid checkpoint: the rounded state, decoded on the layer's card
+            rec = rec.decode(dev)
+        if conv.device != dev or rec.device != dev:   # --prefix-store host: back to the layer's card
+            conv, rec = conv.to(dev, non_blocking=True), rec.to(dev, non_blocking=True)
         if ready:
             layer.conv_states[0][bi].copy_(conv)
             layer.recurrent_states[0][bi].copy_(rec)
@@ -2602,7 +2755,7 @@ class _BatchSlot:
     __slots__ = ("bi", "out_ids", "drafter", "max_new", "done",
                  "temperature", "top_k", "top_p", "_history_len",
                  "req_id", "stats", "on_token", "just_admitted",
-                 "acc_ema", "spec_off", "spec_backoff", "prompt_ids", "prefix_hit", "branch", "_ckpt_at", "k_cur", "acc_len_ema",
+                 "acc_ema", "spec_off", "spec_backoff", "prompt_ids", "prefix_hit", "shared_leases", "branch", "_ckpt_at", "k_cur", "acc_len_ema",
                  "admit_no")
 
     def __init__(self, bi: int, drafter, max_new: int,
@@ -2622,6 +2775,7 @@ class _BatchSlot:
         self.on_token = on_token
         self.prompt_ids = None      # the full prompt as a list (to checkpoint / match prefixes)
         self.prefix_hit = 0         # prompt tokens restored from a saved prefix instead of prefilled
+        self.shared_leases = None   # --prefix-store shared: pool blobs this slot reads from (released in _drop)
         self.k_cur = None           # adaptive draft length (packed engines), None = engine k
         self.acc_len_ema = 4.0      # accepted drafts per step, smoothed
         self._ckpt_at = 0           # slot length at the last chunk-boundary checkpoint
@@ -3557,8 +3711,21 @@ class ContinuousBatchEngine:
         # Measured on the 27B (6808-token prompt): 512 -> 324.7 tok/s,
         # 1024 -> 426.5, 2048 -> 459.9, so silently pinning every server
         # to the module default cost ~30% of prefill.
+        # Mid-prompt checkpoints of a long prefill (--prefix-checkpoint-every, tokens): each holds the linear-attention
+        # state (~150 MB for a 27B), so one per chunk was ~5x the KV it covers. Sparse: a restore prefills at most this
+        # many tokens again; the computation is the same (a checkpoint is the exact state at its position).
+        self._ckpt_every = 0          # set from the prefill chunk below
+        self._state_tau = float(os.environ.get("QV_PREFIX_STATE_TAU", "0") or 0) or None
         self.prefill_chunk = (int(prefill_chunk) if prefill_chunk
                               else PREFILL_CHUNK)
+        self._ckpt_every = ckpt_every_for(self.prefill_chunk)      # validated at server start (llm_server.load)
+        from qv_band.decode.shared_prefix import store_from_env
+        self._shared = store_from_env()
+        if self._shared is not None:
+            self._shared.release_all()         # a rebuilt engine: the old one's requests are gone
+        print(f"[prefix] checkpoints every {self._ckpt_every} tokens (grid), linear-attention state "
+              + (f"qvb8 at the model's tau {self._state_tau:g} (KV-cache codec)" if self._state_tau else "exact fp32"),
+              file=sys.__stdout__, flush=True)
         _probe = drafter_factory() if (self.k > 0 and drafter_factory) else None
         self.want_hidden = bool(getattr(_probe, "needs_hidden", False))
         # Target layers a DFlash drafter is fed from (see speculative_generate's
@@ -3862,41 +4029,48 @@ class ContinuousBatchEngine:
                     take = min(ch, heads[bi] - d[bi])
                     if d[bi] < cuts.get(bi, 0):
                         take = min(take, cuts[bi] - d[bi])
+                    take = self._grid_take(hist[bi], take)
                     seqs[rows[bi]] = work[bi][0, d[bi]:d[bi] + take].tolist()
             hl = [hist[bi] for bi, _ in live]
             saves = []
+            grid = set()
             for bi in work:
                 n = len(seqs[rows[bi]])
                 d[bi] += n
                 hist[bi] += n
+                on_grid = self._ckpt_every > 0 and n and hist[bi] % self._ckpt_every == 0
+                if on_grid:
+                    grid.add(bi)                     # rounded in every run, saved or not
                 if cuts.get(bi) == d[bi]:
                     saves.append(bi)
-                elif (d[bi] < heads[bi] and slot[bi].prompt_ids is not None
-                      and hist[bi] - ckpt_at[bi] >= self.prefill_chunk):
+                elif on_grid and d[bi] < heads[bi] and slot[bi].prompt_ids is not None:
                     ckpt_at[bi] = hist[bi]
                     saves.append(bi)
-            plan.append((seqs, hl, saves, dict(d), dict(hist)))
+            plan.append((seqs, hl, saves, dict(d), dict(hist), grid))
         L = len(self.past.layers)
         base = gate.new_run(len(plan))
         snaps = {}
 
-        def snap(c, s, bis):                         # inside gate.leave(s, base + c)
+        def snap(c, s, bis, grid):                   # inside gate.leave(s, base + c): this card's layers after round c
             lo, hi = gate.stage_layers[s]
-            for bi in bis:
+            for bi in set(bis) | grid:
+                packed = self._grid_round(bi, range(lo, hi)) if bi in grid else {}
+                if bi not in bis:
+                    continue
                 arr = snaps[c][bi]
                 for li in range(lo, hi):
-                    arr[li] = _export_layer_slot(self.past.layers[li], bi)
+                    arr[li] = _export_layer_slot(self.past.layers[li], bi, packed.get(li))
 
-        for c, (_, _, saves, _, _) in enumerate(plan):
-            if saves:
+        for c, (_, _, saves, _, _, grid) in enumerate(plan):
+            if saves or grid:
                 snaps[c] = {bi: [None] * L for bi in saves}
                 for s in range(gate.n):
-                    gate.on_leave[(s, base + c)] = functools.partial(snap, c, s, saves)
+                    gate.on_leave[(s, base + c)] = functools.partial(snap, c, s, saves, grid)
         failed = []
 
         @torch.no_grad()                             # grad mode is per thread
         def run(c):
-            seqs, hl, _, _, _ = plan[c]
+            seqs, hl, _, _, _, _ = plan[c]
             with torch.cuda.device(self._device), _sg.as_ticket(base + c):
                 if failed:
                     gate.release(base + c)
@@ -3922,7 +4096,7 @@ class ContinuousBatchEngine:
                     break
                 c = completed
                 res = futs.pop(c).result()           # re-raises the round's error
-                seqs, hl, saves, dc, hc = plan[c]
+                seqs, hl, saves, dc, hc, _ = plan[c]
                 if res is not None:
                     for bi in work:
                         r, n = rows[bi], len(seqs[rows[bi]])
@@ -4022,10 +4196,14 @@ class ContinuousBatchEngine:
         # precisely the situation that makes it worst.
         totals = {bi: t.shape[-1] for bi, t in work.items()}
         ckpt = {bi for bi, s in live if bi in work and checkpoint(s)}
-        heads = {bi: totals[bi] - (PREFIX_TAIL if bi in ckpt else ch) for bi in work}
-        # where each slot parts from a saved prompt, in this call's own coordinates
-        cuts = {bi: s.branch - s.prefix_hit for bi, s in live
-                if bi in work and s.branch > s.prefix_hit}
+        slot_of = dict(live)
+        # the prompt-end checkpoint on the chunk boundary at or before (prompt - PREFIX_TAIL): a later, longer prompt
+        # that restores it then continues on the same chunk split as an uncached run
+        heads = {bi: (max(0, self._align_down(slot_of[bi].prefix_hit + totals[bi] - PREFIX_TAIL) - slot_of[bi].prefix_hit)
+                      if bi in ckpt else totals[bi] - ch) for bi in work}
+        # where each slot parts from a saved prompt -- on the chunk boundary at or before it -- in this call's coordinates
+        cuts = {bi: self._align_down(s.branch) - s.prefix_hit for bi, s in live
+                if bi in work and self._align_down(s.branch) > s.prefix_hit}
         for bi, c in cuts.items():
             heads[bi] = max(heads[bi], c)
         t0 = time.time()
@@ -4051,12 +4229,13 @@ class ContinuousBatchEngine:
                     take = min(ch, heads[bi] - done[bi])
                     if done[bi] < cuts.get(bi, 0):
                         take = min(take, cuts[bi] - done[bi])
+                    take = self._grid_take(self._slot_len(bi), take)
                     seqs[rows[bi]] = work[bi][0, done[bi]:done[bi] + take].tolist()
             hist = [self._slot_len(bi) for bi, _ in live]
             for (bi, sl), h in zip(live, hist):
                 sl._history_len = h
             _pp = None
-            if _PROFILE_PREFILL[0] > 0:
+            if _PROFILE_PREFILL[0] > 0 and max(hist) >= _PROFILE_PREFILL_FROM:
                 _PROFILE_PREFILL[0] -= 1
                 _pp = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                          torch.profiler.ProfilerActivity.CUDA])
@@ -4088,19 +4267,22 @@ class ContinuousBatchEngine:
                       + _pp.key_averages().table(sort_by="cuda_time_total", row_limit=25),
                       file=sys.__stdout__, flush=True)
             for bi in work:
-                done[bi] += len(seqs[rows[bi]])
+                took = len(seqs[rows[bi]])
+                done[bi] += took
+                sl = dict(live)[bi]
+                n_now = self._slot_len(bi)
+                # only a slot that ADVANCED onto the grid in this round: one that took nothing (finished, waiting) while
+                # others still prefill would otherwise be rounded again on every later round
+                on_grid = took > 0 and self._ckpt_every > 0 and n_now % self._ckpt_every == 0
+                packed = self._grid_round(bi) if on_grid else None      # every run rounds here, saved or not
                 if cuts.get(bi) == done[bi]:
-                    self._save_prefix(bi, dict(live)[bi], branch=True)
-                elif done[bi] < heads[bi] and dict(live)[bi].prompt_ids is not None:
-                    # A chunk boundary of a long prefill: if a later prompt rewrites something inside
-                    # this prompt (an agent client replacing an old tool result), the nearest boundary
-                    # before the rewrite is where it can restore, instead of prefilling from token 0.
-                    # (At most one per --prefill-chunk tokens: interleaved chunks are smaller.)
-                    sl = dict(live)[bi]
-                    n_now = self._slot_len(bi)
-                    if n_now - getattr(sl, "_ckpt_at", 0) >= self.prefill_chunk:
-                        sl._ckpt_at = n_now
-                        self._save_prefix(bi, sl, branch=True)
+                    self._save_prefix(bi, sl, branch=True,
+                                      state=self._export_state(bi, packed) if on_grid else None)
+                elif on_grid and done[bi] < heads[bi] and sl.prompt_ids is not None:
+                    # A grid position inside a long prefill: if a later prompt rewrites something after it (an
+                    # agent client replacing an old tool result), this is where it can restore.
+                    sl._ckpt_at = n_now
+                    self._save_prefix(bi, sl, branch=True, state=self._export_state(bi, packed))
             now = time.time()
             if now - last_print >= 2.0:
                 tot_done = sum(done.values())
@@ -4192,6 +4374,9 @@ class ContinuousBatchEngine:
             from qv_band.kv import banded_cache as _bc
             gib = 2.0 ** 30
             store = _bytes_of([e["state"] for e in self._prefix_store], set()) / gib
+            if self._shared is not None:
+                st = self._shared.stats()
+                store, self._prefix_store_n = st["used_bytes"] / gib, st["entries"]
             pl = getattr(self.model, "_qv_placement", None)
             cards = sorted({torch.device(d).index for d in pl.devices}) if pl is not None else None
             if cards and len(cards) > 1:              # pipeline placement: every card, not just the current one
@@ -4203,7 +4388,8 @@ class ContinuousBatchEngine:
                         f"{torch.cuda.memory_reserved() / gib:.1f}G reserved ")
             mem = (vram +
                    f"(dense kv views {_bc._GLOBAL_SM_BYTES / gib:.2f}G joined {_bc._GLOBAL_JOINED_BYTES / gib:.2f}G "
-                   f"prefix store {store:.2f}G x{len(self._prefix_store)})")
+                   f"prefix store {store:.2f}G x{getattr(self, '_prefix_store_n', None) or len(self._prefix_store)}"
+                   + (" shared)" if self._shared is not None else ")"))
         except Exception:
             pass                                # reporting must never break generation
         timing = (f", per step ms: draft {1e3 * ph[0] / ph[4]:.0f} prep {1e3 * ph[1] / ph[4]:.0f} "
@@ -4261,7 +4447,12 @@ class ContinuousBatchEngine:
         whole point of continuous batching over a round model.
         """
         from qv_band.kv.banded_cache import BandedKVCache, KV_DEFAULT_TAU
-        device = ids.device
+        # The engine's home is the MODEL's (the pipeline's main card), not whatever device the request thread put the
+        # ids on: a bare .to("cuda") there is that thread's current device, cuda:0 (github issue #1).
+        from qv_band.run.placement import home_device
+        device = home_device(self.model) or ids.device
+        if ids.device != device:
+            ids = ids.to(device)
         self._device = device
         drafter = self.drafter_factory() if self.drafter_factory else None
         if (drafter is not None and MTP_CTX_WINDOW > 0
@@ -4343,7 +4534,7 @@ class ContinuousBatchEngine:
         slot.prompt_ids = prompt = ids[0].tolist()
         best = None
         branch, closest = 0, (0, None)
-        for e in self._prefix_store:
+        for e in (self._shared.entries() if self._shared is not None else self._prefix_store):
             n = len(e["tokens"])
             if n < n_ids and (best is None or n > len(best["tokens"])) and prompt[:n] == e["tokens"]:
                 best = e
@@ -4370,15 +4561,26 @@ class ContinuousBatchEngine:
         dr = slot.drafter
         if dr is not None and not hasattr(dr, "import_state") and type(dr).__name__ != "NGramDrafter":
             return
-        if not self._import_state(bi, best["state"]):
+        if self._shared is not None:           # views of the machine's pool, leased until this request leaves
+            got = self._shared.get(best["key"], self._device, getattr(self.model, "dtype", None))
+            if got is None:
+                return                         # evicted since the lookup
+            best = dict(best, state=got[0], drafter=got[1])
+            slot.shared_leases = got[2]
+        if not self._import_state(bi, best["state"], best["tokens"] if self._shared is not None else None):
+            if self._shared is not None:
+                self._shared.release(slot.shared_leases)
+                slot.shared_leases = None
             return
+        _release_cached_blocks()
         if dr is not None and best["drafter"] is not None:
-            dr.import_state(best["drafter"])
+            dr.import_state(_tensors_to(best["drafter"], getattr(dr, "device", None) or self._device))   # the drafter lives on the main card
         n = len(best["tokens"])
         self._pending_prompts[bi] = ids[:, n:]
         slot.prefix_hit = slot._history_len = slot._ckpt_at = n   # next chunk checkpoint counts from here
-        self._prefix_store.remove(best)
-        self._prefix_store.insert(0, best)
+        if self._shared is None:
+            self._prefix_store.remove(best)
+            self._prefix_store.insert(0, best)
         print(f"[prefix] req #{slot.req_id}: restored {n} of {n_ids} prompt tokens, "
               f"prefilling {n_ids - n}", file=sys.__stdout__, flush=True)
 
@@ -4398,6 +4600,33 @@ class ContinuousBatchEngine:
         if state is None:
             return
         tokens = slot.prompt_ids[:n]
+        if self._shared is not None:           # the machine's pool: copied once, evicted by bytes (least recently used)
+            remote = getattr(state, "remote", ())
+            if len(remote) != len(self._stages):
+                return
+            # A split model: each stage keeps its layers in ITS machine's pool. All or nothing: when a later stage or
+            # this machine cannot keep its part, the stages that already did are told to drop theirs (before
+            # 2026-11-14 such a part stayed in the stage's pool, useless, until evicted).
+            kept, ok = [], False
+            try:
+                for st, sid in remote:
+                    if not st.persist(sid, tokens, branch):
+                        break
+                    kept.append(st)
+                else:
+                    ok = bool(self._shared.put(tokens, state, _tensors_to(dr.export_state(), "host")
+                                               if hasattr(dr, "export_state") else None, branch,
+                                               getattr(self.model, "dtype", None)))
+            finally:
+                if not ok:
+                    for st in kept:
+                        try:
+                            st.forget(tokens)
+                        except Exception:      # noqa: BLE001 - the stage is gone: its pool goes with its restart
+                            pass
+            if ok:
+                self._adopt_pool_copies(bi, slot)
+            return
         # the same conversation moving forward supersedes its earlier prefix
         # (a branch point is not superseded: other prompts that part from this one there need it)
         self._prefix_store = [e for e in self._prefix_store
@@ -4405,12 +4634,66 @@ class ContinuousBatchEngine:
         if any(e["tokens"] == tokens for e in self._prefix_store):
             return
         self._prefix_store.insert(0, {"tokens": tokens, "state": state, "branch": branch,
-                                      "drafter": dr.export_state() if hasattr(dr, "export_state") else None})
+                                      "drafter": _tensors_to(dr.export_state(), "host")
+                                      if hasattr(dr, "export_state") else None})
         self._trim_prefix_store()
 
-    def _export_state(self, bi: int):
+    def _adopt_pool_copies(self, bi: int, slot: "_BatchSlot") -> None:
+        """After a checkpoint went into the machine's pool: point slot `bi`'s KV segments at the pool's copy (same bytes)
+        and drop the private one, so the request's older KV is in host RAM once. The blobs stay leased by the slot until
+        it leaves (_drop)."""
+        from qv_band.kv.banded_cache import BandedKVLayer
+        layers = [l for l in self.past.layers if isinstance(l, BandedKVLayer)]
+        bks = [bk for l in layers if bi < len(l._banded_k)
+               for seg in (l._banded_k[bi] + l._banded_v[bi]) for bk in seg]
+        if not bks:
+            return
+        for l in layers:                       # copies to host still in flight would overwrite the view when they land
+            if bi < len(l._host_tiers) and l._host_tiers[bi] is not None:
+                l._host_tiers[bi].finish()
+        bks = [bk for bk in bks if not bk.packed.is_cuda]     # only host copies: the GPU window stays where it is read
+        pairs, new = self._shared.adopt(bks, slot.shared_leases or ())
+        for bk, view in pairs:
+            bk.packed = view
+        if new:
+            slot.shared_leases = list(slot.shared_leases or ()) + new
+        _release_cached_blocks()
+
+    def _grid_round(self, bi: int, layers=None) -> dict:
+        """A grid position of slot `bi` (PREFIX_CKPT_EVERY): with a qvb8 KV cache, round the recurrent state of the
+        linear-attention layers (all, or `layers`) to qvb8 at the KV cache's tau, in place; -> {layer index: packed}."""
+        from qv_band.kv.banded_cache import BandedKVCache
+        tau = self._state_tau
+        if not tau or not isinstance(self.past, BandedKVCache):
+            return {}
+        out = {}
+        for li in (layers if layers is not None else range(len(self.past.layers))):
+            p = _round_layer_slot(self.past.layers[li], bi, tau)
+            if p is not None:
+                out[li] = p
+        if out:
+            print(f"[prefix] slot {bi} at {self._slot_len(bi)}: state of {len(out)} layers rounded (tau {tau:g}, "
+                  f"{sum(p.escaped for p in out.values())} heads escaped)", file=sys.__stdout__, flush=True)
+        return out
+
+    def _grid_take(self, cur: int, take: int) -> int:
+        """Chunk boundaries at FIXED absolute positions (multiples of --prefill-chunk from token 0, the checkpoint grid
+        included): the chunked linear-attention and attention kernels sum in chunk order, so a different split of the
+        same tokens gives different fp32 rounding. Aligned, a prefill restored from any checkpoint computes exactly what
+        an uncached run computes (2026-11-12: a cut at a cached prompt's divergence point made the first chunk after a
+        restore 628 tokens instead of 1024 and the answer differ). Holds for the same load: while other requests
+        decode, chunks are smaller (INTERLEAVE_CHUNK) and the split differs from an idle run."""
+        a = self.prefill_chunk
+        return min(take, a - cur % a) if a > 0 else take
+
+    def _align_down(self, pos: int) -> int:
+        """The chunk boundary at or before absolute position `pos`."""
+        a = self.prefill_chunk
+        return (pos // a) * a if a > 0 else pos
+
+    def _export_state(self, bi: int, packed=None):
         """Slot `bi` of every cache layer, here and on every stage; None if some layer cannot be exported."""
-        state = _export_slot_state(self.past, bi)
+        state = _export_slot_state(self.past, bi, packed)
         if state is None or not self._stages:
             return state
         from qv_band.decode.remote_stage import StagedState
@@ -4422,8 +4705,22 @@ class ContinuousBatchEngine:
             state.remote += ((st, sid),)
         return state
 
-    def _import_state(self, bi: int, state) -> bool:
-        """Write a saved slot into the empty slot `bi`, here and on every stage. All-or-nothing."""
+    def _import_state(self, bi: int, state, tokens=None) -> bool:
+        """Write a saved slot into the empty slot `bi`, here and on every stage. All-or-nothing. tokens: the prefix's
+        token ids with --prefix-store shared -- each stage then loads its layers from its own machine's pool."""
+        if tokens is not None and self._stages:
+            # every stage is asked first: the pools evict independently, and a chain of two or more stages whose first
+            # stage restored and whose second no longer held its part failed the request instead of prefilling
+            if len(self._stages) > 1 and not all(st.has(tokens) for st in self._stages):
+                return False
+            for n, st in enumerate(self._stages):
+                if not st.restore(bi, tokens):
+                    if n:
+                        raise RuntimeError("slot restore: accepted by one stage and refused by another")
+                    return False               # the stage's pool no longer holds its part: prefill in full
+            if not _import_slot_state(self.past, bi, state):
+                raise RuntimeError("slot restore: accepted by the stages and refused by the main machine")
+            return True
         remote = getattr(state, "remote", ())
         if len(remote) != len(self._stages):
             return False
@@ -4457,6 +4754,9 @@ class ContinuousBatchEngine:
             self.finished[key] = (finished_slot.req_id, finished_slot.out_ids,
                                   finished_slot.stats)
         self.past.drop_slot(bi)
+        if finished_slot is not None and getattr(finished_slot, "shared_leases", None):
+            self._shared.release(finished_slot.shared_leases)     # its restored prefix may be evicted again
+            finished_slot.shared_leases = None
         # Mirror of add_request's grow: only shrink the linear-attention
         # batch axis once it exists (see _linear_attention_state_ready).
         if _linear_attention_state_ready(self.past):
@@ -4470,6 +4770,8 @@ class ContinuousBatchEngine:
         self._pending_prompts = {
             (k - 1 if k > bi else k): v for k, v in self._pending_prompts.items() if k != bi
         }
+        _release_cached_blocks()
+
     @torch.no_grad()
     def step(self) -> list[tuple[int, list[int]]]:
         """Run ONE decode iteration over every live slot.
@@ -4501,7 +4803,8 @@ class ContinuousBatchEngine:
         # contributes its whole prompt, a running slot contributes
         # [last_token] + its own draft.
         _prof = None
-        if _PROFILE_STEPS[0] > 0 and not any(s.just_admitted for _, s in live):
+        if (_PROFILE_STEPS[0] > 0 and not any(s.just_admitted for _, s in live)
+                and not getattr(self, "_prefilling", ())):      # decode steps only, not a long prompt's prefill chunks
             # QV_BAND_PROFILE_STEPS=N: profile N decode steps (draft + verify forward), print, then off
             _PROFILE_STEPS[0] -= 1
             _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,

@@ -347,9 +347,11 @@ _RESERVE = int(_os.environ.get("QV_KV_GPU_RESERVE_MB", "2048")) << 20
 
 
 def _vram_room(dev, nbytes: int) -> bool:
-    """True if allocating nbytes more on dev still leaves _RESERVE free (counting the allocator's cached blocks)."""
+    """True if allocating nbytes more on dev still leaves _RESERVE of the card really free. The allocator's cached
+    blocks are NOT counted: without expandable segments (the V100 launchers) they are fragmented -- 2.47 GB cached
+    on a V100 could not give one 170 MB block, so this check kept saying "room" and the next prefill chunk ran out of
+    memory instead of the layer spilling its oldest KV to host RAM (2026-11-12, 27B two cards, 78k-89k token prompts)."""
     free, _ = torch.cuda.mem_get_info(dev)
-    free += torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
     return free - nbytes >= _RESERVE
 _COLD_BLOCK = int(_os.environ.get("QV_KV_COLD_BLOCK", "4096") or 4096)
 _GROW_TOK = 4096       # spare rows when an id buffer / high-byte pool grows
@@ -404,15 +406,52 @@ def _mk_lay(ki, vi, P, C, ns, tt, hk=None, hv=None):
     return lay
 
 
-_STAGE = {}       # (device, dtype) -> (copy stream, 2 k slots, 2 v slots)
+_STAGE = {}       # (device, dtype) -> (copy stream, 2 k slots, 2 v slots, 2 k / 2 v low-byte slots)
 
 
 def _staging(dev, dt, h, d):
     key = (str(dev), dt, h, d)            # the buffers' shape is (COLD_BLOCK, h, d): part of the key
     if key not in _STAGE:
-        mk = lambda: [torch.empty(_COLD_BLOCK, h, d, dtype=dt, device=dev) for _ in range(2)]
-        _STAGE[key] = (torch.cuda.Stream(device=dev), mk(), mk())
+        mk = lambda t: [torch.empty(_COLD_BLOCK, h, d, dtype=t, device=dev) for _ in range(2)]
+        lo = (mk(torch.uint8), mk(torch.uint8)) if dt == torch.int16 else (None, None)
+        _STAGE[key] = (torch.cuda.Stream(device=dev), mk(dt), mk(dt)) + lo
     return _STAGE[key]
+
+
+class CompactIds:
+    """A cold block's 2-byte ids (a widened layer on the sm_70 CUDA kernel) kept as 1 byte per id plus the high byte of
+    only the (row, head) pairs that have one: host RAM and the per-step PCIe copy about halve (2026-11-13: 27B on one
+    V100, 166k tokens, the 2-byte cold blocks were ~2x the packed KV). Rebuilt into the int16 staging slot on the GPU:
+    the same values as the int16 block (low | high << 8, the uint16 bit pattern)."""
+    __slots__ = ("lo", "idx", "hi")
+
+    def __init__(self, ids16: torch.Tensor):
+        """ids16: (B, h, d) int16 on the card."""
+        b, h, d = ids16.shape
+        u = ids16.to(torch.int32) & 0xFFFF
+        hi = (u >> 8).to(torch.uint8).reshape(b * h, d)
+        rows = torch.nonzero(hi.any(dim=1)).flatten()
+        self.lo = torch.empty((b, h, d), dtype=torch.uint8, pin_memory=True)
+        self.lo.copy_((u & 0xFF).to(torch.uint8))
+        self.idx = torch.empty(rows.shape, dtype=torch.int64, pin_memory=True)
+        self.idx.copy_(rows)
+        self.hi = torch.empty((rows.numel(), d), dtype=torch.uint8, pin_memory=True)
+        if rows.numel():
+            self.hi.copy_(hi.index_select(0, rows))
+
+    def nbytes(self) -> int:
+        return self.lo.numel() + self.idx.numel() * 8 + self.hi.numel()
+
+    def fill(self, dst16: torch.Tensor, lo_slot: torch.Tensor) -> None:
+        """dst16 (B, h, d) int16 on the card <- this block (on the current stream; copies non-blocking)."""
+        lo_slot.copy_(self.lo, non_blocking=True)
+        dst16.copy_(lo_slot)                                       # uint8 -> int16: 0..255
+        if self.idx.numel():
+            d = dst16.shape[-1]
+            flat = dst16.view(-1, d)
+            idx = self.idx.to(dst16.device, non_blocking=True)
+            hi = self.hi.to(dst16.device, non_blocking=True).to(torch.int32) << 8
+            flat.index_copy_(0, idx, (flat.index_select(0, idx).to(torch.int32) | hi).to(torch.int16))
 
 
 class FusedKV:
@@ -425,7 +464,16 @@ class FusedKV:
         self.cap = 0
         self.base = 0
         self.valid = 0
-        self.cold = []                # (a, b, host k, host v, tile table) blocks below base
+        self.cold = []                # [a, b, host k, host v, tile table, remote] blocks below base
+        # QV_KV_REMOTE: old blocks also go to a KV host (kv/remote_cold.py), which computes their attention; once it
+        # holds a block the local copy is dropped (remote = "remote"); until then it is used locally ("pending")
+        from .remote_cold import client_from_env
+        self.remote = client_from_env()
+        self.sid = None
+        import collections
+        self._landed = collections.deque()   # (block start, ok) from the shipping thread, applied on the main thread
+        if self.remote is not None:
+            self._new_session()
         self.P = None                 # kmid, kstep, vmid, vstep : (cap_seg, H, D)
         self.C = None                 # kc, vc : (cap_seg, H) id centres
         self.cap_seg = 0
@@ -442,6 +490,29 @@ class FusedKV:
         self.hrow = []                # per segment: None, or (K rows, V rows) per head of its first pool row (-1 = 8 bit)
         self.hmark = []               # per segment: hused before it (a rewrite from segment m frees everything after)
 
+    def _new_session(self):
+        import uuid
+        import weakref
+        if self.sid is not None:
+            self.remote.free(self.sid)
+            self._fin.detach()
+        self.sid = uuid.uuid4().hex
+        self._fin = weakref.finalize(self, self.remote.free, self.sid)       # the layer's state goes: free its blocks
+
+    def _apply_landed(self):
+        """Blocks the KV host now holds: drop their local copies (main thread only)."""
+        done = {}
+        while self._landed:                   # popleft: an append racing with this loop is never lost
+            a, good = self._landed.popleft()
+            done[a] = good
+        for c in self.cold:
+            if c[5] == "pending" and c[0] in done:
+                if done[c[0]]:
+                    c[2] = c[3] = None
+                    c[5] = "remote"
+                else:
+                    c[5] = None               # shipping failed: stays local
+
     def _grow(self, need_tok, need_seg, h, d, dev, seg_len=0):
         """need_tok: window length (from base) that must fit. seg_len: the segment being appended (a prefill chunk): the
         id buffer needs GPU window + cold block + that many spare rows before eviction can make room for it."""
@@ -452,6 +523,12 @@ class FusedKV:
             if self.win:
                 cap = max(need_tok, min(cap, self.win + _COLD_BLOCK + seg_len))
             dt = self.ki.dtype if self.ki is not None else torch.uint8
+            spare = need_tok + max(seg_len, 256)
+            if cap > spare and not _vram_room(dev, 2 * cap * h * d * max(2, torch.empty((), dtype=dt).element_size())):
+                # a full card: no spare rows beyond this chunk. 27B on one 16 GB V100, a 10.7k-token prompt: the 4096
+                # spare rows (x 16 layers x K,V x 2-byte ids = 268 MB) were what the next MLP chunk could not get
+                # (2026-11-13: fresh prompt after a restore, out of memory at 4-6k tokens).
+                cap = spare
             ki = torch.empty(cap, h, d, dtype=dt, device=dev)
             vi = torch.empty_like(ki)
             n = self.valid - self.base
@@ -488,21 +565,35 @@ class FusedKV:
         """Switch the id buffers to 2 bytes (int16 holding uint16 bit patterns)."""
         self.ki = self.ki.to(torch.int16).bitwise_and_(0xFF)
         self.vi = self.vi.to(torch.int16).bitwise_and_(0xFF)
-        self.cold = [(a, b, hk.to(torch.int16).pin_memory(), hv.to(torch.int16).pin_memory(), tt)
-                     for a, b, hk, hv, tt in self.cold]
+        # cold blocks so far hold 1-byte ids: as compact blocks with no high bytes they need no conversion
+        for c in self.cold:
+            if c[2] is not None and not isinstance(c[2], CompactIds):
+                c[2] = CompactIds(c[2].to(self.ki.device).to(torch.int16))
+                c[3] = CompactIds(c[3].to(self.vi.device).to(torch.int16))
         print(f"[fused_attn] a head needs > 8 bits: this layer's ids widened to 16 bit", flush=True)
 
-    def _evict(self, lens, dev):
+    def _evict(self, lens, dev, sk=None, sv=None):
         """Move the oldest window blocks to pinned host RAM."""
         while self.win and self.valid - self.base > self.win + _COLD_BLOCK:
             B = _COLD_BLOCK
-            hk = torch.empty((B,) + tuple(self.ki.shape[1:]), dtype=self.ki.dtype, pin_memory=True)
-            hv = torch.empty_like(hk, pin_memory=True)
-            hk.copy_(self.ki[:B])
-            hv.copy_(self.vi[:B])
+            if self.ki.dtype == torch.int16:          # 2-byte ids: 1 byte + the high bytes that exist (CompactIds)
+                hk, hv = CompactIds(self.ki[:B]), CompactIds(self.vi[:B])
+            else:
+                hk = torch.empty((B,) + tuple(self.ki.shape[1:]), dtype=self.ki.dtype, pin_memory=True)
+                hv = torch.empty_like(hk, pin_memory=True)
+                hk.copy_(self.ki[:B])
+                hv.copy_(self.vi[:B])
             a = self.base
-            self.cold.append((a, a + B, hk, hv, _tile_table(lens, a, a + B, dev, hrow=self.hrow if self.hipool else None,
-                                                            nh=self.ki.shape[1])))
+            entry = [a, a + B, hk, hv, _tile_table(lens, a, a + B, dev, hrow=self.hrow if self.hipool else None,
+                                                   nh=self.ki.shape[1]), None]
+            if self.remote is not None and sk is not None:
+                from .remote_cold import build_block
+                entry[5] = "pending"
+                from .remote_cold import landed_callback
+                self.remote.ship(self.sid, a, a + B, build_block(sk, sv, lens, a, a + B, dev),
+                                 landed_callback(self, lambda fk, ok, a=a, sid=self.sid:
+                                                 sid == fk.sid and fk._landed.append((a, ok))))
+            self.cold.append(entry)
             n = self.valid - a - B
             self.ki[:n] = self.ki[B:B + n].clone()
             self.vi[:n] = self.vi[B:B + n].clone()
@@ -527,6 +618,8 @@ class FusedKV:
         pos = sum(lens[:m])
         if pos < self.base:                 # history rewritten inside the host tier
             self.cold, self.base, m, pos = [], 0, 0, 0
+            if self.remote is not None:
+                self._new_session()           # the host's blocks of the old history are dropped
         if m < len(self.hmark):             # segments from m on are rewritten: free their high-byte rows
             self.hused = list(self.hmark[m])
         del self.hmark[m:], self.hrow[m:]
@@ -542,7 +635,7 @@ class FusedKV:
                 if not _vram_room(dev, 2 * grow_to * h * d * self.ki.element_size()):
                     # VRAM limit reached: keep this layer's buffer as it is and spill its oldest blocks from now on
                     self.win = self.cap - sl - _COLD_BLOCK
-                    self._evict(lens, dev)
+                    self._evict(lens, dev, sk, sv)
                     print(f"[fused_attn] VRAM limit at {pos} tokens: this layer now keeps the newest {self.win} on "
                           f"{dev}, older KV in host RAM", flush=True)
                     need = pos + sl - self.base
@@ -574,7 +667,7 @@ class FusedKV:
             self.hrow.append(rows if max(rows[0] + rows[1]) >= 0 else None)
             pos += sl
             self.valid = pos
-            self._evict(lens, dev)
+            self._evict(lens, dev, sk, sv)
         if cvals:
             from qv_band.common.xfer import h2d_small
             rows = h2d_small(torch.tensor([cv[1] + cv[2] for cv in cvals], dtype=torch.float32), dev)
@@ -590,12 +683,31 @@ class FusedKV:
         return self.lay
 
     def attend_cold(self, q, q_pos0, scale):
-        """(o, lse) over the host tier, streamed block by block; None if empty."""
+        """(o, lse) over the host tier, streamed block by block (and the KV host's part, asked for in parallel); None if
+        empty."""
         if not self.cold:
             return None
+        self._apply_landed()
+        fut = None
+        if any(c[5] == "remote" for c in self.cold):
+            # the queries go out; the host answers (o, lse) over its blocks. A 16-bit model sends fp16 (bf16 -> fp16 is
+            # exact inside fp16's range, which normalised queries are in) and gets o back in fp16: half the bytes
+            qw = q.clamp(-65504.0, 65504.0).to(torch.float16) if q.dtype in (torch.float16, torch.bfloat16) else q.float()
+            qn = qw.cpu().numpy()
+            fut = _remote_pool().submit(self.remote.attend, self.sid, qn, q_pos0, scale)
+        local = [c for c in self.cold if c[5] != "remote"]
+        res = self._attend_local(local, q, q_pos0, scale) if local else None
+        if fut is not None:
+            o_np, l_np = fut.result()
+            o2 = torch.from_numpy(o_np).to(q.device).float()
+            l2 = torch.from_numpy(l_np).to(q.device).float()
+            res = (o2, l2) if res is None else _merge_lse(res[0], res[1], o2, l2)
+        return res
+
+    def _attend_local(self, cold, q, q_pos0, scale):
         dev, dt = q.device, self.ki.dtype
         h, d = self.ki.shape[1], self.ki.shape[2]
-        cs, sk, sv = _staging(dev, dt, h, d)
+        cs, sk, sv, lk, lv = _staging(dev, dt, h, d)
         main = torch.cuda.current_stream(dev)
         ns = self.lay.kmin.shape[0]
         ready = [torch.cuda.Event(), torch.cuda.Event()]
@@ -606,25 +718,64 @@ class FusedKV:
             if done[s] is not None:
                 cs.wait_event(done[s])
             with torch.cuda.stream(cs):
-                sk[s].copy_(self.cold[j][2], non_blocking=True)
-                sv[s].copy_(self.cold[j][3], non_blocking=True)
+                ck, cv = cold[j][2], cold[j][3]
+                if isinstance(ck, CompactIds):
+                    ck.fill(sk[s], lk[s])
+                    cv.fill(sv[s], lv[s])
+                else:
+                    sk[s].copy_(ck, non_blocking=True)
+                    sv[s].copy_(cv, non_blocking=True)
                 ready[s].record(cs)
 
         cs.wait_stream(main)                  # staging free of the previous call
         issue(0)
-        if len(self.cold) > 1:
+        if len(cold) > 1:
             issue(1)
-        o = lse = None
-        for j, (a, b, _, _, tt) in enumerate(self.cold):
+        # every block's (o, lse) is kept and merged ONCE at the end: a pairwise merge per block was ~14 small kernels
+        # each, ~600 per layer per decode step at 94k tokens -- the V100 host could not launch them fast enough
+        # (profile 2026-11-12: one card, 18k launches per step, GPU idle ~75 %)
+        outs, lses = [], []
+        for j, (a, b, _, _, tt, _r) in enumerate(cold):
             s = j % 2
             main.wait_event(ready[s])
             o2, l2 = attend(q, _mk_lay(sk[s], sv[s], self.P, self.C, ns, tt, self.hk, self.hv), q_pos0 - a, scale)
-            o, lse = (o2, l2) if o is None else _merge_lse(o, lse, o2, l2)
+            outs.append(o2)
+            lses.append(l2)
+            if len(outs) > 1 and len(outs) * o2.numel() * o2.element_size() > _MERGE_BYTES:
+                # a prefill chunk's per-block results are large (1024 query rows): collapse them so memory stays
+                # bounded; a decode step's (a few rows) never gets here, it keeps the one-shot merge
+                o1, l1 = _merge_lse_all(torch.stack(outs), torch.stack(lses))
+                outs, lses = [o1], [l1]
             done[s] = torch.cuda.Event()
             done[s].record(main)
-            if j + 2 < len(self.cold):
+            if j + 2 < len(cold):
                 issue(j + 2)
-        return o, lse
+        if len(outs) == 1:
+            return outs[0], lses[0]
+        return _merge_lse_all(torch.stack(outs), torch.stack(lses))
+
+
+_MERGE_BYTES = 64 << 20       # attend_cold: collected block results above this are merged early
+_REMOTE_POOL = []             # threads that wait for the KV host while the local blocks are attended
+
+
+def _remote_pool():
+    if not _REMOTE_POOL:
+        import concurrent.futures as cf
+        _REMOTE_POOL.append(cf.ThreadPoolExecutor(4, thread_name_prefix="kv-host-attend"))
+    return _REMOTE_POOL[0]
+
+
+def _merge_lse_all(o, lse):
+    """_merge_lse over a stack of n partial results at once: o (n, ..., D), lse (n, ...). Same algebra (log-sum-exp
+    weights), a fixed number of kernels whatever n is."""
+    m = lse.max(dim=0).values
+    m = torch.where(torch.isinf(m), torch.zeros_like(m), m)
+    w = torch.exp(lse - m)
+    den = w.sum(dim=0)
+    out = (o * w[..., None]).sum(dim=0) / den.clamp_min(1e-30)[..., None]
+    lse_out = torch.where(den > 0, m + torch.log(den.clamp_min(1e-30)), torch.full_like(den, float("-inf")))
+    return out, lse_out
 
 
 def _merge_lse(o1, lse1, o2, lse2):

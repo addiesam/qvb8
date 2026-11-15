@@ -96,7 +96,7 @@ class ModelAdapter:
 # -- registry ------------------------------------------------------------------------------------------
 _REGISTRY: list[ModelAdapter] = []
 _ENTRY_POINTS_LOADED = False
-_IN_TREE = ("ripple",)              # imported lazily so the engine never imports models at load time
+_IN_TREE = ("ripple", "qwen", "nemotron")              # imported lazily so the engine never imports models at load time
 
 
 def register(adapter: ModelAdapter) -> ModelAdapter:

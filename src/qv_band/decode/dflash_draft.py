@@ -34,8 +34,8 @@ temperature > 0 propose() returns the selector's real proposal distribution
 `returns_probs`, so spec_decode uses it as p_draft directly instead of
 re-deriving one from logits.
 
-    ./inference_qvb8.sh /mnt/data/models/Qwen3.8-27B_qvb8_1e-3_bf16 \\
-        --draft-model /mnt/data/models_raw/incoai/Qwen3.8-27B-DFlash2
+    ./inference_qvb8.sh ./models/Qwen3.8-27B_qvb8_1e-3_bf16 \\
+        --draft-model ./models/Qwen3.8-27B-DFlash2
 
 Measured on the dev GPU (one prompt each, 256 tokens, greedy; identical output to
 plain decoding on the bf16 packs):
@@ -151,7 +151,12 @@ class DFlashDrafter:
                              f"(architectures={archs})")
         self.embed = embed
         self.lm_head = lm_head
-        self.device = torch.device(device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            # a bare "cuda" is the CALLING thread's current device: the weights load on the main card (current at
+            # build time), a later .to(self.device) on the scheduler thread meant cuda:0 (github issue #1)
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
         self.dtype = dtype
         self.H = cfg["hidden_size"]
         self.n_heads = cfg["num_attention_heads"]
@@ -673,15 +678,14 @@ class NGramWithDFlashDrafter:
 
 
 # Where find_dflash_draft looks; QV_BAND_DRAFT_ROOTS (":"-separated) overrides.
-# /mnt/backup/models holds the raw HF checkpoints that were moved off the
+# ./models holds the raw HF checkpoints that were moved off the
 # boot disk -- without it a moved model silently loses its drafter.
-DRAFT_ROOTS = ("/mnt/data/models_raw", "/mnt/data/models",
-               "/mnt/backup/models", "/mnt/backup/models_raw")
+DRAFT_ROOTS = ("./models",)
 
 
 def target_name(model_dir: str) -> str:
     """The checkpoint name a drafter is published under, e.g.
-    "Qwen3.8-27B" for the pack /mnt/data/models/Qwen3.8-27B_qvb8_1e-3_bf16:
+    "Qwen3.8-27B" for the pack ./models/Qwen3.8-27B_qvb8_1e-3_bf16:
     the basename of the pack manifest's hf_model, else of `model_dir`
     itself with any "_qvb..." suffix removed."""
     man = os.path.join(model_dir, "manifest.json")
@@ -720,7 +724,7 @@ def find_dflash_pack_for(draft_dir: str, roots=None) -> str | None:
 
     The counterpart of find_dflash_draft for the explicit-checkpoint flow:
     `draft_dir` is the dense DFlash directory itself (e.g.
-    /mnt/backup/models/incoai/Qwen3.8-27B-DFlash2), and the pack is published
+    ./models/Qwen3.8-27B-DFlash2), and the pack is published
     beside it as "<basename>_qvb8_*" (possibly one organisation level down,
     like the dense drafter itself). The drafter's own basename is used, so a
     drafter that is not the target's default sibling is packed correctly too.
@@ -811,7 +815,10 @@ def build_dflash_drafter(model, draft_dir: str, device: str = "cuda",
     if cfg.get("no_rope_layers"):                                     # DFlash2 with NoPE layers
         from qv_band.decode.dflash_nope_draft import build_nope_drafter
         return build_nope_drafter(model, draft_dir, device=device, pack_dir=pack_dir)
-    if "LiLiCorrDraftModel" in (cfg.get("architectures") or []):      # LiLiCorr drafter
+    if (cfg.get("dflash_config") or {}).get("selected_prefix_code_bridge"):     # DSpine drafter (code bridge)
+        from qv_band.decode.dspine_draft import DSpineDrafter
+        cls = DSpineDrafter
+    elif "LiLiCorrDraftModel" in (cfg.get("architectures") or []):      # LiLiCorr drafter
         from qv_band.decode.lilicorr_draft import LiLiCorrDrafter
         cls = LiLiCorrDrafter
     else:
@@ -827,7 +834,7 @@ def build_dflash_drafter(model, draft_dir: str, device: str = "cuda",
     if cfg.get("vocab_size") not in (None, model.config.vocab_size):
         raise ValueError(f"vocab mismatch: draft {cfg.get('vocab_size')} vs "
                          f"target {model.config.vocab_size}")
-    print(f"{'LiLiCorr' if d.version == 3 else 'DFlash%d' % d.version} drafter: {d.param_bytes/1e9:.2f} GB on {device}, block "
+    print(f"{ {3: 'LiLiCorr', 4: 'DSpine'}.get(d.version, 'DFlash%d' % d.version)} drafter: {d.param_bytes/1e9:.2f} GB on {device}, block "
           f"{d.block_size}, target layers {d.capture_layers}", flush=True)
     return d
 

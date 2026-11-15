@@ -4,7 +4,7 @@ with every model the server serves and from any machine that can reach it.
 
     python -m ai_engine.cli.chat_client                                  interactive, server http://127.0.0.1:8080
     python -m ai_engine.cli.chat_client "Explain entropy" --no-interactive
-    python -m ai_engine.cli.chat_client --url http://host:50808 --no-think --max-tokens 2000
+    python -m ai_engine.cli.chat_client --url http://host:8080 --no-think --max-tokens 2000
 
 In the chat: /reset starts a new conversation, /exit (or Ctrl-D) leaves, Ctrl-C stops the current answer.
 """

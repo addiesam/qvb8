@@ -218,8 +218,11 @@ class QVHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", self._cors_value())
         self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        # Authorization: OpenAI-style clients in a browser send "Authorization: Bearer ..." on every request, and a
+        # preflight that does not list it makes the browser refuse the real request before it is sent. DELETE: the
+        # job routes (DELETE /v1/jobs/<id>, /videos/<name>).
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-QV-Pool-Token")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
         self._end_close()
         self.end_headers()
 

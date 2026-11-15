@@ -88,6 +88,7 @@ def try_causal_bhsd(query, key, value, scale=None):
 
 
 _LLM_INSTALLED = False
+VISION_CHUNK_BYTES = int(os.environ.get("QV_V100_NONCAUSAL_CHUNK_MB", "128")) << 20   # score bytes per non-causal chunk
 
 
 def install_llm_prefill() -> bool:
@@ -116,6 +117,22 @@ def install_llm_prefill() -> bool:
             out = try_causal_bhsd(query, k, v, scaling)
             if out is not None:
                 return out.transpose(1, 2).contiguous(), None
+        if not causal and not dropout and not kw.get("output_attentions") and query.dim() == 4:
+            # Non-causal (the vision tower: one masked block per image). The V100 has no flash kernel, so sdpa builds the
+            # whole (heads, q, k) score matrix -- 1 GB for a 1 MP photo, an out-of-memory on a full 16 GB card. Each
+            # query row's softmax is independent: the same call on row chunks gives the same rows at a fraction of it.
+            bh, nq, nk = query.shape[0] * query.shape[1], query.shape[2], key.shape[2]
+            rows = max(1, VISION_CHUNK_BYTES // max(1, bh * nk * 4))
+            if nq > rows:
+                outs = []
+                for r0 in range(0, nq, rows):
+                    m = attention_mask
+                    if m is not None and m.dim() == 4 and m.shape[2] == nq:
+                        m = m[:, :, r0:r0 + rows]
+                    o, _ = base(module, query[:, :, r0:r0 + rows], key, value, m, dropout=dropout, scaling=scaling,
+                                is_causal=False, **kw)
+                    outs.append(o)
+                return torch.cat(outs, dim=1), None
         return base(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, **kw)
 
     AttentionInterface.register("sdpa", sdpa_v100)

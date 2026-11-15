@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# QVB8 in five commands.        ./qvb8 list | get <model> | start <model> | chat | stop | status | log
+#   ./qvb8 get qwen-9b          download the model (and its drafter) into ./models
+#   ./qvb8 start qwen-9b        start the server in the background, port 8080 (PORT=9090 ./qvb8 start qwen-9b)
+#   ./qvb8 chat                 chat in the terminal;  or any OpenAI client: http://localhost:8080/v1
+# Settings (environment): MODELS_DIR (default ./models), PORT (8080), PYTHON (default .venv/bin/python),
+#   ATTN (default sdpa: works on every card; flash_attention_2 is faster on Ampere and newer but needs flash-attn).
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; cd "$ROOT"
+MODELS_DIR="${MODELS_DIR:-$ROOT/models}"
+USER_PYTHON="${PYTHON:-}"
+if [ -z "$USER_PYTHON" ]; then
+  if [ -x .venv/bin/python ]; then PYTHON=.venv/bin/python; else PYTHON=python3; fi
+fi
+export PYTHON PORT="${PORT:-8080}" ATTN="${ATTN:-sdpa}"
+# Limits that suit the card: a small card gets a small batch; a big machine (or a unified-memory one such as the DGX Spark)
+# keeps the launcher defaults. Override with MAX_MEM, MAX_LIVE, MAX_LIVE_TOKENS.
+GPU_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9' || true)
+if [ -n "$GPU_MB" ]; then
+  export MAX_MEM="${MAX_MEM:-$(( GPU_MB / 1024 + 1 ))}"   # a ceiling above the card's size: the card itself is the limit
+  if [ "$GPU_MB" -lt 40000 ]; then export MAX_LIVE="${MAX_LIVE:-2}" MAX_LIVE_TOKENS="${MAX_LIVE_TOKENS:-65536}"; fi
+fi
+
+# name | Hugging Face repo of the model | its drafter repo | tokens drafted per step | download size | GPU memory needed
+preset() {
+  case "$1" in
+    qwen-9b)  MODEL_REPO=Qwen3.5-9B_qvb8_1e-3_fp16;      DRAFT_REPO=Qwen3.5-9B-DFlash_qvb8_1e-3;            DRAFT_K=15; SIZE="9.0 GB"; NEED="16 GB" ;;
+    qwen-27b) MODEL_REPO=Qwen3.8-27B_qvb8r_2e-3_fp16;    DRAFT_REPO=Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16;    DRAFT_K=7;  SIZE="15.1 GB"; NEED="30 GB" ;;
+    *) echo "unknown model '$1'. Run: ./qvb8 list" >&2; exit 1 ;;
+  esac
+}
+need_install() { [ -x .venv/bin/python ] || [ -n "$USER_PYTHON" ] || { echo "Not installed yet. Run ./install.sh first." >&2; exit 1; }; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  list)
+    printf '%-10s %-12s %-14s %s\n' MODEL DOWNLOAD "GPU MEMORY" NOTE
+    printf '%-10s %-12s %-14s %s\n' qwen-9b  "9.0 GB"  "16 GB" "Qwen3.5-9B, fast, good for a first try"
+    printf '%-10s %-12s %-14s %s\n' qwen-27b "15.1 GB" "30 GB" "Qwen3.8-27B, stronger" ;;
+  get)
+    need_install; preset "${1:-}"
+    mkdir -p "$MODELS_DIR"
+    echo "Downloading $1 ($SIZE) into $MODELS_DIR ..."
+    for r in "$MODEL_REPO" "$DRAFT_REPO"; do
+      "$PYTHON" -c "from huggingface_hub import snapshot_download as s; s('addiesam/$r', local_dir='$MODELS_DIR/$r')" \
+        || { echo "Download of addiesam/$r failed. Check the network and run the same command again: it resumes." >&2; exit 1; }
+    done
+    echo "Done. Next:  ./qvb8 start $1" ;;
+  start)
+    need_install; preset "${1:-}"
+    [ -d "$MODELS_DIR/$MODEL_REPO" ] && [ -d "$MODELS_DIR/$DRAFT_REPO" ] || { echo "Model not downloaded. Run: ./qvb8 get $1" >&2; exit 1; }
+    echo "GPU memory needed: about $NEED. The first start takes a few minutes."
+    MODEL="$MODELS_DIR/$MODEL_REPO" DRAFT="$MODELS_DIR/$DRAFT_REPO" DRAFT_K=$DRAFT_K exec scripts/qwen_server.sh start ;;
+  stop|status|log|startup)
+    exec scripts/qwen_server.sh "$cmd" ;;
+  chat)
+    exec scripts/chat.sh "$@" ;;
+  *)
+    sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

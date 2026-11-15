@@ -96,6 +96,10 @@ class RemoteStage:
         self.layers = range(a, b)
         self.link = None
         self._ops: list = []
+        # queue() is also called by StagedState.__del__, on whatever thread the garbage collector runs: without a lock
+        # an action appended while call() swapped the list was lost (a lost "free" leaves an exported state on the
+        # stage's GPU for good). Re-entrant: a collection can start inside the swap on the same thread.
+        self._ops_lock = threading.RLock()
         self._lock = threading.Lock()
         self._next_id = 0
         self.calls = self.wait_s = 0.0
@@ -104,12 +108,17 @@ class RemoteStage:
         cfg = model.config.get_text_config(decoder=True)
         self.link = Link.connect(self.addr)
         f, _ = self.link.call("hello", {"layers": [self.a, self.b], "num_layers": len(model.model.layers),
-                                        "hidden": cfg.hidden_size, "dtype": str(model.dtype).split(".")[1]})
+                                        "hidden": cfg.hidden_size, "dtype": str(model.dtype).split(".")[1],
+                                        "token": os.environ.get("QV_POOL_TOKEN", "")})
         _log(f"[stage] {self.addr}: layers {self.a}..{self.b - 1} of {len(model.model.layers)} "
              f"on {f.get('device')} ({f.get('pack')})")
+        if os.environ.get("QV_PREFIX_STORE") == "shared" and not f.get("pool"):
+            raise RuntimeError(f"--prefix-store shared: the stage worker at {self.addr} has no prefix pool -- start it "
+                               f"with --prefix-store shared too (it keeps its layers of every saved prefix)")
 
     def queue(self, name: str, *args) -> None:
-        self._ops.append([name, *args])
+        with self._ops_lock:
+            self._ops.append([name, *args])
 
     def call(self, op: str, fields: dict | None = None, tensors: dict | None = None, device=None):
         if self.link is None:
@@ -117,7 +126,8 @@ class RemoteStage:
         import time
         with self._lock:
             fields = dict(fields or {})
-            fields["ops"], self._ops = self._ops, []
+            with self._ops_lock:
+                fields["ops"], self._ops = self._ops, []
             t0 = time.perf_counter()
             try:
                 out = self.link.call(op, fields, tensors, device)
@@ -131,7 +141,8 @@ class RemoteStage:
 
     # -- engine cache actions ----------------------------------------------------------------------------------------
     def reset(self, tau: float, residual: int) -> None:
-        self._ops = []
+        with self._ops_lock:
+            self._ops = []
         if self.link is None:
             return               # the stage was lost: the engine still builds, and every request fails with StageLost
         self.call("reset", {"tau": tau, "residual": residual})
@@ -144,6 +155,28 @@ class RemoteStage:
 
     def import_(self, bi: int, sid: int) -> bool:
         return bool(self.call("import", {"bi": bi, "id": sid})[0]["ok"])
+
+    # --prefix-store shared: the stage keeps ITS layers of a saved prefix in its own machine's pool, named by the prefix's
+    # token ids (as the main server's pool names its part); neither side depends on the other's process memory.
+    def persist(self, sid: int, tokens: list, branch: bool) -> bool:
+        """Copy the stage's exported state `sid` into its pool under `tokens`."""
+        t = {"tokens": torch.tensor(tokens, dtype=torch.int32)}
+        return bool(self.call("persist", {"id": sid, "branch": bool(branch)}, t)[0]["ok"])
+
+    def restore(self, bi: int, tokens: list) -> bool:
+        """Load the stage's part of the prefix `tokens` from its pool into slot bi; False when it does not hold it."""
+        t = {"tokens": torch.tensor(tokens, dtype=torch.int32)}
+        return bool(self.call("restore", {"bi": bi}, t)[0]["ok"])
+
+    def forget(self, tokens: list) -> None:
+        """Drop the stage's part of the prefix `tokens` from its pool (another part of the same save failed)."""
+        t = {"tokens": torch.tensor(tokens, dtype=torch.int32)}
+        self.call("forget", {}, t)
+
+    def has(self, tokens: list) -> bool:
+        """True when the stage's pool holds its part of the prefix `tokens` (asked before any stage restores)."""
+        t = {"tokens": torch.tensor(tokens, dtype=torch.int32)}
+        return bool(self.call("has", {}, t)[0]["ok"])
 
     def ring_plan(self, bi: int) -> str:
         """"ok" (a rollback is ready for slot bi), "none" (no recurrent layer here) or "fail"."""
@@ -219,9 +252,22 @@ class StageHost:
         self.eng = ContinuousBatchEngine(model, tok)          # model preparation + arming, no drafter
         self.dev = next(model.model.layers[a].parameters()).device
         self.tau = self.residual = None
+        # --prefix-store shared on the stage worker: this machine's pool for the stage's layers of saved prefixes
+        from qv_band.decode.shared_prefix import store_from_env
+        self.pool = store_from_env()
+        self.leases = []                      # per slot: pool blobs a restored prefix reads from (released when it goes)
+        # QV_POOL_TOKEN (the same as the servers, router and store): a main process must present it in its first
+        # message. Without it anyone who reaches the port drives these layers and this machine's prefix pool.
+        self.token = os.environ.get("QV_POOL_TOKEN", "")
+        self.authed = not self.token
+        if not self.token:
+            _log("[stage] WARNING: QV_POOL_TOKEN is not set: any host that reaches this port can use the stage")
         self._clear()
 
     def _clear(self) -> None:
+        if self.pool is not None:
+            self.pool.release_all()
+        self.leases = []
         self.eng.past = None
         self.states, self.snap, self.ring, self.plan = {}, None, None, None
 
@@ -245,10 +291,15 @@ class StageHost:
             head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
             like = torch.zeros(1, heads, 0, head_dim, dtype=self.model.dtype, device=self.dev)
             past.add_slot(like, like)
+            self.leases.append(None)
             if sd._linear_attention_state_ready(past):
                 sd._grow_linear_attention_batch(past)
         elif name == "drop":
             past.drop_slot(args[0])
+            if args[0] < len(self.leases):
+                held = self.leases.pop(args[0])
+                if held and self.pool is not None:
+                    self.pool.release(held)
             if sd._linear_attention_state_ready(past):
                 sd._drop_linear_attention_batch(past, args[0])
         elif name == "crop":
@@ -267,6 +318,11 @@ class StageHost:
     # -- messages -----------------------------------------------------------------------------------------------------
     def handle(self, op: str, f: dict, t: dict):
         from qv_band.decode import spec_decode as sd
+        if not self.authed:
+            import hmac
+            if op != "hello" or not hmac.compare_digest(str(f.get("token", "")), self.token):
+                raise PermissionError("QV_POOL_TOKEN missing or wrong (set the same token on the main server)")
+            self.authed = True
         for o in f.get("ops", ()):
             self._op(*o)
         if op == "forward":
@@ -283,6 +339,32 @@ class StageHost:
             return {"ok": st is not None}, None
         if op == "import":
             return {"ok": bool(sd._import_slot_state(self._past(), f["bi"], self.states[f["id"]]))}, None
+        if op == "persist":
+            st = self.states.get(f["id"])
+            if st is None or self.pool is None:
+                return {"ok": False}, None
+            return {"ok": bool(self.pool.put(t["tokens"].tolist(), st, None, f["branch"], self.model.dtype))}, None
+        if op == "forget":
+            toks = t["tokens"].tolist()
+            key = self.pool.key_for(len(toks), toks) if self.pool is not None else None
+            return {"ok": bool(key is not None and self.pool.drop(key))}, None
+        if op == "has":
+            toks = t["tokens"].tolist()
+            return {"ok": self.pool is not None and self.pool.key_for(len(toks), toks) is not None}, None
+        if op == "restore":
+            if self.pool is None:
+                return {"ok": False}, None
+            toks = t["tokens"].tolist()
+            key = self.pool.key_for(len(toks), toks)
+            got = self.pool.get(key, self.dev, self.model.dtype) if key is not None else None
+            if got is None:
+                return {"ok": False}, None
+            ok = bool(sd._import_slot_state(self._past(), f["bi"], got[0]))
+            if ok and f["bi"] < len(self.leases):
+                self.leases[f["bi"]] = got[2]
+            else:
+                self.pool.release(got[2])
+            return {"ok": ok}, None
         if op == "ring_plan":
             self.plan = sd._ring_plan(self._past(), self.ring, f["bi"]) if self.ring is not None else None
             return {"plan": "fail" if self.plan is None else "ok" if self.plan else "none"}, None
@@ -290,10 +372,10 @@ class StageHost:
             cfg = self.model.config.get_text_config(decoder=True)
             mine = {"layers": [self.a, self.b], "num_layers": len(self.model.model.layers),
                     "hidden": cfg.hidden_size, "dtype": str(self.model.dtype).split(".")[1]}
-            theirs = {k: f.get(k) for k in mine}
+            theirs = {k: f.get(k) for k in mine}             # (the token is checked above, never echoed)
             if theirs != mine:
                 raise RuntimeError(f"stage and main do not agree: stage {mine}, main {theirs}")
-            return {"device": str(self.dev), "pack": self.pack}, None
+            return {"device": str(self.dev), "pack": self.pack, "pool": self.pool is not None}, None
         raise RuntimeError(f"stage: unknown message {op!r}")
 
     def _forward(self, f: dict, t: dict):
@@ -329,12 +411,17 @@ class StageHost:
         while True:
             link = accept(srv)
             _log(f"[stage] main connected from {link.peer}")
+            self.authed = not self.token                 # every connection proves itself
             try:
                 while True:
                     op, f, t = link.recv(self.dev)
                     try:
                         with torch.no_grad():
                             rf, rt = self.handle(op, f, t)
+                    except PermissionError as e:         # not our main process: say so and hang up
+                        _log(f"[stage] {link.peer} refused: {e}")
+                        link.send("error", {"text": f"PermissionError: {e}"})
+                        break
                     except Exception as e:                # the main side raises StageLost with this text
                         import traceback
                         traceback.print_exc(file=sys.__stdout__)

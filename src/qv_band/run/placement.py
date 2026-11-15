@@ -148,6 +148,94 @@ def balanced_split(per_layer: list[int], n_cards: int, main_extra: int) -> list[
     return bounds
 
 
+def capacity_split(per_layer: list[int], caps: list[int], main_extra: int) -> list[int]:
+    """balanced_split with a capacity per card (bytes it can take): each card's target is its SHARE of what is left,
+    cap_c / sum(caps of the cards still open). Equal caps give exactly balanced_split. Raises when the weights do not
+    fit the capacities in total, naming both (github issue #1: the balanced split put 1/3 of a 65B on a 10 GB card
+    next to a 24 GB one and ran out of memory)."""
+    L, n = len(per_layer), len(caps)
+    if n > L:
+        raise RuntimeError(f"{n} cards for {L} layers: at most one card per layer")
+    need = sum(per_layer) + main_extra
+    if need > sum(caps):
+        raise RuntimeError(f"pipeline: the weights need {need / 2**30:.1f} GiB, the cards have "
+                           f"{' + '.join(f'{c / 2**30:.1f}' for c in caps)} GiB free for them (after the per-card "
+                           f"reserve): free memory on the cards, add a card, or lower --pipeline-reserve-mb")
+    bounds, i, left = [], 0, need
+    for card in range(n - 1):
+        target = left * caps[card] / sum(caps[card:])
+        acc = per_layer[i]
+        j = i + 1
+        while j < L - (n - 1 - card) and abs(acc + per_layer[j] - target) < abs(acc - target):
+            acc += per_layer[j]
+            j += 1
+        while acc > caps[card] and j > i + 1:           # never over a card's capacity: give layers back
+            j -= 1
+            acc -= per_layer[j]
+        bounds.append(j)
+        left -= acc
+        i = j
+    # The main (last) card takes what is left plus the non-layer weights, and until 2026-11-14 nobody checked that it
+    # fits there: the total fitted, the earlier cards were kept under their capacity, and the remainder could still be
+    # more than the main card holds (an out-of-memory at load). Repair: while a card is over, hand its first layer to
+    # the nearest earlier card with room for it.
+    def loads(bs):
+        edges = [0] + bs + [L]
+        return [sum(per_layer[a:b]) + (main_extra if c == n - 1 else 0) for c, (a, b) in enumerate(zip(edges, edges[1:]))]
+
+    for _ in range(L * n):
+        ld = loads(bounds)
+        over = [c for c in range(n) if ld[c] > caps[c]]
+        if not over:
+            break
+        o, edges = over[-1], [0] + bounds + [L]
+        moved = False
+        for c in range(o - 1, -1, -1):                  # layers only move to an EARLIER card (the order is fixed)
+            if edges[c + 2] - edges[c + 1] >= 2 and ld[c] + per_layer[bounds[c]] <= caps[c]:
+                bounds[c] += 1
+                moved = True
+                break
+        if not moved:
+            break
+    ld = loads(bounds)
+    if any(ld[c] > caps[c] for c in range(n)):
+        raise RuntimeError("pipeline: no split of contiguous layers fits the cards: loads "
+                           + ", ".join(f"{x / 2**30:.1f}" for x in ld) + " GiB against "
+                           + ", ".join(f"{c / 2**30:.1f}" for c in caps) + " GiB free (after the per-card reserve; the "
+                           "last card also holds embedding / lm_head / drafter). Free memory on the cards, change "
+                           "their order, add a card, or set --pipeline-split by hand")
+    return bounds
+
+
+def card_capacities(devices: list[str]) -> list[int] | None:
+    """Bytes each card can take for weights: its FREE memory now (other processes counted) minus the reserve for
+    activations and KV (QV_PIPELINE_RESERVE_MB, default 2048), rounded down to whole GiB so that equal cards give the
+    same split as before. None when CUDA cannot be asked."""
+    try:
+        import torch
+        reserve = int(os.environ.get("QV_PIPELINE_RESERVE_MB", "2048") or 2048) << 20
+        return [max(0, (torch.cuda.mem_get_info(torch.device(d))[0] - reserve) >> 30 << 30) for d in devices]
+    except Exception:                                    # noqa: BLE001 - no CUDA here (tests, a stage's planner)
+        return None
+
+
+def home_device(model):
+    """The card the non-layer modules, the drafter and the request tensors live on, WITH its index: the placement's
+    main card, else the model's own device. A bare "cuda" means "the calling thread's current device", which is cuda:0
+    in every new thread -- on a multi-card pipeline that is not the main card (github issue #1). None on CPU."""
+    import torch
+    pl = getattr(model, "_qv_placement", None)
+    if pl is not None:
+        return torch.device(pl.main)
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        return None
+    if dev.type != "cuda":
+        return None
+    return dev if dev.index is not None else torch.device("cuda", torch.cuda.current_device())
+
+
 class Placement:
     def __init__(self, devices: list[str], bounds: list[int], n_layers: int):
         if len(bounds) != len(devices) - 1 or any(b <= a for a, b in zip([0] + bounds, bounds + [n_layers])):
@@ -187,8 +275,15 @@ def build(devices: list[str], model_dir: str, pack_dir: str | None, n_layers: in
             a, b, only = here
             per = [nb if a <= i and (b is None or i < b) else 0 for i, nb in enumerate(per)]
             other = 0 if only else other
-        bounds = balanced_split(per, len(devices), other)
-        how = "balanced by weight bytes" + (" held here" if here is not None else "")
+        caps = card_capacities(devices)
+        if caps is not None:                     # equal cards too: the same split as balanced, plus the check that it fits
+            bounds = capacity_split(per, caps, other)
+            how = ("by weight bytes and each card's free memory (" +
+                   ", ".join(f"{d} {c >> 30} GiB" for d, c in zip(devices, caps)) + ")")
+        else:
+            bounds = balanced_split(per, len(devices), other)
+            how = "balanced by weight bytes"
+        how += " held here" if here is not None else ""
     p = Placement(devices, bounds, n_layers)
     p.how = how
     return p

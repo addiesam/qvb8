@@ -1,11 +1,11 @@
 """Stage worker: runs a range of decoder layers of a pack for a main server on another machine
 (qv_band/decode/remote_stage.py; design: qv_band/design_doc/engine_architecture.md section 6).
 
-    python -m ai_engine.cli.stage_worker PACK --stage-port 50818 --stage-layers 0:12 [the server's model flags]
+    python -m ai_engine.cli.stage_worker PACK --stage-port 8081 --stage-layers 0:12 [the server's model flags]
 
 then, on the main machine:
 
-    scripts/servers/llm_server.sh -m PACK --pipeline HOST:50818,local --pipeline-split 12
+    scripts/qwen_server.sh --pipeline HOST:8081,local --pipeline-split 12
 
 Both read the same pack with the same --dtype and --kv-* flags. Each loads only its own layers; the worker loads
 no embedding, no drafter and samples nothing. Several cards on the worker: add --pipeline cuda:0,cuda:1.
@@ -33,10 +33,11 @@ def _layers_from_argv() -> None:
 
 _layers_from_argv()
 
-from ai_engine.cli.serve import tolerate_autotune_launch_oom  # noqa: E402
+from ai_engine.cli.serve import disable_unusable_kernels, tolerate_autotune_launch_oom  # noqa: E402
 
 
 def main() -> None:
+    disable_unusable_kernels()
     tolerate_autotune_launch_oom()
     from ai_engine.generation import add_generation_args, load_qvb8_llm, params_from_args
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -54,6 +55,13 @@ def main() -> None:
     args.draft_k = 0
     params = params_from_args(args)
     llm = load_qvb8_llm(args.model, params, verbose=True)
+    if os.environ.get("QV_PREFIX_STORE") == "shared":
+        # this machine's pool for the stage's layers of saved prefixes (the main server keeps its own layers in its pool)
+        from qv_band.decode.shared_prefix import config_tag, pack_signature
+        os.environ["QV_PREFIX_SHARED_TAG"] = config_tag(pack_signature(str(llm.bundle.pack)), params.effective_kv_tau,
+                                                        int(params.kv_residual), str(llm.model.dtype), args.stage_layers)
+        os.environ.setdefault("QV_PREFIX_SHARED_NAME", "qv_prefix_" + os.path.basename(str(llm.bundle.pack).rstrip("/"))
+                              + "_stage" + args.stage_layers.replace(":", "-"))
     from qv_band.decode.remote_stage import StageHost
     StageHost(llm.model, llm.tok, int(a), int(b), pack=str(llm.bundle.pack)).serve(args.stage_port, args.stage_host)
 

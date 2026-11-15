@@ -6,7 +6,8 @@
 # then calls:  serve_main "$@"
 #
 #   <script> [start|stop|status|restart|log|startup] [extra server flags...]      (start is the default)
-# Log: scripts/logs/<NAME>.log  (pid: <NAME>.pid).
+# Log: scripts/logs/<NAME>.log  (pid: <NAME>.pid). INSTANCE=x (env) makes them <NAME>_x.*: several servers of one launcher
+# on one machine (one per card) each need their own INSTANCE and PORT.
 # Startup log: scripts/logs/<NAME>.startup.log -- the command line and everything the server printed until it
 # answered /health (or until it died): the load / placement / kernel / memory lines, kept apart from the request log.
 
@@ -70,7 +71,7 @@ serve_main() {
     esac
   done
   PORT="${PORT:-$DEF_PORT}"
-  LOGDIR="$ROOT/scripts/logs"; LOGF="$LOGDIR/$NAME.log"; PIDF="$LOGDIR/$NAME.pid"; STARTF="$LOGDIR/$NAME.startup.log"
+  LOGDIR="$ROOT/scripts/logs"; F="$NAME${INSTANCE:+_$INSTANCE}"; LOGF="$LOGDIR/$F.log"; PIDF="$LOGDIR/$F.pid"; STARTF="$LOGDIR/$F.startup.log"
   cd "$ROOT" || exit 1
   if [ -n "${QV_SERVE_RUN:-}" ]; then launch; exit $?; fi       # the detached child: run the server itself
   case "$action" in
