@@ -40,8 +40,6 @@ import torch
 
 _STEP_FLOOR = 1e-12
 
-# Certified per-element error (--kv-tau-threshold overrides it per cache). Chosen
-# 2026-10-02: ppl within 0.002 of dense KV on the 27B and 0.003 on the 35B.
 KV_DEFAULT_TAU = 0.1
 # Bit-width FLOOR; heads rise above it when the certificate needs more bits.
 KV_BITS_FLOOR = int(os.environ.get("QV_BAND_KV_BITS", "6"))

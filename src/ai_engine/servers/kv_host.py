@@ -186,6 +186,8 @@ def main(argv=None):
           + (f", blocks {'resident on the card (fp16)' if a.blocks == 'gpu' else 'in host RAM (decoded per step)'}"
              if a.device else "") + (f", matmul {a.matmul}" if a.device else ""), flush=True)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    from qv_band.common import tls as _tls
+    _tls.wrap_server(srv)                 # TLS when the deployment sets QV_TLS_* (qv_band/common/tls.py)
     srv.daemon_threads = True                    # an idle keep-alive client must not block shutdown
     srv.serve_forever()
 

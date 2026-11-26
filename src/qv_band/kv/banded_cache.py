@@ -191,17 +191,6 @@ _JOINED_CACHE_BYTES = int(os.environ.get(
 _JOINED_CACHE_CAP_BYTES = int(os.environ.get(
     "QV_BAND_GLOBAL_JOINED_CACHE_MB", "512")) * 2 ** 20
 
-# Append-in-place dense K/V views for the ragged attention path (see
-# BandedKVLayer.ragged_kv_views). Unlike the joined cache this is the PRIMARY
-# decode-time view, so it is sized to hold real context: 512 MB/layer is
-# ~128k tokens of (4 kv heads x 256 dim x fp16) K+V. Past either cap a slot
-# falls back to the (slower, always-correct) rebuild-per-step path.
-# Tried on the dev GPU (v1, 2026-11-06): 1 GB/layer + 10 GB global so Ripple's
-# 16 full-attention layers keep the view at 75k tokens. A/B on a 74,764-token
-# prompt, same acceptance: decode 4.5 / 5.7 tok/s with the big caps vs
-# 4.9 / 6.3 with these defaults -- no gain, so the defaults stay. Override with
-# QV_BAND_DENSE_VIEW_MB / QV_BAND_GLOBAL_DENSE_VIEW_MB. A failed allocation
-# falls back to the rebuild path (see ragged_kv_views) instead of raising.
 _SM_VIEW_BYTES = int(os.environ.get(
     "QV_BAND_DENSE_VIEW_MB", "512")) * 2 ** 20
 _SM_VIEW_CAP_BYTES = int(os.environ.get(

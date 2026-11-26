@@ -1,5 +1,5 @@
 # Tested versions (NVIDIA DGX Spark, GB10 sm_121, CUDA 13.0, Python 3.12)
-# torch==2.14.0   (install separately with CUDA support, see README)
+# torch>=2.14,<2.15   (install separately with CUDA support, see README; the bundled CUDA kernels are keyed on the torch 2.14 build)
 triton==3.8.0
 transformers==5.17.0
 tokenizers==0.23.2

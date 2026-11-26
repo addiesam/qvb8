@@ -76,8 +76,7 @@ def _align(n: int) -> int:
 
 
 def _alive(epoch: str) -> bool:
-    """Is the process that wrote `epoch` still running? Exact: the pid must exist AND have the start time recorded
-    (2026-11-14; before, a pid re-used by another process kept a dead server's leases and half-written blobs alive).
+    """Is the process that wrote `epoch` still running? Exact: the pid must exist AND have the start time recorded.
     No timeout on purpose: a lease says "this process reads these bytes through a view", and a live process that is
     merely slow must keep them. Transfers to other machines have their own expiring leases (XFER_LEASE_S)."""
     pid, _, start = epoch.partition(":")
@@ -177,7 +176,7 @@ class SharedPrefixStore:
     @contextmanager
     def _locked(self):
         """Other processes: flock. Other threads of THIS process: a thread lock first -- flock does not exclude threads
-        that share one open file (2026-11-13: 4 piece requests at once from the prefix store wrote the index together:
+        that share one open file (4 piece requests at once from the prefix store wrote the index together:
         FileNotFoundError on the rename, and a lost update would drop leases or entries)."""
         with self._tlock:
             if self._tdepth == 0:
@@ -229,7 +228,7 @@ class SharedPrefixStore:
 
     def _save(self, idx: dict) -> None:
         tmp = self.index_path + f".{os.getpid()}.{threading.get_ident()}"
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:   # same user only
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
             pickle.dump(idx, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, self.index_path)
 
@@ -267,8 +266,6 @@ class SharedPrefixStore:
         pos = fit(idx["blobs"].values())
         if pos is not None:
             return pos
-        # Would it fit with everything evictable gone? If not, evict NOTHING (before 2026-11-14 a request larger than
-        # the free-able room emptied the pool entry by entry and then failed anyway).
         held = self._held(idx) | protect
         stay = set(held) | {b for b, v in idx["blobs"].items() if v.get("writing")}
         for e in idx["entries"].values():
@@ -610,7 +607,7 @@ class SharedPrefixStore:
     def adopt(self, live_bks, already=()) -> tuple:
         """The running request's own KV segments that the pool now holds (a checkpoint just copied them): -> ([(segment,
         pool view of its packed bytes)], newly leased blob ids). The caller points each segment at the view and frees
-        its private copy, so a long request's older KV sits in host RAM once (2026-11-13, 166k tokens on one V100:
+        its private copy, so a long request's older KV sits in host RAM once (, 166k tokens on one V100:
         12.1 GB private pinned + the pool's copy). `already`: blob ids this request leased before (not leased again)."""
         with self._locked():
             idx = self._load()
@@ -1051,9 +1048,6 @@ def _import_layers(self, metas: list, fetch, streams: int = 4) -> dict:
     mv = memoryview(self._mm)
     tok_off = total
     try:
-        # neighbouring ranges of one source blob are fetched as ONE piece (up to PIECE bytes) and split here: a slice is
-        # thousands of small tensors, and a request per tensor paid the link's round trip each time (2026-11-13: 5,816
-        # requests, 571 MB in 695 s over Wi-Fi, 0.8 MB/s against 2.3 MB/s for whole blobs)
         spans = []                                           # [meta index, bid, src off, src end, [(src off, nb, dst)]]
         for j in sorted(jobs, key=lambda j: (j[0], j[1], j[2])):
             mi, b_, o_, nb, _, d_ = j

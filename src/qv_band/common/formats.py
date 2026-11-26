@@ -94,6 +94,11 @@ def _build_registry() -> None:
     # stacks of a qvb8r pack stream dense (see FormatSpec.experts).
     from qv_band.formats.qvb8r.module import QVBandLinearV8R, QVBandEmbeddingV8R
     from qv_band.formats.qvb8r.fuse import fuse_same_input
+    # qvbq: NVFP4 / FP8 checkpoint codes kept bit-exact (restore nvfp4 / fp8, max_err 0),
+    # decoded inside the matmul from the code's own formula (formats/qvbq).
+    from qv_band.formats.qvbq import QVBQLinear, QVBQEmbedding, QVBQExperts, decode_linear
+    _REGISTRY["qvbq"] = FormatSpec("qvbq", QVBQLinear, QVBQEmbedding, QVBQExperts,
+                                  decoder=decode_linear)
     _REGISTRY["qvb8r"] = FormatSpec("qvb8r", QVBandLinearV8R,
                                     QVBandEmbeddingV8R, None,
                                     # fp32 band value (escapes exact); decode_pack rounds ONCE to the dtype asked for

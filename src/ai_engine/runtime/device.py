@@ -71,14 +71,18 @@ class DevicePlan:
     def hf_device_map(self) -> str:
         """The string to hand straight to from_pretrained(device_map=...).
 
-        "auto" when more than one CUDA device is visible so HF shards across
-        them, "cuda:0" for a single card, "cpu"/"xpu" otherwise.
+        "auto" (HF shards across every visible CUDA device) ONLY for an explicit "all"; "cuda:N" stays on that card;
+        plain "cuda" / "auto" mean one card, cuda:0. It used to return "auto" whenever more than one card was visible:
+        a model asked for cuda:1 was spread over both cards, which ignored the request, filled the other card, and
+        hung for good on a board whose card-to-card copies do not work.
         """
         if not self.use_gpu:
             return "cpu"
         if self.use_xpu:
             return "xpu"
-        return "auto" if self.gpu_count > 1 else "cuda:0"
+        if self.all_gpus and self.gpu_count > 1:
+            return "auto"
+        return self.gpu_dev if self.gpu_dev and self.gpu_dev.startswith("cuda:") else "cuda:0"
 
     def torch_device(self) -> Any:
         """A torch.device, for .to() / .Generator(device=...)."""

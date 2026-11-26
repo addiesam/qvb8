@@ -194,12 +194,6 @@ class QVBandExpertsV8(nn.Module):
         self._stk = (stack(gu), stack(dn))
         return True
 
-    # Up to this many tokens the fused kernel (attention-free, one launch per projection) runs; above it the
-    # per-expert GEMM loop. The loop costs about the same from 16 to 64 tokens (one host sync + up to 2 x experts
-    # GEMMs per layer), the fused kernel grows with the tokens. Measured on the dev GPU (35B-A3B, DFlash K=8, ms per step,
-    # scheduler, 2026-11-10): 2 requests (16 tok) 261 loop / 128 fused; 3 (24 tok) 288 / 163; 6 (48 tok) 421 / 313;
-    # 8 (64 tok) 447 / 362; one request 85 either way. So several users share a step only when the limit covers
-    # their tokens. sm_70 (V100) keeps 8: not measured there.
     FUSED_MAX_TOKENS = 8
     FUSED_MAX_TOKENS_SM80 = 64
     _limit_by_dev: dict = {}

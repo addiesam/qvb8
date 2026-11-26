@@ -26,7 +26,8 @@ import time
 
 import torch
 
-from qv_band.decode.spec_decode import Stats, _IncStreamer, _probs
+from qv_band.decode.spec_decode import Stats, _IncStreamer
+from qv_band.engine.spec import sampling_probs
 
 
 def new_cache(model, device):
@@ -105,16 +106,18 @@ class _NGram:
 def _sample(logits, temperature, top_k, top_p):
     if temperature <= 0:
         return int(torch.argmax(logits).item())
-    p = _probs(logits.float(), temperature, top_k, top_p)
+    p = sampling_probs(logits.float(), temperature, top_k, top_p)
     return int(torch.multinomial(p, 1).item())
 
 
 @torch.no_grad()
-def hybrid_generate(model, drafter, tok, ids, *, max_new: int = 40, stream: bool = True,
+def hybrid_generate(model, drafter, tok, ids, *, max_new: int = 40, stream: bool = True, on_text=None,
                       temperature: float = 0.0, top_k: int = 0, top_p: float = 1.0,
                       kv_stats: dict | None = None, skip_special_tokens: bool = True,
                       abort_check=None, prefix_cache=None, return_cache: bool = False,
                       on_heartbeat=None, prefill_chunk: int | None = None, embeds=None, on_token=None, **_ignored):
+    # streamed text: on_text(piece) when given (a server writing SSE), else stdout as before
+    _on_text = on_text if on_text is not None else (lambda piece: print(piece, end="", flush=True))
     from qv_band.layers.mamba2_hybrid import rollback
 
     st = Stats()
@@ -141,7 +144,7 @@ def hybrid_generate(model, drafter, tok, ids, *, max_new: int = 40, stream: bool
         if inc is not None:
             piece = inc.feed(new)
             if piece:
-                print(piece, end="", flush=True)
+                _on_text(piece)
 
     # ---- prefill (chunked; the drafter sees every position's captured features) ------------------------
     t0 = time.time()
@@ -184,7 +187,7 @@ def hybrid_generate(model, drafter, tok, ids, *, max_new: int = 40, stream: bool
         if inc is not None:
             tail = inc.finish()
             if tail:
-                print(tail, end="", flush=True)
+                _on_text(tail)
         return done()
     emit([tok0])
     if ng is not None:
@@ -224,7 +227,7 @@ def hybrid_generate(model, drafter, tok, ids, *, max_new: int = 40, stream: bool
             new = drafts[:n_acc] + [tgt[n_acc]]
         else:
             while n_acc < m:
-                p = _probs(lg[n_acc], temperature, top_k, top_p)
+                p = sampling_probs(lg[n_acc], temperature, top_k, top_p)
                 if torch.rand((), device=p.device).item() < p[drafts[n_acc]].item():
                     n_acc += 1
                     continue
@@ -263,5 +266,5 @@ def hybrid_generate(model, drafter, tok, ids, *, max_new: int = 40, stream: bool
     if inc is not None:
         tail = inc.finish()
         if tail:
-            print(tail, end="", flush=True)
+            _on_text(tail)
     return done()

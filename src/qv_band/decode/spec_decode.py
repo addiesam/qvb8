@@ -30,16 +30,16 @@ from __future__ import annotations
 
 import argparse
 import contextvars
-import math
 import os
 import types
-import random
 import sys
 import threading
 import time
 
 import torch
 from transformers import DynamicCache
+
+from qv_band.engine.spec import sample_token, verify_row
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -77,15 +77,6 @@ PREFILL_CHUNK = int(os.environ.get("QV_BAND_PREFILL_CHUNK", "512"))
 # ContinuousBatchEngine, pure-attention models: pack each step into one unpadded row, and feed a long prompt
 # one chunk per step so running requests keep decoding meanwhile (see _forward_packed / _prefill_admitted).
 PACKED_ENABLED = os.environ.get("QV_BAND_PACKED", "1") != "0"
-# opt-in: measured a net loss on the 65B (code 20.4 -> 17.6 tok/s, prose unchanged) -- full block wins
-ADAPTIVE_K = os.environ.get("QV_BAND_ADAPTIVE_K", "0") == "1"
-# Verify-token budget for a packed step (v1). A packed step concatenates every slot's [last + drafts]
-# into ONE row, so the target's linears see M = total tokens. 16 is the largest M the tensor-core qvb8 kernel
-# serves (~485 ms / 80 layers on Ripple); past it the bf16 path decodes the whole weight matrix (~3x the
-# traffic). With several drafting slots each gets k = budget // n - 1 (2 slots: 7 each, 3: 4, ...).
-# 0 = no budget (every slot drafts the engine's k). Opt-in: measured on the dev GPU (Ripple, 2 concurrent code
-# requests, 300 tok each) aggregate 15.2 tok/s with the budget vs 16.5 without, so the default is off.
-ROW_BUDGET = int(os.environ.get("QV_BAND_ROW_BUDGET", "0"))
 _PROFILE_STEPS = [int(os.environ.get("QV_BAND_PROFILE_STEPS", "0"))]
 _PROFILE_PREFILL = [int(os.environ.get("QV_BAND_PROFILE_PREFILL", "0"))]   # profile N prefill chunk forwards
 _PROFILE_PREFILL_FROM = int(os.environ.get("QV_BAND_PROFILE_PREFILL_FROM", "0"))   # only chunks starting at >= this token
@@ -197,162 +188,6 @@ MTP_CTX_WINDOW = int(os.environ.get("QV_BAND_MTP_CTX", "256"))
 # 0.2-0.3 and <= 8% below 0.2. Drafting stops at the first token whose
 # cumulative confidence falls below this. 0 = always draft the full k.
 MTP_MIN_CUM = float(os.environ.get("QV_BAND_MTP_MIN_CUM", "0.35"))
-# Adaptive drafting in ContinuousBatchEngine, OFF by default. A slot whose
-# smoothed per-token acceptance falls below SPEC_MIN_ACCEPT stops drafting
-# for a while (backoff doubles per failed probe). It was meant to save the
-# replay forward a rejected draft costs, but measured on the 27B at 6.6k
-# context it LOST throughput: tokens/step fell 2.54 -> 1.83 and decode
-# 5.4 -> 4.7 tok/s even though acceptance was ~77% overall, because
-# per-step acceptance is bursty and each pause forfeits the ~2.5 tokens a
-# step gains. Kept for experimentation only: QV_BAND_SPEC_MIN_ACCEPT=0.5.
-SPEC_MIN_ACCEPT = float(os.environ.get("QV_BAND_SPEC_MIN_ACCEPT", "0"))
-SPEC_EMA = 0.75
-SPEC_BACKOFF_MIN = 8
-SPEC_BACKOFF_MAX = 128
-
-
-def _probs(logits: torch.Tensor, temperature: float, top_k: int,
-           top_p: float) -> torch.Tensor:
-    """The exact distribution _select() would draw from at temperature > 0:
-    temperature-scaled, top-k then nucleus (top-p) filtered, softmaxed -- the
-    same order transformers' own LogitsProcessor pipeline applies for
-    TopKLogitsWarper -> TopPLogitsWarper.  Shared by _select(), _accept_prob()
-    and _resample_residual() so the sampled token, the acceptance probability
-    and the residual all come from identical mass functions."""
-    scaled = logits / temperature
-    if top_k > 0:
-        # torch.sort, not torch.topk. On Intel XPU (Arc/Xe) torch.topk over a
-        # vocab-sized 1-D tensor measured 58 SECONDS per call against 0.006 s
-        # for a full sort of the same tensor -- a driver/kernel pathology, not
-        # an algorithmic cost. topk dominated everything: 213 s of a 226 s
-        # sampled run, versus 7 s for all 1992 weight-decode kernel calls.
-        # A full sort is O(n log n) where top-k is O(n), but at these sizes
-        # the constant factor is what matters, and CUDA is unaffected either
-        # way (sort of 150 K floats is sub-millisecond on both).
-        kth = torch.sort(scaled, descending=True).values[
-            ..., min(top_k, scaled.shape[-1]) - 1, None]
-        scaled = torch.where(scaled < kth, torch.full_like(scaled, float("-inf")), scaled)
-    if 0 < top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
-        cum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-        # keep the smallest prefix whose cumulative prob >= top_p; always
-        # keep at least the top token even if its own prob already exceeds it
-        remove = cum_probs - torch.softmax(sorted_logits, dim=-1) > top_p
-        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-        scaled = torch.full_like(scaled, float("-inf")).scatter(
-            -1, sorted_idx, sorted_logits)
-    return torch.softmax(scaled, dim=-1)
-
-
-def _select(logits: torch.Tensor, temperature: float, top_k: int,
-           top_p: float = 1.0) -> int:
-    """argmax when temperature is 0 (the greedy path everything else here is
-    built around); otherwise multinomial sampling, top-k then nucleus
-    (top-p) filtered, temperature-scaled -- see _probs."""
-    if temperature <= 0:
-        return int(logits.argmax())
-    return int(torch.multinomial(_probs(logits, temperature, top_k, top_p), 1))
-
-
-def _accept_prob(p_target: torch.Tensor, p_draft: torch.Tensor | None,
-                 token: int) -> float:
-    """P(accept) = min(1, p_target(token) / p_draft(token)), the standard
-    speculative-sampling acceptance identity (Leviathan et al. 2023 /
-    Chen et al. 2023).
-
-    p_draft=None means the drafter's proposal is a one-hot at `token`
-    (n-gram, and MTP at temperature 0): the ratio then reduces to exactly
-    p_target(token), so acceptance is a coin flip on the target model's own
-    probability for that token."""
-    if p_draft is None:
-        return float(p_target[token])
-    pd = float(p_draft[token])
-    if pd <= 0.0:
-        return 0.0
-    return min(1.0, float(p_target[token]) / pd)
-
-
-def _resample_residual(p_target: torch.Tensor, p_draft: torch.Tensor | None,
-                       rejected: int) -> int:
-    """Draw the token emitted after a rejection from the residual
-    distribution max(0, p_target - p_draft), renormalised -- the standard
-    speculative-sampling correction that keeps the marginal distribution
-    exactly the target's.  With p_draft=None the residual is p_target with
-    the rejected token's one-hot mass zeroed out.  Falls back to a plain
-    target sample if all the mass was on `rejected` (top_k=1, or a draft
-    that dominates the target)."""
-    if p_draft is None:
-        residual = p_target.clone()
-        residual[rejected] = 0.0
-    else:
-        residual = torch.clamp(p_target - p_draft, min=0.0)
-    total = float(residual.sum())
-    if total <= 0.0 or not math.isfinite(total):
-        return int(torch.multinomial(p_target, 1))
-    return int(torch.multinomial(residual / total, 1))
-
-def _topk_dist(logits: torch.Tensor, temperature: float, top_k: int, top_p: float):
-    """_probs() for every row of `logits` at once, restricted to each row's top_k tokens
-    (everything outside them has probability 0 in _probs too): (token ids, probabilities,
-    count of logits >= the k-th). The count differs from top_k only on a tie at the k-th
-    logit, where _probs keeps every tied token -- the caller then falls back to _probs."""
-    vals, idx = torch.topk(logits, top_k, dim=-1)               # sorted, descending
-    ties = (logits >= vals[:, -1:]).sum(-1)
-    p = torch.softmax(vals.float() / temperature, dim=-1)
-    if 0 < top_p < 1.0:
-        p = p.masked_fill((p.cumsum(-1) - p) > top_p, 0.0)      # the nucleus, as in _probs
-        p = p / p.sum(-1, keepdim=True)
-    return idx, p, ties
-
-
-def _verify_sampled(s, draft, dl, row_logits):
-    """Speculative-sampling verification (the temperature > 0 branch of _verify) done on each
-    position's top_k tokens and ONE device-to-host copy, or None when that is not exact.
-
-    WHY: _verify ran _probs per drafted position -- two full-vocab (248k) sorts, several softmaxes
-    and a GPU sync per accept test. Measured on the 27B that was ~55 ms of a ~260 ms decode step. A
-    token outside the top_k has probability 0 under the target, so acceptance and the residual
-    only ever involve the top_k tokens; this computes them once for all positions and decides on
-    the host. Same distribution, same accept/residual rule."""
-    k, V, n = s.top_k, row_logits.shape[-1], len(draft)
-    if k <= 0 or k >= V:
-        return None
-    if dl is not None and any(x is not None for x in dl) and not getattr(s.drafter, "returns_probs", False):
-        return None                                      # a draft that still needs _probs() of its logits
-    idx, p, ties = _topk_dist(row_logits, s.temperature, k, s.top_p)
-    pd = torch.zeros_like(p)                             # the draft's own probability on those tokens
-    for i, x in enumerate(dl or ()):
-        if x is not None and i < n:
-            pd[i] = x[idx[i]].float()
-    packed = torch.cat([idx.float(), p, pd, ties.float()[:, None]], dim=1).cpu()
-    if bool((packed[:, -1] != k).any()):
-        return None
-    ids = packed[:, :k].long().tolist()
-    tp, dp = packed[:, k:2 * k].tolist(), packed[:, 2 * k:3 * k].tolist()
-
-    def draw(weights) -> int:
-        return random.choices(range(k), weights=weights)[0]
-
-    for i, d in enumerate(draft):
-        pos = ids[i].index(d) if d in ids[i] else -1
-        if pos < 0:
-            accept = 0.0                                 # the target gives it no mass
-        elif dl is None or dl[i] is None:
-            accept = tp[i][pos]
-        else:
-            accept = 0.0 if dp[i][pos] <= 0.0 else min(1.0, tp[i][pos] / dp[i][pos])
-        if random.random() < accept:
-            continue
-        if dl is None or dl[i] is None:
-            residual = list(tp[i])
-            if pos >= 0:
-                residual[pos] = 0.0
-        else:
-            residual = [max(0.0, a - b) for a, b in zip(tp[i], dp[i])]
-        total = sum(residual)
-        weights = residual if total > 0.0 and math.isfinite(total) else tp[i]
-        return i, ids[i][draw(weights)]
-    return n, ids[n][draw(tp[n])]
 
 
 # Whether a rejected draft can be undone exactly.
@@ -555,6 +390,19 @@ class MTPDrafter:
         self.ctx_v = None
         self._pending = []
 
+    def export_state(self) -> dict:
+        """Per-sequence state (position, last hidden, the head's bounded context and its not-yet-run TRUE rows), so a
+        sequence resumed from a saved prefix drafts without re-observing it -- and so the engine saves prefixes at
+        all (it keeps none for a drafter without export_state). Drafter state only affects acceptance: every draft
+        is verified, so a restored state can never change the output."""
+        c = lambda t: None if t is None else t.clone()
+        return {"pos": self.pos, "hidden": c(self.hidden), "ctx_k": c(self.ctx_k), "ctx_v": c(self.ctx_v),
+                "pending": [(int(p), h.clone(), int(t)) for p, h, t in self._pending]}
+
+    def import_state(self, st: dict) -> None:
+        self.pos, self.hidden, self.ctx_k, self.ctx_v = st["pos"], st["hidden"], st["ctx_k"], st["ctx_v"]
+        self._pending = [(int(p), h, int(t)) for p, h, t in st.get("pending") or []]
+
     def enable_context(self, window: int = 256) -> bool:
         """Give the head its own attention context over the last `window`
         positions (built from the main model's hidden states). Returns False
@@ -621,7 +469,7 @@ class MTPDrafter:
             else:
                 lg = self.lm_head(h)[0]
                 if temperature > 0:
-                    tid = _select(lg, temperature, top_k, top_p)
+                    tid = sample_token(lg, temperature, top_k, top_p)
                 elif MTP_MIN_CUM > 0:
                     conf, tt = torch.softmax(lg.float(), dim=-1).max(0)
                     cum *= float(conf)
@@ -708,7 +556,7 @@ class MTPDrafter:
             else:
                 lg = self.lm_head(h)[0]
                 if temperature > 0:
-                    tid = _select(lg, temperature, top_k, top_p)
+                    tid = sample_token(lg, temperature, top_k, top_p)
                 else:
                     tid = int(lg.argmax())
             if temperature > 0:
@@ -742,6 +590,13 @@ class NGramWithMTPDrafter:
     def __init__(self, ngram, mtp):
         self.ngram = ngram
         self.mtp = mtp
+
+    def export_state(self):
+        return {"mtp": self.mtp.export_state(), "tokens": list(self.ngram.tokens)}
+
+    def import_state(self, st):
+        self.mtp.import_state(st["mtp"])
+        self.ngram.reset(st["tokens"])
 
     @property
     def hidden(self):
@@ -1178,6 +1033,13 @@ class _ResultWithHidden:
         self.layer_features = layer_features
 
 
+def _tap_module(model, li):
+    """The module a drafter tap `li` reads: decoder layer `li`'s output; the index one past the last layer is the
+    final norm's OUTPUT (a drafter feature source "final_postnorm"). Any model with a final norm plugs in."""
+    layers = model.model.layers
+    return layers[li] if li < len(layers) else _resolve_final_norm(model)
+
+
 def _resolve_final_norm(model):
     """Return the base model's final RMSNorm module.
 
@@ -1266,7 +1128,7 @@ def _forward_with_hidden(model, input_ids, past_key_values, want_hidden: bool,
     for li in capture_layers or ():
         def _capture_layer(_module, _args, out, li=li):     # tap layers may sit on other cards: gathered below (xfer)
             layer_out[li] = out[0] if isinstance(out, tuple) else out
-        handles.append(model.model.layers[li].register_forward_hook(_capture_layer))
+        handles.append(_tap_module(model, li).register_forward_hook(_capture_layer))
     try:
         outputs = model.model(input_ids, past_key_values=past_key_values, use_cache=True)
     finally:
@@ -1354,7 +1216,7 @@ def _forward_batched_with_hidden(model, input_ids, attention_mask, position_ids,
     for li in capture_layers or ():
         def _capture_layer(_module, _args, out, li=li):     # tap layers may sit on other cards: gathered below (xfer)
             layer_out[li] = out[0] if isinstance(out, tuple) else out
-        handles.append(model.model.layers[li].register_forward_hook(_capture_layer))
+        handles.append(_tap_module(model, li).register_forward_hook(_capture_layer))
     try:
         outputs = model.model(input_ids, attention_mask=attention_mask,
                               position_ids=position_ids,
@@ -1419,7 +1281,8 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                          prefix_cache: "PrefixCache | None" = None,
                          return_cache: bool = False,
                          on_heartbeat=None,
-                         prefill_chunk: int | None = None):
+                         prefill_chunk: int | None = None,
+                         on_text=None):
     """Greedy decode, drafting k tokens per step.  drafter=None -> plain greedy.
 
     `abort_check`: optional zero-arg callable, polled once per decode step
@@ -1452,7 +1315,7 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
     to real speculative sampling: each drafted token is accepted with
     probability min(1, p_target(token)/p_draft(token)) and a rejection draws
     the emitted token from the residual distribution max(0, p_target -
-    p_draft), renormalised (see _accept_prob / _resample_residual).  p_draft
+    p_draft), renormalised (engine/spec.py: accept_prob / resample_residual).  p_draft
     is the drafter's own distribution: one-hot at the proposed token when
     the drafter has none (n-gram, and MTP at temperature 0), which reduces
     acceptance to a coin flip at p_target(token); the MTP head run with
@@ -1509,6 +1372,8 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
     PREFILL_CHUNK / QV_BAND_PREFILL_CHUNK; pass an explicit value to
     override per-call without touching the environment.
     """
+    # streamed text: on_text(piece) when given (a server writing SSE), else stdout as before
+    _on_text = on_text if on_text is not None else (lambda piece: print(piece, end="", flush=True))
     _prefill_chunk = prefill_chunk if prefill_chunk is not None else PREFILL_CHUNK
     st = Stats()
     out_ids: list[int] = []
@@ -1881,7 +1746,7 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                 drafter.hidden = res.last_hidden_state[0, -1]
             if hasattr(drafter, "reset"):
                 drafter.reset(ids[0].tolist())
-        nxt = _select(res.logits[0, -1], temperature, top_k, top_p)
+        nxt = sample_token(res.logits[0, -1], temperature, top_k, top_p)
         st.t_prefill = time.perf_counter() - _t_pf0       # the pick above synchronises the GPU
         st.n_prefill = int(prefill_ids.shape[-1])
         out_ids.append(nxt)
@@ -1902,7 +1767,7 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
         if _streamer is not None:
             piece = _streamer.feed([nxt])
             if piece:
-                print(piece, end="", flush=True)
+                _on_text(piece)
 
         _pd = int(os.environ.get("QV_PROFILE_DECODE", "0") or 0)   # profile steps 5..5+N
         _pd_step = 0
@@ -1981,69 +1846,9 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
                 from qv_band.decode.ring_snapshot import build_ring
                 ring_built = build_ring(spec_past, len(seq))
 
-            if temperature <= 0:
-                # Greedy verification, unchanged: a draft token is kept only where
-                # it equals the base model's own argmax at that position, so the
-                # emitted stream is token-identical to plain greedy decoding.
-                greedy = res.logits[0].argmax(-1).tolist()
-                n_acc = 0
-                for i, d in enumerate(draft):
-                    if greedy[i] != d:
-                        break
-                    n_acc += 1
-                next_tok = greedy[n_acc]
-            else:
-                # Speculative sampling (Leviathan et al. 2023 / Chen et al. 2023):
-                # accept each draft position with probability
-                # min(1, p_target(token)/p_draft(token)) and, on the first
-                # rejection, emit a token drawn from the residual distribution
-                # max(0, p_target - p_draft), renormalised -- this preserves the
-                # target model's sampling distribution exactly.  p_draft is one-hot
-                # when the drafter has no distribution (n-gram, MTP at temperature
-                # 0), which reduces acceptance to a coin flip at p_target(token);
-                # an MTP drafter run with temperature > 0 returns its real
-                # per-position logits, so the true draft distribution is used.
-                n_acc = 0
-                next_tok = None
-                for i, d in enumerate(draft):
-                    p_target = _probs(res.logits[0, i], temperature, top_k, top_p)
-                    # draft_logits (the whole list) not being None does
-                    # NOT mean every element is real: NGramWithMTPDrafter
-                    # pads n-gram-sourced positions with a per-element
-                    # None placeholder (see its propose()'s comment --
-                    # n-gram has no distribution, only a one-hot pick),
-                    # so a list that IS present can still hold None at
-                    # position i. Checking only the outer list crashed
-                    # here with `TypeError: unsupported operand type(s)
-                    # for /: 'NoneType' and 'float'` inside _probs the
-                    # first time a draft was ENTIRELY n-gram-sourced
-                    # (remaining <= 0 in NGramWithMTPDrafter.propose, so
-                    # MTP never even ran) -- _accept_prob/
-                    # _resample_residual already correctly treat
-                    # p_draft=None as "one-hot", they just never got the
-                    # chance because _probs(None, ...) raised first.
-                    _dl = draft_logits[i] if draft_logits is not None else None
-                    if _dl is None:
-                        p_draft = None
-                    elif draft_probs:
-                        # The drafter sampled from this exact
-                        # distribution (DFlash2's selector over its
-                        # top-k candidates); re-filtering it would make
-                        # p_draft differ from the real proposal.
-                        p_draft = _dl
-                    else:
-                        p_draft = _probs(_dl, temperature, top_k, top_p)
-                    if random.random() < _accept_prob(p_target, p_draft, d):
-                        n_acc += 1
-                    else:
-                        next_tok = _resample_residual(p_target, p_draft, d)
-                        break
-                if next_tok is None:
-                    # Every drafted position was accepted (or there was no draft):
-                    # emit the target's own next token at the position after the
-                    # draft, sampled exactly as a plain step-by-step sample would
-                    # be.
-                    next_tok = _select(res.logits[0, n_acc], temperature, top_k, top_p)
+            # greedy exact match / speculative sampling (engine/spec.verify_row): the emitted stream is the target's own
+            n_acc, next_tok = verify_row(draft, draft_logits, res.logits[0, :len(draft) + 1], temperature, top_k, top_p,
+                                         draft_probs)
             st.accepted += n_acc
             if capture:
                 # Rows 0..n_acc of the verify batch are seq[0] + the accepted
@@ -2271,7 +2076,7 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
             if _streamer is not None and _newly:
                 piece = _streamer.feed(_newly)
                 if piece:
-                    print(piece, end="", flush=True)
+                    _on_text(piece)
 
             # Invariant: prefix_ids == exactly the tokens the cache has consumed.
             # This step fed seq[0] plus the accepted drafts.  The token in
@@ -2303,7 +2108,7 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
             # losing the last visible token.
             tail = _streamer.finish()
             if tail:
-                print(tail, end="", flush=True)
+                _on_text(tail)
 
     finally:
         # No attention-implementation swap to undo any more (the gather
@@ -2313,20 +2118,6 @@ def speculative_generate(model, drafter, tok, ids, *, k: int = 8,
         # behavioural change.
         pass
 
-    # Refresh kv_stats against the FINAL cache state before returning --
-    # the only earlier update() call (right after prefill, above) measures
-    # int8_kv before the residual buffer has had any chance to fill past
-    # residual_length and flush to int8 (default 128 tokens; a prompt
-    # shorter than that leaves the cache 100% fp16 at that snapshot no
-    # matter how long the SUBSEQUENT generation runs), so the number shown
-    # to the user was effectively always "roughly 100%, ~2.0 B/elem"
-    # regardless of the real end-of-generation compression -- confirmed by
-    # direct measurement: after 300 decode steps the SAME cache that
-    # reported 100%/2.0 B/elem right after prefill was actually at 59.9%/
-    # 1.2 B/elem. qvb8_resident does not have this specific problem (its
-    # prefill is banded immediately, not threshold-gated), but decode-step
-    # growth is unbanded there too (see the comment above), so refreshing
-    # here is strictly more accurate for both paths, not just int8_kv's.
     if kv_stats is not None and past is not None and (int8_kv or qvb8_resident):
         kv_stats.update(past.memory_report())
 
@@ -2477,11 +2268,6 @@ def _seed_ngram_with_prompt(drafter, prompt_ids) -> None:
 _UNSUPPORTED = object()
 
 
-# Where saved prompt prefixes keep their copied tensors (--prefix-store, ai_engine/cli/kv_offload.py): "gpu" or "host"
-# (pinned host RAM, copied back to the card on a restore). The banded KV segments are shared by reference either way.
-# "shared": one pool in /dev/shm per machine for every server on it (decode/shared_prefix.py). A checkpoint is exported
-# to pinned host RAM as with "host" (an export on the card took ~270 MB of a full 16 GB V100 at each 8192-token
-# checkpoint, 2026-11-13), copied into the pool once, freed; a restore reads views of the pool -- no private copy kept.
 PREFIX_STORE_SHARED = os.environ.get("QV_PREFIX_STORE", "gpu") == "shared"
 PREFIX_STORE_HOST = os.environ.get("QV_PREFIX_STORE", "gpu") == "host" or PREFIX_STORE_SHARED
 # --prefix-checkpoint-every N: mid-prompt checkpoints sit on a FIXED grid of absolute positions (N, 2N, ...), the same
@@ -2502,11 +2288,6 @@ def ckpt_every_for(prefill_chunk: int) -> int:
                              f"{prefill_chunk}: checkpoints sit on chunk boundaries")
         return PREFIX_CKPT_EVERY
     return -(-8192 // prefill_chunk) * prefill_chunk
-# The state's tau is the MODEL's (the pack manifest's tau, set by the server: QV_PREFIX_STATE_TAU), not the KV cache's.
-# PoC (poc/state_ckpt, 2026-11-12, 27B, 17,408 tokens of real text, KV-cache codec per head and column): tau 2e-3
-# rounded once / on a 4096 grid / at every 1024-token chunk -> perplexity 4.3944 -> 4.3943 / 4.3935 / 4.3937, top-1
-# agreement 99.75 / 99.61 / 99.28 %, state 0.24x of fp32. (The KV cache's tau 0.2 gave 6.219: far too coarse.)
-# No tau set (no manifest tau, or not a qvb8 KV cache) -> grid checkpoints store exact states.
 
 
 class PackedState:
@@ -2576,7 +2357,7 @@ def _keep(t):
 def _release_cached_blocks() -> None:
     """Give the allocator's cached free blocks back to the card after a request leaves / a prefix is restored. Without
     expandable segments (the V100 launchers) the cache fragments: 27B on one V100, a prefill after a mid-prompt restore
-    failed to get 68 MiB with 497 MiB cached but in pieces (2026-11-12). Memory housekeeping only: outputs unchanged."""
+    failed to get 68 MiB with 497 MiB cached but in pieces. Memory housekeeping only: outputs unchanged."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -2620,10 +2401,6 @@ def _export_layer_slot(layer, bi: int, packed=None):
         st = layer.export_slot(bi)
         if PREFIX_STORE_HOST:
             st["resid_k"], st["resid_v"] = _keep(st["resid_k"]), _keep(st["resid_v"])
-            # The packed segments stay shared by reference: --kv-host already moves a slot's old segments to pinned host
-            # RAM in batches (banded_cache.PackedHostTier swaps them in place, so checkpoints follow). Copying them here
-            # per checkpoint (thousands of tiny blocking copies) halved long-prompt prefill on a V100 (2026-11-13) and
-            # rested on a wrong diagnosis: the restore OOM was allocator fragmentation (expandable segments fix it).
         return ("kv", st)
     if isinstance(layer, LinearAttentionCacheLayerMixin) and not isinstance(layer, DynamicLayer):
         cs, rs = layer.conv_states.get(0), layer.recurrent_states.get(0)
@@ -2755,7 +2532,7 @@ class _BatchSlot:
     __slots__ = ("bi", "out_ids", "drafter", "max_new", "done",
                  "temperature", "top_k", "top_p", "_history_len",
                  "req_id", "stats", "on_token", "just_admitted",
-                 "acc_ema", "spec_off", "spec_backoff", "prompt_ids", "prefix_hit", "shared_leases", "branch", "_ckpt_at", "k_cur", "acc_len_ema",
+                 "prompt_ids", "prefix_hit", "shared_leases", "branch", "_ckpt_at",
                  "admit_no")
 
     def __init__(self, bi: int, drafter, max_new: int,
@@ -2776,8 +2553,6 @@ class _BatchSlot:
         self.prompt_ids = None      # the full prompt as a list (to checkpoint / match prefixes)
         self.prefix_hit = 0         # prompt tokens restored from a saved prefix instead of prefilled
         self.shared_leases = None   # --prefix-store shared: pool blobs this slot reads from (released in _drop)
-        self.k_cur = None           # adaptive draft length (packed engines), None = engine k
-        self.acc_len_ema = 4.0      # accepted drafts per step, smoothed
         self._ckpt_at = 0           # slot length at the last chunk-boundary checkpoint
         self.branch = 0             # where this prompt leaves a saved one: save a checkpoint there too
         self.admit_no = 0           # admission order (engine counter): the VRAM-ceiling stop takes the newest
@@ -2788,11 +2563,6 @@ class _BatchSlot:
         # position of its own prompt, not treat the forward as a normal
         # verify step. Cleared right after that step is consumed.
         self.just_admitted = False
-        # Adaptive drafting (see SPEC_MIN_ACCEPT): running per-token
-        # acceptance, steps left to skip drafting, and the current backoff.
-        self.acc_ema = 1.0
-        self.spec_off = 0
-        self.spec_backoff = SPEC_BACKOFF_MIN
 
 
 def _find_attn_impl_holder(model):
@@ -3350,7 +3120,7 @@ def _run_linear_attn_per_slot(module, hidden_states, cache_params, real_lens,
         groups.setdefault((rl, cold), []).append(bi)
     for (rl, cold), rows in groups.items():
         idx = torch.tensor(rows, device=hidden_states.device)
-        hs_i = hidden_states.index_select(0, idx)[:, seq_max - rl:, :]
+        hs_i = hidden_states.indexsample_token(0, idx)[:, seq_max - rl:, :]
         if layer is None:
             out[idx, seq_max - rl:, :] = orig_forward(
                 hidden_states=hs_i, cache_params=None, attention_mask=None, **kwargs)
@@ -3365,8 +3135,8 @@ def _run_linear_attn_per_slot(module, hidden_states, cache_params, real_lens,
         # group-sized tensors.
         cs_full = layer.conv_states.get(0) if layer.conv_states else None
         rs_full = layer.recurrent_states.get(0) if layer.recurrent_states else None
-        cs_rows = cs_full.index_select(0, idx) if cs_full is not None else None
-        rs_rows = rs_full.index_select(0, idx) if rs_full is not None else None
+        cs_rows = cs_full.indexsample_token(0, idx) if cs_full is not None else None
+        rs_rows = rs_full.indexsample_token(0, idx) if rs_full is not None else None
         if cs_rows is not None:
             layer.conv_states[0] = cs_rows
         if rs_rows is not None:
@@ -3446,15 +3216,15 @@ def _run_mamba_per_slot(module, hidden_states, cache_params, real_lens,
         groups.setdefault(rl, []).append(bi)
     for rl, rows in groups.items():
         idx = torch.tensor(rows, device=hidden_states.device)
-        hs_i = hidden_states.index_select(0, idx)[:, seq_max - rl:, :]
+        hs_i = hidden_states.indexsample_token(0, idx)[:, seq_max - rl:, :]
         if layer is None:
             out[idx, seq_max - rl:, :] = orig_forward(
                 hs_i, cache_params=None, attention_mask=None, **kwargs)
             continue
         cs_full = layer.conv_states[0]
         rs_full = layer.recurrent_states[0]
-        layer.conv_states[0] = cs_full.index_select(0, idx)
-        layer.recurrent_states[0] = rs_full.index_select(0, idx)
+        layer.conv_states[0] = cs_full.indexsample_token(0, idx)
+        layer.recurrent_states[0] = rs_full.indexsample_token(0, idx)
         try:
             out_i = orig_forward(hs_i, cache_params=cache_params,
                                  attention_mask=None, **kwargs)
@@ -3704,6 +3474,8 @@ class ContinuousBatchEngine:
         self.tok = tok
         self.drafter_factory = drafter_factory
         self.k = k if drafter_factory is not None else 0
+        from qv_band.engine.spec import SpecPlanner
+        self._planner = SpecPlanner()                    # draft lengths: measured costs + each slot's acceptance
         self.kv_tau = kv_tau
         self.int8_residual_length = int8_residual_length
         # Per-instance chunk size, so a server's --prefill-chunk actually
@@ -3773,20 +3545,6 @@ class ContinuousBatchEngine:
         self.progress_interval_s = float(
             os.environ.get("QV_BAND_PROGRESS_INTERVAL_S", "10.0"))
         self._device = None
-        # SGLang/vLLM-shaped ragged attention (see _qv_varlen_attention_
-        # forward's own docstring for the full "why") -- replaces every
-        # earlier padded-K/V + mask attempt this session made (4D causal
-        # bias for sdpa, dict mask for flash-attn's own 2D convention,
-        # both of which chased correctness bugs stemming from the SAME
-        # root cause: padding rows to a shared width in the first place).
-        # `_qv_text_config` is whichever config object the loaded model's
-        # decoder layers actually read `_attn_implementation` from --
-        # found once here, not re-derived per step, and step() flips it
-        # to "qv_varlen" only for the duration of its own forward call,
-        # restoring the ORIGINAL implementation immediately after, so any
-        # OTHER caller sharing this same model object (e.g. serve.py's
-        # old STATE["lock"] single-request path, when a request doesn't
-        # route through this engine) is completely unaffected.
         _register_qv_varlen_attention()
         # Linear-attention layers cannot be fixed by masking (see
         # _run_linear_attn_per_slot's docstring) -- they must not be fed
@@ -3914,12 +3672,9 @@ class ContinuousBatchEngine:
                 def _tap(_m, _a, o, li=li):
                     c = _cur()
                     if c is not None and c.capture is not None and li in c.capture_layers:
-                        # pipeline placement: a tap layer may sit on another card -- copied through host memory, never
-                        # peer-to-peer (common/xfer.py): a direct card-to-card copy gave the drafter wrong taps on the two
-                        # V100s (0% accepted, 2026-11-11)
                         from qv_band.common.xfer import to_device as _to_dev
                         c.capture[li] = _to_dev(o[0] if isinstance(o, tuple) else o, c.capture_dev)
-                hooked[li] = self.model.model.layers[li].register_forward_hook(_tap)
+                hooked[li] = _tap_module(self.model, li).register_forward_hook(_tap)
         if "_norm" not in hooked:
             def _pre(_m, a, _k):
                 c = _cur()
@@ -4151,20 +3906,6 @@ class ContinuousBatchEngine:
         engine exists to avoid. Admissions are rare relative to decode
         steps, so this costs little.
         """
-        # Chunk ONE admitted slot at a time, and only while it is the
-        # only slot that has not been prefilled yet.
-        #
-        # REAL CONFIRMED BUG this guards: a slot that has never taken
-        # part in a forward has no row in the linear-attention state
-        # (those tensors are created lazily, sized from the first
-        # forward's batch). Letting it ride along as a zero-length row
-        # in ANOTHER slot's chunk forward is what creates that state at
-        # the wrong shape -- reproduced as "Sizes of tensors must match
-        # except in dimension 2. Expected size 0 but got size 1" inside
-        # Qwen3_5GatedDeltaNet's torch.cat([conv_state, mixed_qkv]) as
-        # soon as two requests were admitted back-to-back before any
-        # step. Chunking strictly one slot at a time keeps every forward
-        # well-formed for every row that takes part in it.
         live = self._live()
         rows = {bi: r for r, (bi, _) in enumerate(live)}
         # Packed (pure-attention) engines feed ONE chunk round per step() and then let the running requests
@@ -4604,9 +4345,6 @@ class ContinuousBatchEngine:
             remote = getattr(state, "remote", ())
             if len(remote) != len(self._stages):
                 return
-            # A split model: each stage keeps its layers in ITS machine's pool. All or nothing: when a later stage or
-            # this machine cannot keep its part, the stages that already did are told to drop theirs (before
-            # 2026-11-14 such a part stayed in the stage's pool, useless, until evicted).
             kept, ok = [], False
             try:
                 for st, sid in remote:
@@ -4680,7 +4418,7 @@ class ContinuousBatchEngine:
         """Chunk boundaries at FIXED absolute positions (multiples of --prefill-chunk from token 0, the checkpoint grid
         included): the chunked linear-attention and attention kernels sum in chunk order, so a different split of the
         same tokens gives different fp32 rounding. Aligned, a prefill restored from any checkpoint computes exactly what
-        an uncached run computes (2026-11-12: a cut at a cached prompt's divergence point made the first chunk after a
+        an uncached run computes (a cut at a cached prompt's divergence point made the first chunk after a
         restore 628 tokens instead of 1024 and the answer differ). Holds for the same load: while other requests
         decode, chunks are smaller (INTERLEAVE_CHUNK) and the split differs from an idle run."""
         a = self.prefill_chunk
@@ -4817,13 +4555,11 @@ class ContinuousBatchEngine:
         admit_rows: set[int] = set()
         # slots still mid-prefill (packed engines: one chunk per step) sit this step out
         wait_rows = {row for row, (bi, _s) in enumerate(live) if bi in getattr(self, "_prefilling", ())}
-        k_budget = None
-        if ROW_BUDGET > 0 and self.k > 0 and self._packed_ok():
-            n_draft = sum(1 for row, (bi, s) in enumerate(live)
-                          if row not in wait_rows and not s.just_admitted and s.spec_off <= 0
-                          and not s.done and s.drafter is not None)
-            if n_draft > 1:
-                k_budget = max(0, ROW_BUDGET // n_draft - 1)
+        # draft lengths (engine/spec.SpecPlanner): each slot's measured acceptance per position against this engine's
+        # measured step cost by rows -- the most tokens per second for the whole step; 0 = a plain step
+        cand = [bi for row, (bi, s) in enumerate(live) if row not in wait_rows and not s.just_admitted
+                and not s.done and s.drafter is not None and self.k > 0]
+        k_plan = dict(zip(cand, self._planner.plan_k([(bi, self.k) for bi in cand])))
         for row, (bi, s) in enumerate(live):
             if row in wait_rows:
                 seqs.append([])
@@ -4837,12 +4573,8 @@ class ContinuousBatchEngine:
                 admit_rows.add(row)
                 continue
             d, dl = [], None
-            if s.spec_off > 0:
-                s.spec_off -= 1          # backed off: plain decode this step
-            elif not s.done and s.drafter is not None and self.k > 0:
-                k_slot = s.k_cur or self.k
-                if k_budget is not None:
-                    k_slot = min(k_slot, k_budget)
+            k_slot = k_plan.get(bi, 0)
+            if k_slot > 0:
                 d, dl = s.drafter.propose(s.out_ids[-1], k_slot,
                                           temperature=s.temperature,
                                           top_k=s.top_k, top_p=s.top_p)
@@ -4936,24 +4668,8 @@ class ContinuousBatchEngine:
             if row in admit_rows:
                 # This forward WAS this slot's prefill.
                 s.just_admitted = False
-                nxt = _select(res.logits[row, -1], s.temperature, s.top_k, s.top_p)
-                # Seed the drafter with the prompt BEFORE emitting the
-                # first token.
-                #
-                # REAL CONFIRMED BUG (order-of-operations): _emit calls
-                # drafter.append(nxt), and NGramDrafter.reset() then does
-                # `self.tokens = list(tokens)` -- wiping it. Emitting
-                # first therefore appended the first token and
-                # immediately threw it away, leaving the drafter's own
-                # token history permanently one token short of the real
-                # sequence and misaligned from then on. Only k>0 is
-                # affected (no drafter, no bug), which is exactly what
-                # the measurements showed: the engine's greedy output
-                # matched speculative_generate exactly while its
-                # drafting output did not -- violating the invariant
-                # that speculative decoding at temperature 0 is
-                # output-identical to greedy. speculative_generate does
-                # reset() first for this reason; this now matches it.
+                self._planner.forget(bi)
+                nxt = sample_token(res.logits[row, -1], s.temperature, s.top_k, s.top_p)
                 if self.capture and s.drafter is not None:
                     s.drafter.observe_features(
                         hist_lens[row], res.layer_features[row, -len(seq):])
@@ -4992,24 +4708,8 @@ class ContinuousBatchEngine:
                 s.drafter.observe_features(
                     hist_lens[row], res.layer_features[row, fpad:fpad + n_acc + 1])
                 self._phase[7] += time.perf_counter() - _to
-            if draft and SPEC_MIN_ACCEPT > 0:
-                rate = n_acc / len(draft)
-                s.acc_ema = SPEC_EMA * s.acc_ema + (1.0 - SPEC_EMA) * rate
-                if s.acc_ema < SPEC_MIN_ACCEPT:
-                    s.spec_off = s.spec_backoff
-                    s.spec_backoff = min(s.spec_backoff * 2, SPEC_BACKOFF_MAX)
-                    s.acc_ema = SPEC_MIN_ACCEPT      # a probe starts neutral
-                elif rate == 1.0:
-                    s.spec_backoff = SPEC_BACKOFF_MIN
-            if draft and ADAPTIVE_K and self._packed_ok():
-                # Pick the draft length that buys the most tokens per second. Verify cost by rows on the
-                # 65B (the dev GPU): 1-4 rows ~375 ms (GEMV, bandwidth bound), 8 rows ~470, 16 rows ~507; the
-                # draft itself costs the same at any length. A fully accepted draft says nothing about
-                # how far it would have gone, so it counts as a few more so a short k can climb back.
-                obs = n_acc + (4 if n_acc == len(draft) else 0)
-                s.acc_len_ema = 0.6 * s.acc_len_ema + 0.4 * obs
-                e = s.acc_len_ema
-                s.k_cur = min(self.k, 3 if e < 2.0 else 7 if e < 4.0 else 15)
+            if draft:
+                self._planner.feedback(bi, n_acc, len(draft))
             if s.drafter is not None and hasattr(s.drafter, "feedback"):
                 s.drafter.feedback(n_acc, len(draft))
             n_drop = len(draft) - n_acc
@@ -5080,6 +4780,11 @@ class ContinuousBatchEngine:
         _tp = time.perf_counter()
         self._replay_accepted(replay)
         self._phase[11] += time.perf_counter() - _tp
+        if not admit_rows and not wait_rows:              # a decode step: its costs for the draft plan
+            n_prop = sum(1 for d in drafts if d)
+            if n_prop:
+                self._planner.observe(self._planner.pcost, n_prop, _t_b - _t_a)
+            self._planner.observe(self._planner.vcost, sum(len(sq) for sq in seqs), time.perf_counter() - _t_b)
         self._tokens_since_progress += sum(len(t) for _, t in emitted)
         if (admit_rows and torch.cuda.is_available()
                 and torch.cuda.memory_reserved() - torch.cuda.memory_allocated() > 2 ** 30):
@@ -5135,36 +4840,10 @@ class ContinuousBatchEngine:
         return True
 
     def _verify(self, s, draft, dl, row_logits, greedy=None) -> tuple[int, int]:
-        """Accept/reject this slot's draft and pick its next token --
-        greedy exact-match at temperature 0, speculative sampling above
-        it (identical to speculative_generate's own verification)."""
-        if s.temperature <= 0:
-            if greedy is None:
-                greedy = row_logits.argmax(-1).tolist()
-            n_acc = 0
-            for i, d in enumerate(draft):
-                if greedy[i] != d:
-                    break
-                n_acc += 1
-            return n_acc, greedy[n_acc]
-        fast = _verify_sampled(s, draft, dl, row_logits)
-        if fast is not None:
-            return fast
-        n_acc = 0
-        for i, d in enumerate(draft):
-            p_target = _probs(row_logits[i], s.temperature, s.top_k, s.top_p)
-            _dl = dl[i] if dl is not None else None
-            if _dl is None:
-                p_draft = None
-            elif getattr(s.drafter, "returns_probs", False):
-                p_draft = _dl            # already the proposal distribution
-            else:
-                p_draft = _probs(_dl, s.temperature, s.top_k, s.top_p)
-            if random.random() < _accept_prob(p_target, p_draft, d):
-                n_acc += 1
-            else:
-                return n_acc, _resample_residual(p_target, p_draft, d)
-        return n_acc, _select(row_logits[n_acc], s.temperature, s.top_k, s.top_p)
+        """Accept / reject this slot's draft and pick its next token (engine/spec.verify_row)."""
+        return verify_row(draft, dl, row_logits, s.temperature, s.top_k, s.top_p,
+                          getattr(s.drafter, "returns_probs", False), greedy)
+
     def _emit(self, s, bi: int, tokens: list[int], emitted: list, finished: list) -> None:
         """Commit `tokens` to this slot, stopping at max_new/EOS."""
         newly: list[int] = []

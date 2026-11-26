@@ -585,3 +585,6 @@ def footprint_report(module) -> dict:
         'bytes_per_param': (total / n_params) if n_params else 0.0,
         'escape_ratio': (n_esc / n_params) if n_params else 0.0,
     }
+
+
+from qv_band.formats.qvb8 import wmma_sm70 as _wmma_sm70  # noqa: E402,F401

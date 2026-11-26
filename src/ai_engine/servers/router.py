@@ -48,7 +48,7 @@ give it to r (POST r/v1/pool/pull, servers/pool_xfer.py): r's time then counts t
 
 and r is scored with the faster of the two (--pull cost: a pull happens only when the transfer is predicted to take
 less time than the prefill it saves; on a 1 GbE link that is nearly always, on a slow test link rarely. --pull always
-keeps the 2026-11-13 behaviour: pull whenever a longer prefix exists, for testing the transfer path). Donors are other replicas and --store prefix stores (a DRAM-only machine:
+keeps the behaviour: pull whenever a longer prefix exists, for testing the transfer path). Donors are other replicas and --store prefix stores (a DRAM-only machine:
 servers/prefix_store.py), which are polled like replicas but never get a request. Replicas must report
 the same transfer signature (same packs, taus, checkpoint grid, dtype, drafter). A failed pull just means r prefills.
 
@@ -92,7 +92,8 @@ class Replica:
         self.lock = threading.Lock()
 
     def conn(self, timeout: float) -> http.client.HTTPConnection:
-        return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+        from qv_band.common import tls
+        return tls.http_connection(self.host, self.port, timeout)
 
     def queued_seconds(self) -> float:
         ld = (self.state or {}).get("load") or {}
@@ -116,6 +117,20 @@ class Replica:
         return t, cached
 
 
+RETRYABLE_ERRORS = ("OutOfMemoryError", "CUDA out of memory", "StageUnavailable")
+
+
+class AsyncJob:
+    """An async job as the router submitted it: enough to run it again on another backend when the one holding it is lost
+    (down, restarted without its queue: a 404) or failed through no fault of the request (out of memory on that card, a
+    block stage gone). The client keeps the id it got first; the router answers it from wherever the job runs now."""
+    __slots__ = ("route", "model", "raw", "ctype", "r", "bid", "tried", "moves")
+
+    def __init__(self, route, model, raw, ctype, r, bid):
+        self.route, self.model, self.raw, self.ctype, self.r, self.bid = route, model, raw, ctype, r, bid
+        self.tried, self.moves = [], 0
+
+
 class Router:
     def __init__(self, replicas: list, poll: float, down_after: float, default_max_tokens: int,
                  queue_timeout: float = 600.0, net_mb_s: float = 3.0, bytes_per_token: float = 41e3,
@@ -129,11 +144,31 @@ class Router:
         self.default_max_tokens = default_max_tokens
         self.default_model = None
         self.owner = {}                              # job id -> the backend that holds it
+        self.jobs = {}                               # async job id (the one the client got) -> AsyncJob: resubmitted when lost
         self.panel = None                            # --panel: backend or model whose page is served at /
         self._rr = 0
         self.pick_lock = threading.Lock()
 
+    started = 0.0
+    MAX_ASYNC_JOBS = 1024                            # async job records kept (their request bodies only until they end)
+
+    def remember_async(self, jid: str, route: str, model, raw: bytes, ctype: str, r) -> None:
+        """Keep what is needed to run async job `jid` again elsewhere. Caller holds pick_lock."""
+        self.jobs[jid] = AsyncJob(route, model, raw, ctype, r, jid)
+        while len(self.jobs) > self.MAX_ASYNC_JOBS:
+            self.jobs.pop(next(iter(self.jobs)))
+
+    def job_target(self, jid: str):
+        """(backend, its own id) of a job the client knows as `jid` (an async job moved elsewhere has a new id there)."""
+        with self.pick_lock:
+            a = self.jobs.get(jid)
+        if a is not None:
+            return a.r, a.bid
+        r = self.job_owner(jid)
+        return (r, jid) if r is not None else (None, jid)
+
     def start(self) -> None:
+        self.started = time.time()
         for r in self.replicas:
             threading.Thread(target=self._poll_loop, args=(r,), daemon=True, name=f"poll-{r.name}").start()
 
@@ -200,15 +235,32 @@ class Router:
 
     @staticmethod
     def job_wait(r: Replica) -> float:
-        """Seconds a new job would wait on r: jobs ahead (queued + running + being submitted) x its last job's time."""
+        """Seconds a new job would wait on r: the rest of the running job + the jobs waiting (queued + being submitted)
+        x one job's time. One job's time = the last finished job's, or how long the running one has run when that is
+        longer. A running job past every known duration (a server that has not finished a job yet, or a job longer
+        than the last) is expected to run as long again: such a server is measured, not assumed fast."""
         st = r.state or {}
-        ahead = int(st.get("queue") or 0) + int(bool(st.get("busy"))) + r.inflight
-        return ahead * float(st.get("last_job_seconds") or 1.0)
+        last, running = float(st.get("last_job_seconds") or 0.0), float(st.get("running_seconds") or 0.0)
+        per = max(last, running) or 1.0
+        rest = 0.0
+        if st.get("busy"):
+            rest = last - running if last > running else (running or per)
+        return (int(st.get("queue") or 0) + r.inflight) * per + rest
 
-    def job_pick(self, route: str, model: str | None):
+    def job_pick(self, route: str, model: str | None, exclude: tuple = ()):
         """(backend, None) for a new job on `route`, or (None, (http code, message)). Candidates are asked for their
-        queue NOW (the 1 s poll is too old when two jobs arrive together). Caller holds pick_lock."""
-        cands = self.job_backends(route)
+        queue NOW (the 1 s poll is too old when two jobs arrive together). Caller holds pick_lock.
+        exclude: backends that already failed this job (a retry goes elsewhere).
+        A backend that has not answered its first poll yet is asked here too: a job sent right after the router came
+        up otherwise only sees the card that answered first."""
+        for r in self.replicas:
+            if r.kind is None and r not in exclude:
+                try:
+                    t_ask = time.time()
+                    self.apply_state(r, *self.fetch_state(r, timeout=2.0), asked=t_ask)
+                except Exception:                   # noqa: BLE001 - still down: the poll keeps trying
+                    pass
+        cands = [r for r in self.job_backends(route) if r not in exclude]
         if not cands:
             known = sorted({rt for r in self.replicas if r.kind == "job" for rt in r.routes})
             return None, ((503, f"no server for {route} is up") if any(route in r.routes for r in self.replicas)
@@ -227,7 +279,19 @@ class Router:
             except Exception:                       # noqa: BLE001 - it keeps its last state; the poll marks it down
                 pass
         cands = [r for r in cands if r.up] or cands
-        return min(cands, key=lambda r: (self.job_wait(r), r.inflight)), None
+        # expected COMPLETION, not just the wait: the wait + how long a job takes on THAT backend (its last finished job).
+        # By wait alone two idle backends tie and the first won every time -- on a V100 pair that was the throttled card
+        # (684 s per Sonic clip there vs 132 s on the other). A backend with no finished job yet counts as the fastest
+        # known, so it is tried; a slow one gets work only when it would still finish first.
+        known = [t for t in (self.job_seconds(r) for r in cands) if t]
+        floor = min(known) if known else 0.0
+        return min(cands, key=lambda r: (self.job_wait(r) + (self.job_seconds(r) or floor), self.job_seconds(r) > 0,
+                                         r.inflight)), None
+
+    @staticmethod
+    def job_seconds(r: Replica) -> float:
+        """How long one job took on r (its last finished job), 0 when it has not finished one."""
+        return float((r.state or {}).get("last_job_seconds") or 0.0)
 
     def job_owner(self, jid: str):
         """The backend that holds job `jid`: remembered from its submit, else asked for (a router restart)."""
@@ -334,7 +398,7 @@ class Router:
     def pull_plan(self, r: Replica, keys: list, cached: int, live: list):
         """(donor, prefix key hex, its tokens, predicted transfer seconds) when another machine's replica or prefix store
         holds a longer prefix of this request; else None. Always pulled when it exists (no cost test: the link here is
-        a test link, 2026-11-13); the predicted transfer still counts in r's score, so a free replica that already
+        a test link, ); the predicted transfer still counts in r's score, so a free replica that already
         holds the prefix is preferred over one that must pull it."""
         mine = (r.state or {}).get("pool")
         sig = (r.state or {}).get("xfer")
@@ -416,8 +480,12 @@ class Handler(BaseHTTPRequestHandler):
                      "pool": (r.state or {}).get("pool"), "store": r.store_only, "family": r.family, "kind": r.kind,
                      "routes": list(r.routes), "queue": (r.state or {}).get("queue"), "busy": (r.state or {}).get("busy"),
                      "rate_tok_s": {"prefill": r.prefill_tps, "decode": r.decode_tps}} for r in self.router.replicas]
-            return self._json(200, {"status": "ok" if any(r["up"] for r in reps) else "no replica up",
-                                    "replicas": reps})
+            # "starting" until every backend has answered once (or was found down): a launcher that waits for "ok"
+            # then starts with every card known
+            pending = any(r.kind is None and not r.up and time.time() - self.router.started < self.router.down_after
+                          for r in self.router.replicas)
+            status = "starting" if pending else "ok" if any(r["up"] for r in reps) else "no replica up"
+            return self._json(503 if status == "no replica up" else 200, {"status": status, "replicas": reps})
         if path == "/v1/models":
             fam = dict(self.router.families())
             for r in self.router.job_backends():
@@ -431,8 +499,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._job_get(self.path.split("?", 1)[0])
 
     # ---- job servers: status, results, panels ----------------------------------------------------------------------
-    def _proxy(self, r: Replica, method: str, path: str, body: bytes | None = None, timeout: float = 600.0):
-        """Forward one request to r and relay the answer; -> (status, body) or None when r could not be reached."""
+    def _ask(self, r: Replica, method: str, path: str, body: bytes | None = None, timeout: float = 600.0):
+        """One request to r, nothing sent to the client yet; -> (status, content type, body) or None (unreachable)."""
         try:
             c = r.conn(timeout=timeout)
             hdr = {"Content-Type": self.headers.get("Content-Type") or "application/json"} if body is not None else {}
@@ -441,15 +509,26 @@ class Handler(BaseHTTPRequestHandler):
             data = resp.read()
             c.close()
         except Exception as e:                      # noqa: BLE001
-            self._json(502, {"error": f"backend {r.name} unreachable: {e}"})
+            print(f"[router] backend {r.name} unreachable: {e}", flush=True)
             return None
-        self.send_response(resp.status)
-        self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+        return resp.status, resp.getheader("Content-Type", "application/json"), data
+
+    def _relay(self, r: Replica, status: int, ctype: str, data: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-QV-Replica", r.name)
         self.end_headers()
         self.wfile.write(data)
-        return resp.status, data
+
+    def _proxy(self, r: Replica, method: str, path: str, body: bytes | None = None, timeout: float = 600.0):
+        """Forward one request to r and relay the answer; -> (status, body) or None when r could not be reached."""
+        ans = self._ask(r, method, path, body, timeout)
+        if ans is None:
+            self._json(502, {"error": f"backend {r.name} unreachable"})
+            return None
+        self._relay(r, *ans)
+        return ans[0], ans[2]
 
     def _job_get(self, path: str):
         rt = self.router
@@ -473,6 +552,8 @@ class Handler(BaseHTTPRequestHandler):
             if r is None:
                 return self._json(404, {"error": f"no backend or model {name!r} is up"})
             return self._proxy(r, "GET", "/" + rest + (("?" + self.path.split("?", 1)[1]) if "?" in self.path else ""))
+        if path.startswith("/v1/jobs/") and path.count("/") == 3:
+            return self._async_job_get(path.rsplit("/", 1)[-1])
         if path.startswith("/v1/jobs/") or "." in path.rsplit("/", 1)[-1]:      # a job, or a result file named <id>.<ext>
             jid = path.rsplit("/", 1)[-1]
             jid = jid.rsplit(".", 1)[0] if not path.startswith("/v1/jobs/") else jid
@@ -486,10 +567,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if not path.startswith("/v1/jobs/"):
             return self._json(404, {"error": "not found"})
-        r = self.router.job_owner(path.rsplit("/", 1)[-1])
+        r, bid = self.router.job_target(path.rsplit("/", 1)[-1])
         if r is None:
             return self._json(404, {"error": "no such job"})
-        return self._proxy(r, "DELETE", self.path)
+        return self._proxy(r, "DELETE", f"/v1/jobs/{bid}")
 
     def _job_post(self, path: str):
         rt = self.router
@@ -501,28 +582,51 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "bad Content-Length"})
         raw = self.rfile.read(n)
         if path.startswith("/v1/jobs/") and path.endswith("/cancel"):
-            r = rt.job_owner(path[len("/v1/jobs/"):-len("/cancel")])
+            r, bid = rt.job_target(path[len("/v1/jobs/"):-len("/cancel")])
             if r is None:
                 return self._json(404, {"error": "no such job"})
-            return self._proxy(r, "POST", self.path, raw)
+            return self._proxy(r, "POST", f"/v1/jobs/{bid}/cancel", raw)
         model = None
         if "json" in (self.headers.get("Content-Type") or "json"):
             try:
                 model = json.loads(raw or b"{}").get("model")
             except (ValueError, AttributeError):
                 model = None
-        with rt.pick_lock:                           # pick + count as one step: two jobs arriving together spread
-            r, err = rt.job_pick(path, model)
-            if r is not None:
+        tried, out, last = [], None, None
+        while True:
+            with rt.pick_lock:                       # pick + count as one step: two jobs arriving together spread
+                r, err = rt.job_pick(path, model, exclude=tuple(tried))
+                if r is not None:
+                    with r.lock:
+                        r.inflight += 1
+            if r is None:
+                if last is not None:                 # every other backend is gone too: the failure the client gets
+                    self._relay(*last)
+                    return
+                return self._json(err[0], {"error": err[1]})
+            try:
+                ans = self._ask(r, "POST", self.path, raw, timeout=3600.0)
+            finally:
                 with r.lock:
-                    r.inflight += 1
-        if r is None:
-            return self._json(err[0], {"error": err[1]})
-        try:
-            out = self._proxy(r, "POST", self.path, raw, timeout=3600.0)
-        finally:
-            with r.lock:
-                r.inflight -= 1
+                    r.inflight -= 1
+            # A backend that could not START or FINISH the job through no fault of the request (unreachable, or 503
+            # "retryable": a block stage went away) -- nothing of an answer has reached the client, so the job goes to
+            # the next backend of the route. Anything else (200, 4xx, a real 500) is the answer.
+            retry = ans is None
+            if ans is not None and ans[0] == 503:
+                try:
+                    retry = bool(json.loads(ans[2]).get("retryable"))
+                except (ValueError, AttributeError):
+                    retry = False
+            if not retry:
+                self._relay(r, *ans)
+                out = (ans[0], ans[2])
+                break
+            tried.append(r)
+            last = (r, *ans) if ans is not None else (r, 502, "application/json",
+                                                      json.dumps({"error": f"backend {r.name} unreachable"}).encode())
+            print(f"[router] {path}: {r.name} could not run the job"
+                  f"{' (' + str(ans[0]) + ')' if ans is not None else ' (unreachable)'}, trying another backend", flush=True)
         if out is not None and out[0] in (200, 202):
             try:
                 jid = json.loads(out[1]).get("id")
@@ -531,9 +635,95 @@ class Handler(BaseHTTPRequestHandler):
                         rt.owner[str(jid)] = r
                         while len(rt.owner) > 4096:
                             rt.owner.pop(next(iter(rt.owner)))
+                        if out[0] == 202:            # async: the client polls; a lost job is run again elsewhere
+                            rt.remember_async(str(jid), path, model, raw,
+                                              self.headers.get("Content-Type") or "application/json", r)
             except (ValueError, AttributeError):
                 pass
             print(f"[router] {path} -> {r.name} ({r.family})", flush=True)
+
+    def _async_job_get(self, jid: str):
+        """GET /v1/jobs/<jid>. An async job submitted through this router is followed: when its backend is down, does not
+        know it any more (restarted: 404) or reports a retryable failure, it is submitted again to another backend of its
+        route (never one that already lost it) and the client sees it queued again, under the same id."""
+        rt = self.router
+        with rt.pick_lock:
+            a = rt.jobs.get(jid)
+        if a is None:
+            r = rt.job_owner(jid)
+            if r is None:
+                return self._json(404, {"error": "no such job"})
+            return self._proxy(r, "GET", self.path)
+        while True:
+            ans = self._ask(a.r, "GET", f"/v1/jobs/{a.bid}", None, timeout=10.0)
+            why = None
+            if ans is None:
+                if a.r.up:                           # a blip while the poll still sees it: answer that, do not move yet
+                    return self._json(502, {"error": f"backend {a.r.name} unreachable", "id": jid})
+                why = "its backend is down"
+            elif ans[0] == 404:
+                why = "its backend lost it (restarted)"
+            elif ans[0] == 200:
+                try:
+                    j = json.loads(ans[2])
+                except ValueError:
+                    j = None
+                if isinstance(j, dict):
+                    if j.get("status") == "error" and any(e in str(j.get("error") or "") for e in RETRYABLE_ERRORS):
+                        why = f"it failed there ({str(j.get('error'))[:80]})"
+                    else:
+                        if j.get("status") in ("done", "error", "cancelled"):
+                            a.raw = b""              # finished: the request body is not needed any more
+                        j["id"] = jid
+                        if a.moves:
+                            j["moved"] = a.moves
+                        return self._relay(a.r, 200, "application/json", json.dumps(j).encode())
+            if why is None or not a.raw:
+                return self._relay(a.r, *ans) if ans is not None else self._json(502, {"error": "backend unreachable"})
+            if not self._resubmit(a, jid, why):
+                if ans is not None:
+                    return self._relay(a.r, *ans)
+                return self._json(502, {"error": f"job {jid}: {why}, and no other backend could take it", "id": jid})
+
+    def _resubmit(self, a, jid: str, why: str) -> bool:
+        """Submit async job `a` to another backend of its route; True when one took it."""
+        rt = self.router
+        a.tried.append(a.r)
+        while True:
+            with rt.pick_lock:
+                r, _err = rt.job_pick(a.route, a.model, exclude=tuple(a.tried))
+                if r is not None:
+                    with r.lock:
+                        r.inflight += 1
+            if r is None:
+                print(f"[router] job {jid}: {why}; no other backend for {a.route}", flush=True)
+                return False
+            try:
+                c = r.conn(timeout=60.0)
+                c.request("POST", a.route, a.raw, {"Content-Type": a.ctype})
+                resp = c.getresponse()
+                data = resp.read()
+                c.close()
+                ans = (resp.status, data)
+            except Exception:                        # noqa: BLE001
+                ans = None
+            finally:
+                with r.lock:
+                    r.inflight -= 1
+            bid = None
+            if ans is not None and ans[0] in (200, 202):
+                try:
+                    bid = json.loads(ans[1]).get("id")
+                except (ValueError, AttributeError):
+                    bid = None
+            if not bid:
+                a.tried.append(r)
+                continue
+            with rt.pick_lock:
+                a.r, a.bid, a.moves = r, str(bid), a.moves + 1
+                rt.owner[str(bid)] = r
+            print(f"[router] job {jid}: {why} -> submitted again to {r.name} as {bid}", flush=True)
+            return True
 
     def _forward_get(self, r: Replica, path: str) -> None:
         c = r.conn(timeout=10)
@@ -724,7 +914,7 @@ def main(argv=None):
                     help="cost: pull a prefix from another machine only when the transfer is predicted faster than the "
                          "prefill it saves (production); always: whenever a longer prefix exists (tests the transfer path)")
     ap.add_argument("--net-mb-s", type=float, default=3.0,
-                    help="link speed between machines to start with, MB/s (learned from pulls; 3 = the 2026-11-13 Wi-Fi)")
+                    help="link speed between machines to start with, MB/s (learned from pulls)")
     a = ap.parse_args(argv)
     backends, rates = _named(a.backend, "backend"), _named(a.rate, "rate")
     caps = _named(a.max_inflight, "max-inflight")
@@ -745,6 +935,8 @@ def main(argv=None):
     router.default_model, router.panel = a.default_model, a.panel
     Handler.router = router
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    from qv_band.common import tls as _tls
+    _tls.wrap_server(srv)                 # TLS when the deployment sets QV_TLS_* (qv_band/common/tls.py)
     print(f"[router] {len(reps)} replicas: " + ", ".join(f"{r.name}={r.url} ({r.prefill_tps:g}/{r.decode_tps:g} tok/s)"
                                                          for r in reps) + f"; listening on {a.host}:{a.port}", flush=True)
     try:

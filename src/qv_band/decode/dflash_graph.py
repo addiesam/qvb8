@@ -19,8 +19,8 @@ Here everything after the embedding is captured once and replayed with ONE launc
 A graph is tied to the context buffers' addresses: when DFlashDrafter._reserve reallocates them (geometric
 growth, so O(log context) times per request) the graph is captured again.
 
-Greedy (temperature 0) DFlash v2 only; everything else keeps the eager path. Enabled on sm_80+ without tensor
-parallelism, opt-in with QV_DRAFT_GRAPH=1 (measured on the dev GPU, Ripple 3e-3 drafter: 63.4 -> 59.8 ms at a 3k context, 71.2 -> 72.4 ms at 30k -- launch overhead is not where the draft time goes); the V100 / multi-GPU paths are untouched.
+Greedy (temperature 0) DFlash v2 only; everything else keeps the eager path. Opt-in: QV_DRAFT_GRAPH=1 (tp_up.sh sets it). the dev GPU, Ripple 3e-3 drafter: 63.4 -> 59.8 ms at 3k context; V100 pair, 27B
+TP: 43.8 -> 22.0 ms (there the eager draft is launch-bound).
 """
 from __future__ import annotations
 
@@ -33,12 +33,12 @@ _POOL = None
 
 
 def graph_enabled(d) -> bool:
-    if os.environ.get("QV_DRAFT_GRAPH", "0") != "1" or d.version != 2 or d.device.type != "cuda":
-        return False
-    import torch.distributed as dist
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        return False
-    return torch.cuda.get_device_capability(d.device)[0] >= 8
+    """Greedy DFlash v2 on CUDA: replay the draft block as one graph, opt-in with QV_DRAFT_GRAPH=1 (one graph per drafter:
+    a server that forks a drafter per slot would hold one each; scripts/v100/tp_up.sh turns it on). Any card, with or
+    without tensor parallelism (the split drafter's all-reduces are captured with it); a failed capture falls back to
+    the eager path. Measured on the V100 pair, 27B TP: draft 43.8 -> 22.0 ms per block, 23.3 -> 27.5 tok/s, same output.
+    Needs PYTORCH_CUDA_ALLOC_CONF without expandable_segments (with it the capture fails and the eager path runs)."""
+    return os.environ.get("QV_DRAFT_GRAPH", "0") == "1" and d.version == 2 and d.device.type == "cuda"
 
 
 class DraftGraph:

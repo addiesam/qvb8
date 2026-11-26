@@ -193,6 +193,119 @@ __global__ void __launch_bounds__(32 * WPB) qvb8r_multi(const XT* __restrict__ X
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// pm: M = 1..8, the Parallel-Matrix decode kernel. X fp16 (P, MB) (the model's own activations: exact), fp32 band
+// value, fp32 accumulate. Each warp walks RT tiles at once (RT independent rANS chains: more ILP, and every X load
+// serves RT rows -- multi re-read 32 B of fp32 X per weight from L2, the real limit). Per output row the sum is
+// the same for every MB and RT: lane j adds columns 32 s + j in order with fmaf, then one shuffle tree. So M = 1 and
+// M = 8 give the same row results (speculative decoding == plain decoding).
+template <int RG>
+__device__ __forceinline__ void pm_init(Stream& z, uint32_t* rg, const uint32_t* __restrict__ words,
+                                        const int64_t* __restrict__ tile_off, const uint2* __restrict__ states, int tile, int lane) {
+    z.wp = words + tile_off[tile];
+    const uint2 sv = states[(int64_t)tile * 32 + lane];
+    z.xl = sv.x; z.xh = sv.y; z.ptr = z.sb = 0;
+    #pragma unroll
+    for (int q = 0; q < RG / 32; ++q) rg[32 * q + lane] = __ldg(z.wp + 32 * q + lane);
+    #pragma unroll
+    for (int q = 0; q < RG / 64; ++q) z.pre[q] = __ldg(z.wp + RG + 32 * q + lane);
+}
+template <int RG>
+__device__ __forceinline__ void pm_pair(Stream& z, const uint32_t* st, uint32_t* rg, int lane, uint32_t lt,
+                                        uint32_t& s1, uint32_t& s2) {
+    s1 = stream_dec(z, st); s2 = stream_dec(z, st);
+    const bool need = z.xh == 0u;
+    const uint32_t mk = __ballot_sync(0xffffffff, need);
+    if (need) { z.xh = z.xl; z.xl = rg[(z.ptr + __popc(mk & lt)) & (RG - 1)]; }
+    z.ptr += __popc(mk);
+    if (z.ptr - z.sb >= RG / 2) {
+        #pragma unroll
+        for (int q = 0; q < RG / 64; ++q) rg[(z.sb + RG + 32 * q + lane) & (RG - 1)] = z.pre[q];
+        __syncwarp();
+        z.sb += RG / 2;
+        #pragma unroll
+        for (int q = 0; q < RG / 64; ++q) z.pre[q] = __ldg(z.wp + z.sb + RG + 32 * q + lane);
+    }
+}
+template <int MB>
+__device__ __forceinline__ void ldh(float* v, const half* p) {
+    if constexpr (MB == 8) {
+        const uint4 q = __ldg(reinterpret_cast<const uint4*>(p)); const uint32_t u[4] = {q.x, q.y, q.z, q.w};
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { const float2 f = __half22float2(*reinterpret_cast<const half2*>(&u[k])); v[2 * k] = f.x; v[2 * k + 1] = f.y; }
+    } else if constexpr (MB == 4) {
+        const uint2 q = __ldg(reinterpret_cast<const uint2*>(p));
+        float2 f = __half22float2(*reinterpret_cast<const half2*>(&q.x)); v[0] = f.x; v[1] = f.y;
+        f = __half22float2(*reinterpret_cast<const half2*>(&q.y)); v[2] = f.x; v[3] = f.y;
+    } else if constexpr (MB == 2) {
+        const uint32_t q = __ldg(reinterpret_cast<const uint32_t*>(p));
+        const float2 f = __half22float2(*reinterpret_cast<const half2*>(&q)); v[0] = f.x; v[1] = f.y;
+    } else {
+        v[0] = __half2float(p[0]);
+    }
+}
+#define PM_RG 128
+template <int MB, int RT, int TPB>
+__global__ void __launch_bounds__(32 * TPB / RT) qvb8r_pm(const half* __restrict__ X, const uint32_t* __restrict__ words,
+    const int64_t* __restrict__ tile_off, const uint2* __restrict__ states, const int64_t* __restrict__ tiles,
+    const int32_t* __restrict__ blocks, const uint32_t* __restrict__ tab, const int32_t* __restrict__ perm,
+    const float* __restrict__ mn, const float* __restrict__ ts, const int32_t* __restrict__ drow, float* __restrict__ Y, int P, int R) {
+    __shared__ uint32_t st[4096];
+    __shared__ uint32_t ring[TPB][PM_RG];
+    BLOCK_PROLOGUE(TPB / RT)
+    __syncthreads();
+    int nt = ntb - w * RT; if (nt <= 0) return; if (nt > RT) nt = RT;      // warp-uniform
+    Stream z[RT]; int r0[RT], nr[RT], nmax = 0;
+    #pragma unroll
+    for (int k = 0; k < RT; ++k) {
+        const int tile = tb + w * RT + (k < nt ? k : 0);
+        r0[k] = (int)tiles[3 * tile + 1]; nr[k] = k < nt ? (int)tiles[3 * tile + 2] : 0;
+        nmax = max(nmax, nr[k]);
+        if (k < nt) pm_init<PM_RG>(z[k], ring[w * RT + k], words, tile_off, states, tile, lane);
+    }
+    __syncwarp();
+    for (int r = 0; r < nmax; ++r) {
+        float m[RT], t[RT], acc[RT][MB]; int dr[RT], orow[RT]; bool a[RT];
+        #pragma unroll
+        for (int k = 0; k < RT; ++k) {
+            a[k] = r < nr[k];
+            orow[k] = a[k] ? perm[r0[k] + r] : 0;
+            m[k] = mn[orow[k]]; t[k] = ts[orow[k]]; dr[k] = drow[orow[k]];
+            #pragma unroll
+            for (int i = 0; i < MB; ++i) acc[k][i] = 0.f;
+        }
+        float xc[MB], xn[MB], xc2[MB], xn2[MB];
+        ldh<MB>(xc, X + (int64_t)lane * MB);
+        ldh<MB>(xn, X + (int64_t)(32 + lane) * MB);
+        for (int s0 = 0; s0 < S; s0 += 2) {
+            if (s0 + 2 < S) { ldh<MB>(xc2, X + (int64_t)((s0 + 2) * 32 + lane) * MB); ldh<MB>(xn2, X + (int64_t)((s0 + 3) * 32 + lane) * MB); }
+            #pragma unroll
+            for (int k = 0; k < RT; ++k) {
+                if (!a[k]) continue;
+                uint32_t s1, s2; pm_pair<PM_RG>(z[k], st, ring[w * RT + k], lane, lt, s1, s2);
+                const float w1 = fmaf((float)((int)s1 + dr[k]), t[k], m[k]), w2 = fmaf((float)((int)s2 + dr[k]), t[k], m[k]);
+                #pragma unroll
+                for (int i = 0; i < MB; ++i) { acc[k][i] = fmaf(xc[i], w1, acc[k][i]); acc[k][i] = fmaf(xn[i], w2, acc[k][i]); }
+            }
+            #pragma unroll
+            for (int i = 0; i < MB; ++i) { xc[i] = xc2[i]; xn[i] = xn2[i]; }
+        }
+        #pragma unroll
+        for (int k = 0; k < RT; ++k) {
+            #pragma unroll
+            for (int i = 0; i < MB; ++i) {
+                #pragma unroll
+                for (int o = 16; o; o >>= 1) acc[k][i] += __shfl_down_sync(0xffffffff, acc[k][i], o);
+            }
+            if (lane == 0 && a[k]) {
+                #pragma unroll
+                for (int i = 0; i < MB; ++i) Y[(int64_t)i * R + orow[k]] = acc[k][i];
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // M = 9..16: warp w decodes tile tb + w; all 16 warps step in lock-step. Every TC_SB steps the 16 x 32*TC_SB fp16
 // weight tile (fp16(band), as QVB8's mma path) is multiplied with the X^T tile by 2*TC_SB WMMA m16n16k16.
@@ -393,6 +506,29 @@ torch::Tensor multi(torch::Tensor X, CORE_PARAMS) {
     return Y.narrow(0, 0, M);
 }
 
+
+// pm: X (M, P) fp16, M = 1..8 -> Y (M, R) fp32. rt: tiles per warp (1, 2, 4).
+torch::Tensor pm(torch::Tensor X, CORE_PARAMS, int64_t rt, int64_t tpb) {
+    DEVICE_GUARD(words);
+    check_core(CORE_NAMES);
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kHalf && X.dim() == 2, "qvb8r pm: X must be (M, P) fp16 CUDA");
+    const int M = X.size(0), P = X.size(1), R = mn.numel();
+    TORCH_CHECK(M >= 1 && M <= 8 && P % 128 == 0, "qvb8r pm: M must be 1..8 and P % 128 == 0");
+    const int MP = M == 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : 8;
+    torch::Tensor Xt;
+    if (MP == 1) Xt = X.contiguous().view({P, 1});
+    else { Xt = torch::zeros({P, MP}, X.options()); Xt.narrow(1, 0, M).copy_(X.t()); }
+    auto Y = torch::empty({MP, R}, X.options().dtype(torch::kFloat));
+    const int nb = blocks.numel() / 3;
+    const half* xp = (const half*)Xt.data_ptr<at::Half>();
+    auto st = at::cuda::getCurrentCUDAStream();
+#define PM_GO2(MB_, RT_, TPB_) qvb8r_pm<MB_, RT_, TPB_><<<nb, 32 * TPB_ / RT_, 0, st>>>(xp, CORE_ARGS, Y.data_ptr<float>(), P, R)
+#define PM_GO(MB_, RT_) if (tpb == 16) PM_GO2(MB_, RT_, 16); else PM_GO2(MB_, RT_, 8)
+#define PM_RT(MB_) if (rt == 1) PM_GO(MB_, 1); else if (rt == 2) PM_GO(MB_, 2); else PM_GO(MB_, 4)
+    if (MP == 1) { PM_RT(1); } else if (MP == 2) { PM_RT(2); } else if (MP == 4) { PM_RT(4); } else { PM_RT(8); }
+    return Y.narrow(0, 0, M);
+}
+
 torch::Tensor tc(torch::Tensor X, CORE_PARAMS, int64_t T) {
     DEVICE_GUARD(words);
     check_core(CORE_NAMES);
@@ -441,14 +577,18 @@ torch::Tensor embed_rows(torch::Tensor rows, torch::Tensor words, torch::Tensor 
     torch::Tensor tiles, torch::Tensor tab, torch::Tensor inv_perm, torch::Tensor row_tile, torch::Tensor mn,
     torch::Tensor ts, torch::Tensor drow, torch::Tensor esc_ptr, torch::Tensor esc_col, torch::Tensor esc_val, int64_t P);
 std::vector<torch::Tensor> encode(torch::Tensor sym, torch::Tensor tiles, torch::Tensor F, torch::Tensor C);
+std::vector<torch::Tensor> cut_points(torch::Tensor words, torch::Tensor off, torch::Tensor states, torch::Tensor tiles,
+    torch::Tensor tab, torch::Tensor stop_tile, torch::Tensor stop_pair);
 torch::Tensor row_hist(torch::Tensor sym, int64_t N);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemv", &gemv, "M = 1 GEMV (fp32 X)");
     m.def("ids", &ids, "all ids (Q, P) int16, for verification");
     m.def("multi", &multi, "M = 2..8 (fp32 or bf16 X)");
+    m.def("pm", &pm, "M = 1..8 TP kernel (fp16 X, fp32 band, row-deterministic over M)");
     m.def("tc", &tc, "M = 9..16 tensor-core path (fp16 X)");
     m.def("decode", &decode, "dense rows");
+    m.def("cut_points", &cut_points, "decoder states at cut positions (CPU)");
     m.def("fix_escapes", &fix_escapes, "escape correction");
     m.def("embed_rows", &embed_rows, "CPU embedding rows");
     m.def("encode", &encode, "CPU rANS encoder (codec.encode_tensor)");

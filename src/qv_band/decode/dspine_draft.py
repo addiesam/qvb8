@@ -100,13 +100,6 @@ class DSpineDrafter(DFlashDrafter):
         self.param_bytes += sum(t.numel() * t.element_size() for t in
                                 (self.codebook, self.write_w, self.packed_w, *self.read_w))
         self._tg = self._tsv = None               # vocabulary-wide tables, built at the first propose (needs the head)
-        # Dynamic verification length (the paper's idea, with this engine's costs). A verify step of up to 8 rows
-        # (anchor + 7 drafts) runs the target's cheap multi-row kernel; 9..16 rows cost ~25 % more per step (27B qvb8r
-        # on a DGX Spark, 2026-11-15: 220 vs 276 ms). The drafter knows how sure it is of each token: p_t = the
-        # refined distribution's probability of the token it chose, S_t = p_1 ... p_t = the chance the draft is still
-        # right at t. Expected tokens of a step = 1 + sum_t S_t. Tokens SHORT+1.. are sent only when they are expected
-        # to add more than the longer step costs: (1 + sum_all S) / (1 + sum_{t<=SHORT} S) > RATIO.
-        # QV_DSPINE_DYNAMIC="SHORT:RATIO" (default 7:1.22), "0" = always send the whole draft.
         dyn = os.environ.get("QV_DSPINE_DYNAMIC", "7:1.22").strip()
         self.dyn_short, self.dyn_ratio = (0, 0.0) if dyn in ("0", "") else (int(dyn.split(":")[0]), float(dyn.split(":")[1]))
         self.dyn_full = self.dyn_cut = 0          # how often the whole draft / the short one was sent

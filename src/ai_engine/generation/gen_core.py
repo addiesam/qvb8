@@ -64,13 +64,6 @@ from typing import Any, Callable
 
 
 class DEFAULTS:
-    # --ctx-size caps PROMPT tokens (llama.cpp semantics), checked before a
-    # forward runs. When the user does not pass --ctx-size, load_model
-    # derives it from the loaded model's own max_position_embeddings
-    # (Qwen's declared context window); CTX_SIZE here is only the fallback
-    # if that field is absent from the config. It is NOT backed by a memory
-    # measurement on any machine -- see MEMORY_LIMIT_GB for the ceiling
-    # that actually holds.
     CTX_SIZE = 262144
 
     # Default OUTPUT length when a request gives none. An OUTPUT budget,
@@ -103,15 +96,6 @@ class DEFAULTS:
     # is not the constraint.
     KV_CACHE = "int8"
 
-    # Banded-KV certified tolerance (qv_band/kv/codec.py), used
-    # only by the qvb8 preset: every cached K/V element is guaranteed to decode
-    # within this absolute error (verified on the real decode, bf16 storage
-    # included). NOT the weight pack's tau. The codec is per-channel affine with
-    # a 6-bit floor and raises a head's bits until the guarantee holds -- no
-    # escape channel. 0.1 measured (2026-10-02): perplexity within 0.002 (27B)
-    # and 0.003 (35B) of a dense KV cache, prefill/decode speed unchanged;
-    # KV ~47% of dense at 8k context. A larger tau (0.5) saves bits but costs
-    # accuracy; a tau below bf16's grid at the cache's magnitudes is refused.
     KV_TAU = 0.1
 
     # Tokens kept dense in the KV cache before a bulk flush (band or
@@ -246,7 +230,7 @@ KV_CACHE_PRESETS: dict[str, str] = {
 KV_CACHE_CHOICES = tuple(k for k in KV_CACHE_PRESETS if k != "int8")   # the int8 KV baseline is not in the release
 
 
-DRAFTER_CHOICES = ("dflash", "n-gram", "n-gram_with_dflash")
+DRAFTER_CHOICES = ("dflash", "n-gram", "n-gram_with_dflash", "dspark")
 
 # Which weights the DFlash drafter runs -- see DEFAULTS.DRAFT_PACK.
 #   dense = the plain HF checkpoint (fastest on the 27B/9B; the default)
@@ -357,10 +341,21 @@ def apply_kv_shadow(model_dir: str, params: "GenParams") -> dict:
                            // max(1, int(cfg.get("num_attention_heads") or 1))))
         mpe = int(cfg.get("max_position_embeddings") or 0)
         types = cfg.get("layer_types")
+        try:                                                 # a model that runs layers more than once (a loop)
+            from types import SimpleNamespace as _NS         # has one cache layer per EXECUTION: its adapter says
+            from qv_band.engine.adapter import find_adapter
+            _ad = find_adapter(_NS(**raw))
+            _ex = _ad.execution_layer_types(raw) if _ad is not None else None
+            if _ex is not None:
+                types = _ex
+        except Exception:                                    # noqa: BLE001 - an adapter needing a full config: as is
+            pass
         if cfg.get("layers_block_type"):                     # Nemotron-H: mamba / moe / attention
             n_full = sum(1 for t in cfg["layers_block_type"] if t == "attention")
         elif types:
             n_full = sum(1 for t in types if t == "full_attention")
+        elif cfg.get("local_layer_ids") is not None:        # Inkling: the sliding layers are listed
+            n_full = int(cfg.get("num_hidden_layers") or 0) - len(cfg["local_layer_ids"])
         else:
             # No layer_types: assume every layer attends, which is the
             # conservative direction for the process-wide cap.
@@ -620,12 +615,6 @@ class GenParams:
 # argparse convenience -- optional; an interface may build GenParams by hand.
 # ---------------------------------------------------------------------------
 
-# The GenParams field each argparse dest maps to, and how to read it.
-# `dest` is what add_generation_args registers; `field` is the GenParams
-# kwarg; `sentinel` is the argparse default that means "not supplied by the
-# user" (None) -- params_from_args substitutes the GenParams default for it
-# so a hand-built Namespace missing the attribute and a supplied None are
-# treated identically.
 _ARG_FIELDS = (
     # (dest,            field,             maps None to)
     ("max_output_tokens", "max_output_tokens", DEFAULTS.MAX_OUTPUT_TOKENS),
@@ -909,11 +898,11 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
     t0 = time.time()
     if use_gpu:
         from qv_band.run.run_inference import load_qv_model
+        os.environ["QV_KV_CACHE"] = params.kv_cache      # an adapter's build_target reads it
+        os.environ["QV_KV_TAU"] = str(params.kv_tau)
+        os.environ["QV_DRAFTER"] = params.drafter or ""       # an adapter that drafts by itself reads them
+        os.environ["QV_DRAFT"] = str(params.draft_k)
         model, tok = load_qv_model(model_dir, None if dense else pack, device=gpu_dev, dtype=params.dtype)
-        # Packs are calibrated for fp16 AND bf16 first (qv_band tech_doc/restore_precision_policy.md);
-        # the dtype that runs is the user's --dtype (fp16 on a V100).
-        # With bf16 activations, prefill linears (M > 8) of a bf16-certified pack take the bf16 GEMM.
-        # Decode (M <= 8) is the GEMV kernels either way.
         from qv_band.formats.qvb8.module import enable_bf16_gemm
         n_bf16, n_lin = enable_bf16_gemm(model)
         if verbose and n_lin:
@@ -922,7 +911,7 @@ def load_model(model_dir: str, params: GenParams, *, verbose: bool = True
                       f"is not used", flush=True)
             else:
                 print(f"[load] bf16 GEMM on {n_bf16}/{n_lin} QVB8 linears", flush=True)
-        if params.prefill_linear == "int8" and not dense:
+        if params.prefill_linear == "int8" and not dense and not getattr(model, "_qv_batch_target", False):
             from ai_engine.generation.int8_prefill import install as _install_int8_prefill
             _install_int8_prefill(model, pack, verbose=verbose)
     else:
@@ -975,6 +964,8 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
 
     model, pack, model_dir = bundle.model, bundle.pack, bundle.pack
     use_cuda, gpu_dev = bundle.use_cuda, bundle.gpu_dev
+    if getattr(model, "spec_propose", None) is not None:  # the target drafts by itself (engine/spec.py protocol)
+        return None
 
     def _ngram():
         from qv_band.decode.ngram_draft import NGramDrafter
@@ -1047,6 +1038,8 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
             raise DrafterBuildError(
                 f"dflash drafter failed to build: {exc!r}") from exc
 
+
+
     try:
         if kind == "n-gram_with_mtp":
             if use_cuda:
@@ -1057,12 +1050,7 @@ def build_drafter(kind: str, bundle: ModelBundle, *,
             return build_n_gram_with_mtp_drafter(
                 model, pack, model_dir, max_ctx=max_ctx)
         if kind == "dspark":
-            if use_cuda:
-                from qv_band.decode.dspark_draft import build_dspark_drafter_cuda
-                return build_dspark_drafter_cuda(model, pack, model_dir,
-                                                 device=gpu_dev)
-            from qv_band.decode.dspark_draft import build_dspark_drafter
-            return build_dspark_drafter(model, pack, model_dir)
+            raise DrafterBuildError("--drafter dspark: this model has no drafter of its own (use --drafter dflash with a drafter pack)")
         # kind == "mtp"
         if use_cuda:
             from qv_band.decode.spec_decode import build_drafter_cuda
@@ -1108,8 +1096,10 @@ def run_generate(bundle: ModelBundle, drafter, ids, params: GenParams, *,
                  skip_special_tokens: bool = True,
                  prefix_cache=None,
                  return_cache: bool = False,
-                 on_heartbeat: Callable[[], None] | None = None):
-    """The one speculative_generate() call. Every KV-cache mode and every
+                 on_heartbeat: Callable[[], None] | None = None,
+                 on_text: Callable[[str], None] | None = None):
+    """The one speculative_generate() call. `on_text(piece)`: the streamed text (stream=True) goes there instead of
+    stdout -- a server writes it straight to its client, no process-wide stdout swap. Every KV-cache mode and every
     drafter reaches the model through here; the KV-cache preset -> kwargs mapping
     is GenParams.to_speculative_kwargs() and lives nowhere else.
 
@@ -1145,5 +1135,5 @@ def run_generate(bundle: ModelBundle, drafter, ids, params: GenParams, *,
         stream=stream, kv_stats=kv_stats, abort_check=abort_check,
         skip_special_tokens=skip_special_tokens,
         prefix_cache=prefix_cache, return_cache=return_cache,
-        on_heartbeat=on_heartbeat,
+        on_heartbeat=on_heartbeat, on_text=on_text,
         **params.to_speculative_kwargs())

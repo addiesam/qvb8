@@ -108,3 +108,44 @@ torch::Tensor row_hist(torch::Tensor sym, int64_t N) {
     for (int64_t r = 0; r < R; ++r) for (int64_t j = 0; j < P; ++j) ++hp[r * N + sp[r * P + j]];
     return H;
 }
+
+// cut_points: the decoder state of chosen tiles at chosen symbol-pair positions, for cutting a table in place
+// (formats/qvb8r/cut.py). stop_tile / stop_pair: (n,) int64, sorted by tile then pair; pair = row_in_tile * (P / 64)
+// + column / 64 (0 = the tile's start, rows * P / 64 = its end). Walks exactly as embed_rows (both symbols of every
+// lane, then lanes in lane order refill), no symbols written. -> states (n, 32) u64 as i64, word position (n,) i64
+// (absolute index into `words`): a tile that starts there with those states decodes the rest of the stream exactly.
+std::vector<torch::Tensor> cut_points(torch::Tensor words, torch::Tensor off, torch::Tensor states, torch::Tensor tiles,
+    torch::Tensor tab, torch::Tensor stop_tile, torch::Tensor stop_pair) {
+    for (const torch::Tensor& t : {words, off, states, tiles, tab, stop_tile, stop_pair})
+        TORCH_CHECK(t.device().is_cpu() && t.is_contiguous(), "qvb8r cut_points: contiguous CPU tensors");
+    const int64_t n = stop_tile.numel();
+    const uint32_t* Wd = (const uint32_t*)words.data_ptr<int32_t>();
+    const int64_t* O = off.data_ptr<int64_t>(); const uint64_t* St = (const uint64_t*)states.data_ptr<int64_t>();
+    const int64_t* Ti = tiles.data_ptr<int64_t>(); const uint32_t* Tb = (const uint32_t*)tab.data_ptr<int32_t>();
+    const int64_t* ST = stop_tile.data_ptr<int64_t>(); const int64_t* SP = stop_pair.data_ptr<int64_t>();
+    auto out_s = torch::empty({n, 32}, torch::kInt64); auto out_p = torch::empty({n}, torch::kInt64);
+    uint64_t* OS = (uint64_t*)out_s.data_ptr<int64_t>(); int64_t* OP = out_p.data_ptr<int64_t>();
+    std::vector<int64_t> grp;                                   // first stop of each tile's group
+    for (int64_t i = 0; i < n; ++i) if (i == 0 || ST[i] != ST[i - 1]) grp.push_back(i);
+    grp.push_back(n);
+    pybind11::gil_scoped_release nogil;                         // loader threads cut other tables meanwhile
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int64_t g = 0; g < (int64_t)grp.size() - 1; ++g) {
+        const int64_t tile = ST[grp[g]]; const uint32_t* tb = Tb + Ti[3 * tile] * 4096;
+        uint64_t x[32]; for (int j = 0; j < 32; ++j) x[j] = St[tile * 32 + j];
+        int64_t ptr = O[tile], p = 0;
+        for (int64_t i = grp[g]; i < grp[g + 1]; ++i) {
+            for (; p < SP[i]; ++p)
+                for (int j = 0; j < 32; ++j) {
+                    for (int h = 0; h < 2; ++h) {
+                        const uint32_t E = tb[x[j] & 4095u];
+                        x[j] = (uint64_t)((E >> 22) + 1u) * (x[j] >> 12) + ((E >> 11) & 2047u);
+                    }
+                    if (x[j] < (1ull << 32)) x[j] = (x[j] << 32) | Wd[ptr++];
+                }
+            for (int j = 0; j < 32; ++j) OS[i * 32 + j] = x[j];
+            OP[i] = ptr;
+        }
+    }
+    return {out_s, out_p};
+}

@@ -64,6 +64,8 @@ from ai_engine.generation.gen_core import (
     DEFAULTS, GenParams, add_generation_args,
     params_from_args, build_drafter, run_generate)
 from ai_engine.generation.loader import load_qvb8_llm
+from ai_engine.servers.llm_server_stream import (StreamMixin, _SSEOut, _StreamState,  # noqa: F401
+                                                 _ThinkSplitter)
 
 MODEL_ID = "qv-band-local"
 
@@ -292,7 +294,7 @@ class Overloaded(Exception):
 
 @dataclass
 class Limits:
-    """Admission control of the batch scheduler (2026-11-14). 0 = no limit.
+    """Admission control of the batch scheduler. 0 = no limit.
 
     WHY. The scheduler used to admit every queued request into the live batch at once; under a burst the only brake was
     the VRAM ceiling check inside a step, which fails the WHOLE batch. Now a request enters the batch only when it fits:
@@ -618,7 +620,7 @@ class BatchScheduler:
 
     def _die(self, e: BaseException) -> None:
         """The step loop cannot go on (it raised outside a step, or the engine could not be rebuilt after a failed
-        step). Before 2026-11-14 the thread just ended: every client kept waiting on its queue and the server looked
+        step). Before the thread just ended: every client kept waiting on its queue and the server looked
         healthy. Now every admitted and queued request gets the error, and the server reports itself unusable."""
         self.dead = f"{type(e).__name__}: {e}"
         print(f"[scheduler] FATAL: the step loop ended: {self.dead} -- every request fails until the server is "
@@ -709,6 +711,18 @@ class BatchScheduler:
                   f"(waiting in queue: {self._q.qsize()})",
                   file=sys.__stdout__, flush=True)
 
+    def _new_engine(self):
+        """The model's batch engine: a BatchTarget (adapter with its own forward) runs on
+        engine/target_engine.TargetBatchEngine, every HF-skeleton model on ContinuousBatchEngine."""
+        if getattr(self.model, "_qv_batch_target", False):
+            from qv_band.engine.target_engine import TargetBatchEngine
+            return TargetBatchEngine(self.model, self.tok, prefill_chunk=self.prefill_chunk)
+        from qv_band.decode.spec_decode import ContinuousBatchEngine
+        return ContinuousBatchEngine(
+            self.model, self.tok, drafter_factory=self.drafter_factory,
+            k=self.k, kv_tau=self.kv_tau, int8_residual_length=self.kv_residual,
+            prefill_chunk=self.prefill_chunk)
+
     def _run(self) -> None:
         try:
             self._run_loop()
@@ -721,10 +735,7 @@ class BatchScheduler:
         print("[scheduler] continuous-batching engine thread started",
               file=sys.__stdout__, flush=True)
         _enter_home(self.model)              # this thread's kernels launch on the model's card, not on cuda:0
-        self._engine = ContinuousBatchEngine(
-            self.model, self.tok, drafter_factory=self.drafter_factory,
-            k=self.k, kv_tau=self.kv_tau, int8_residual_length=self.kv_residual,
-            prefill_chunk=self.prefill_chunk)
+        self._engine = self._new_engine()
         engine = self._engine
         engine.cancel_check = self._cancel_snapshot
         engine.over_ceiling = vram_abort_check
@@ -824,11 +835,7 @@ class BatchScheduler:
                         torch.cuda.empty_cache()
                 except Exception:
                     pass
-                self._engine = ContinuousBatchEngine(
-                    self.model, self.tok, drafter_factory=self.drafter_factory,
-                    k=self.k, kv_tau=self.kv_tau,
-                    int8_residual_length=self.kv_residual,
-                    prefill_chunk=self.prefill_chunk)
+                self._engine = self._new_engine()
                 engine = self._engine
                 engine.cancel_check = self._cancel_snapshot
                 engine.over_ceiling = vram_abort_check
@@ -884,7 +891,10 @@ def load(model_dir: str, think: bool, params: "GenParams"):
 
     print(f"[serve] backend {bundle.gpu_dev or 'cpu'}   pack {bundle.pack}",
           flush=True)
-    print(f"[serve] KV cache: {params.describe_kv()}", flush=True)
+    if getattr(bundle.model, "_qv_batch_target", False):
+        print(f"[serve] KV cache: the model adapter's own ({getattr(bundle.model, '_qv_kv_desc', 'bf16')})", flush=True)
+    else:
+        print(f"[serve] KV cache: {params.describe_kv()}", flush=True)
 
     STATE.update(
         model=bundle.model, tok=bundle.tok, pack=bundle.pack, think=think,
@@ -917,8 +927,12 @@ def load(model_dir: str, think: bool, params: "GenParams"):
     # tensor lives on its layer's card (BandedKVLayer._adopt_device / add_slot) and drafter taps are gathered on the
     # main card (unified_scheduler.md section 4).
     _pipeline = bool(os.environ.get("QV_PIPELINE", "").strip())      # N-card placement: served by the scheduler too
-    # The checkpoint grid must sit on chunk boundaries: refuse a wrong --prefix-checkpoint-every HERE, at start, not
-    # inside the scheduler thread (2026-11-12: a check there killed the thread and every request hung).
+    if getattr(bundle.model, "_qv_batch_target", False):
+        # engine/target_engine runs the model whole on one card (its prefixes do use the machine pool):
+        # N-card placement and remote stages are BandedKVCache features.
+        for _env, _flag in (("QV_PIPELINE", "--pipeline"), ("QV_STAGES", "--pipeline HOST:PORT")):
+            if os.environ.get(_env, "").strip():
+                raise SystemExit(f"{_flag}: not supported for a model adapter target ({type(bundle.model).__name__})")
     if params.qvb8_resident and not _SCHEDULER_OFF:
         from qv_band.decode.spec_decode import ckpt_every_for
         try:
@@ -950,7 +964,10 @@ def load(model_dir: str, think: bool, params: "GenParams"):
         # A split model (remote stages): this pool holds the layers that run HERE, each stage worker keeps its layers in
         # its own machine's pool (start it with --prefix-store shared too). The pool's fingerprint and the transfer
         # signature carry the split, so a whole-model server never meets these partial entries.
-        _split = (os.environ.get("QV_STAGES", "").strip(), os.environ.get("QV_LAYERS_HERE", "").strip())
+        # ... and the tensor-parallel processes (engine/proc_tp): an entry then holds one share per rank, never readable by a
+        # server with another rank count
+        _split = (os.environ.get("QV_STAGES", "").strip(), os.environ.get("QV_LAYERS_HERE", "").strip(),
+                  *((f"tp{os.environ['WORLD_SIZE']}",) if int(os.environ.get("WORLD_SIZE", "1")) > 1 else ()))
         from qv_band.decode.shared_prefix import config_tag, pack_signature
         from qv_band.decode.spec_decode import ckpt_every_for
         _dm = str(getattr(params, "draft_model", "") or "")
@@ -990,7 +1007,8 @@ def load(model_dir: str, think: bool, params: "GenParams"):
             raise SystemExit("--pipeline with a remote stage needs the scheduler (--kv-cache qvb8, no --no-scheduler)")
         from qv_band.decode.remote_stage import attach_from_env
         attach_from_env(bundle.model)
-    if params.qvb8_resident and not _SCHEDULER_OFF:
+    _target = bool(getattr(bundle.model, "_qv_batch_target", False))     # adapter with its own forward
+    if (params.qvb8_resident or _target) and not _SCHEDULER_OFF:
         # A DFlash drafter carries gigabytes of weights: every slot gets a
         # fork() of the one already built (shared weights, own context)
         # instead of loading the draft model once per concurrent request.
@@ -1017,8 +1035,8 @@ def load(model_dir: str, think: bool, params: "GenParams"):
         scheduler.start()
         STATE["scheduler"] = scheduler
         print("[serve] continuous-batching scheduler ACTIVE "
-              "(qvb8_resident) -- concurrent requests share "
-              "batched forward passes", flush=True)
+              f"({'model adapter target: engine/target_engine' if _target else 'qvb8_resident'}) -- concurrent "
+              "requests share batched forward passes", flush=True)
     else:
         # Serialised path: one request at a time behind STATE["lock"], using
         # the stock attention implementation. Chosen by --no-scheduler, or
@@ -1159,45 +1177,10 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _THINK_CLOSE_RE = re.compile(r"^.*?</think>", re.DOTALL)
 
 
-class _ThinkSplitter:
-    """Splits a token stream at the model's </think> into reasoning and answer
-    text. The tag can arrive split across pieces ("</th" + "ink>"), so while in
-    the reasoning part the last len(tag)-1 characters are held back until the
-    next piece shows they are not the start of the tag."""
-    CLOSE = "</think>"
 
-    def __init__(self, in_reasoning: bool):
-        self.reasoning = in_reasoning
-        self._hold = ""
 
-    def feed(self, piece: str) -> list[tuple[str, str]]:
-        """-> [("reasoning_content" | "content", text), ...]"""
-        self._hold += piece
-        out: list[tuple[str, str]] = []
-        while self.reasoning:
-            if self.CLOSE in self._hold:
-                head, _, self._hold = self._hold.partition(self.CLOSE)
-                if head:
-                    out.append(("reasoning_content", head))
-                self.reasoning = False
-                continue
-            keep = len(self.CLOSE) - 1
-            if len(self._hold) > keep:
-                out.append(("reasoning_content", self._hold[:-keep]))
-                self._hold = self._hold[-keep:]
-            return out
-        if self._hold:
-            out.append(("content", self._hold))
-            self._hold = ""
-        return out
 
-    def finish(self) -> list[tuple[str, str]]:
-        """Whatever is still held when the stream ends (an unclosed think block
-        stays reasoning)."""
-        text, self._hold = self._hold, ""
-        if not text:
-            return []
-        return [("reasoning_content" if self.reasoning else "content", text)]
+
 
 
 def _chat_format():
@@ -1515,7 +1498,7 @@ def generate(text: str, max_tokens: int, draft: int, on_token=None,
 
 VISION_BODY_BYTES = 32 << 20     # image payload allowance per request with --vision on (base64 data URLs)
 
-class Handler(QVHTTPHandler):
+class Handler(StreamMixin, QVHTTPHandler):
     LOG_TAG = "serve"
 
     # ~6 bytes/token is a generous upper bound for UTF-8 text plus JSON
@@ -1720,151 +1703,6 @@ class Handler(QVHTTPHandler):
                       "total_tokens": r["prompt_tokens"] + r["completion_tokens"]},
             "timings": r.get("timings")})
 
-    def _vision_chat_stream(self, body, max_tokens, think, temperature, top_k, top_p,
-                            req_id: int = 0):
-        """SSE version of _vision_chat. The image route used to answer a streaming
-        request with ONE JSON body after the whole generation (tower load + a
-        thinking block of thousands of tokens), so a client saw no bytes for
-        minutes and gave up or looked hung. Here headers and a keep-alive go out
-        at once, tokens stream as they are sampled (reasoning_content before
-        </think>, content after), and a client that goes away stops the run."""
-        from ai_engine.generation import vision as _vision
-        from qv_band.decode.spec_decode import _IncStreamer
-        bundle = STATE["bundle"]
-        has_tools = bool(body.get("tools"))
-        stops = _stop_list(body)
-        margin = max((len(x) for x in stops), default=1) - 1
-        include_usage = body.get("stream_options", {}).get("include_usage", True)
-        created = int(time.time())
-        cid = f"chatcmpl-{created}"
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", self._cors_value())
-        self.send_header("Vary", "Origin")
-        self._end_close()
-        self.end_headers()
-
-        def write(data: bytes) -> None:
-            self.connection.settimeout(2.0)
-            try:
-                self.wfile.write(data)
-                self.wfile.flush()
-            finally:
-                self.connection.settimeout(None)
-
-        def sse(obj) -> None:
-            write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
-
-        def gone() -> bool:
-            try:
-                import select
-                r, _, _ = select.select([self.connection], [], [], 0)
-                return bool(r) and self.connection.recv(
-                    1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-            except (BlockingIOError, InterruptedError):
-                return False
-            except OSError:
-                return True
-
-        def delta(key: str, text: str) -> None:
-            if text:
-                sse({"id": cid, "object": "chat.completion.chunk", "created": created,
-                     "model": MODEL_ID, "choices": [{"index": 0, "delta": {key: text}}]})
-
-        split = _ThinkSplitter(bool(think))
-        st = {"sent": 0, "content": [], "n": 0}
-        streamer = None
-        t0 = time.time()
-        # Same "arrived" line the text path prints -- without it a streaming
-        # image request is invisible in the log until it finishes (or dies).
-        print(f"[serve] {_ts()} req #{req_id} arrived "
-              f"(thread={threading.current_thread().name}), vision stream",
-              file=sys.__stdout__, flush=True)
-
-        def route_pieces(pieces) -> None:
-            for key, text in pieces:
-                if key == "reasoning_content":
-                    delta(key, text)
-                    continue
-                st["content"].append(text)
-                if has_tools:                           # needs the whole text for parse_tool_calls
-                    continue
-                full = "".join(st["content"])
-                hit, _ = _truncate_at_stop(full, stops)
-                cut = min(max(len(full) - margin, st["sent"]), len(hit))
-                delta("content", full[st["sent"]:cut])
-                st["sent"] = cut
-
-        try:
-            write(b": ping\n\n")                      # bytes on the wire before the slow parts
-            with STATE["lock"], _batch_paused():
-                ad = _vision.adapter(bundle, STATE.get("drafter_obj"))            # first image request loads the tower
-                write(b": ping\n\n")
-                streamer = _IncStreamer(bundle.tok)
-
-                def on_token(tid: int) -> None:
-                    st["n"] += 1
-                    route_pieces(split.feed(streamer.feed([tid])))
-
-                r = ad.generate(
-                    _denormalise_tool_calls(body["messages"]), tools=body.get("tools"),
-                    think=think, max_new=max_tokens,
-                    temperature=0.0 if temperature is None else float(temperature),
-                    top_k=20 if top_k is None else int(top_k),
-                    top_p=0.95 if top_p is None else float(top_p),
-                    on_token=on_token, should_stop=gone,
-                    on_progress=lambda: write(b": ping\n\n"),
-                    prefill_chunk=getattr(STATE.get("params"), "prefill_chunk", None))
-                _maybe_empty_cache(bundle)
-            if r.get("stopped"):
-                print(f"[serve] {_ts()} req #{req_id} vision stream: client gone after "
-                      f"{time.time() - t0:.1f}s, {st['n']} tok",
-                      file=sys.__stdout__, flush=True)
-                return
-            route_pieces(split.feed(streamer.finish()))  # a half-emitted codepoint held back
-            route_pieces(split.finish())
-            text, hit_stop = _truncate_at_stop("".join(st["content"]), stops)
-            finish = "stop" if hit_stop or r["completion_tokens"] < max_tokens else "length"
-            if has_tools:
-                content, tool_calls = parse_tool_calls(text)
-                last = {"tool_calls": tool_calls} if tool_calls else {"content": content or text or None}
-                finish = "tool_calls" if tool_calls else finish
-            else:
-                delta("content", text[st["sent"]:])
-                last = {}
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                     "model": MODEL_ID,
-                     "choices": [{"index": 0, "delta": last, "finish_reason": finish}]}
-            if include_usage:
-                chunk["usage"] = {"prompt_tokens": r["prompt_tokens"],
-                                  "completion_tokens": r["completion_tokens"],
-                                  "total_tokens": r["prompt_tokens"] + r["completion_tokens"]}
-                if r.get("timings"):
-                    chunk["timings"] = r["timings"]
-            sse(chunk)
-            write(b"data: [DONE]\n\n")
-            STATE["served"] += 1
-            STATE["tokens"] += r["completion_tokens"]
-            dt = time.time() - t0
-            print(f"[serve] {_ts()} req #{req_id} done: {st['n']} tok in {dt:.1f}s "
-                  f"({st['n']/dt:.2f} tok/s), {r['prompt_tokens']} prompt tok, "
-                  f"{r.get('images', 0)} image(s), vision stream",
-                  file=sys.__stdout__, flush=True)
-        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
-            print(f"[serve] {_ts()} req #{req_id} vision stream: connection lost "
-                  f"after {time.time() - t0:.1f}s",
-                  file=sys.__stdout__, flush=True)
-        except Exception as e:
-            print(f"[serve] {_ts()} req #{req_id} vision failed: {type(e).__name__}: {e}",
-                  file=sys.__stdout__, flush=True)
-            traceback.print_exc()
-            try:
-                sse({"error": {"message": f"vision: {e}", "type": type(e).__name__}})
-                write(b"data: [DONE]\n\n")
-            except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
-                pass
 
     def do_POST(self):
         route = self.path.rstrip("/")
@@ -1929,6 +1767,11 @@ class Handler(QVHTTPHandler):
             # generate()/_stream(); they now apply to drafted runs too, since
             # speculative_generate verifies with speculative sampling when
             # temperature > 0 instead of forcing greedy.
+            # OpenAI-compatible clients (the vLLM / SGLang convention) switch thinking with chat_template_kwargs:
+            # the same switch as "think" (servers/tp_server.py reads both the same way)
+            _ctk = body.get("chat_template_kwargs")
+            if "think" not in body and isinstance(_ctk, dict) and "enable_thinking" in _ctk:
+                body["think"] = bool(_ctk["enable_thinking"])
             temperature = body.get("temperature")
             top_k = body.get("top_k")
             top_p = body.get("top_p")
@@ -1943,6 +1786,31 @@ class Handler(QVHTTPHandler):
                 # 400 naming the actual problem.
                 return self._send(400, {"error": "messages required"})
 
+            # Opt-in capture (LLM_DUMP_DIR): each DISTINCT system prompt once (by hash) + one tiny params line per request
+            # (temperature/top_p/max_tokens/...). Used to learn what a real client (Cline/OpenCode) sends; never breaks serving.
+            _dd = os.environ.get("LLM_DUMP_DIR")
+            if _dd:
+                try:
+                    import hashlib, time as _t
+                    os.makedirs(_dd, exist_ok=True)
+                    _ms = body.get("messages") or []
+                    for _m in _ms:
+                        if _m.get("role") == "system":
+                            _txt = _m["content"] if isinstance(_m["content"], str) else json.dumps(_m["content"])
+                            _fn = os.path.join(_dd, "system_" + hashlib.sha1(_txt.encode()).hexdigest()[:12] + ".txt")
+                            if not os.path.exists(_fn):
+                                open(_fn, "w").write(_txt)
+                    import gzip                       # full body (messages + tools) so a bad output can be replayed exactly
+                    os.makedirs(os.path.join(_dd, "bodies"), exist_ok=True)
+                    _bid = f"{int(_t.time() * 1000)}_{os.getpid()}"
+                    with gzip.open(os.path.join(_dd, "bodies", _bid + ".json.gz"), "wt") as _g:
+                        json.dump(body, _g)
+                    with open(os.path.join(_dd, "requests.jsonl"), "a") as _f:
+                        _f.write(json.dumps({"ts": int(_t.time()), "body": _bid, "route": route, "n_messages": len(_ms),
+                                             **{k: body.get(k) for k in ("temperature", "top_p", "top_k", "max_tokens", "think", "stream")},
+                                             "has_tools": bool(body.get("tools"))}) + "\n")
+                except Exception:
+                    pass
             think_enabled = bool(body.get("think", STATE.get("think", True)))
             # image_url content -> the vision route (generation/vision.py);
             # text-only requests never take it.
@@ -1972,8 +1840,6 @@ class Handler(QVHTTPHandler):
                     f"context size of {STATE['ctx_size']} (--ctx-size). "
                     f"Send a shorter prompt or restart with a larger "
                     f"--ctx-size.")})
-            # The output budget is what is left of the context after the prompt (before 2026-11-14 only the prompt
-            # was checked: prompt + max_tokens could run past --ctx-size, the size the KV shadow is planned for).
             if n_prompt + max_tokens > STATE["ctx_size"]:
                 max_tokens = STATE["ctx_size"] - n_prompt
                 if max_tokens < 1:
@@ -2054,6 +1920,9 @@ class Handler(QVHTTPHandler):
                 "created": created, "model": model_id,
                 "choices": [{"text": r["text"], "index": 0,
                              "finish_reason": finish}], "usage": usage, "timings": r.get("timings")})
+        fmt = _chat_format()
+        if fmt is not None and hasattr(fmt, "split") and fmt.split(r["text"])[2]:
+            r["text"] = fmt.strip_reasoning(r["text"])
         content, tool_calls = parse_tool_calls(r["text"])
         message = {"role": "assistant", "content": content or None}
         if tool_calls:
@@ -2065,839 +1934,6 @@ class Handler(QVHTTPHandler):
             "choices": [{"index": 0, "finish_reason": finish,
                          "message": message}], "usage": usage, "timings": r.get("timings")})
 
-    def _stream(self, text: str, max_tokens: int, draft: int, route: str,
-               has_tools: bool = False, think: bool = False,
-               stops: list[str] | None = None,
-               temperature: float | None = None, top_k: int | None = None,
-               top_p: float | None = None, req_id: int = 0,
-               include_usage: bool = False):
-        """Server-sent events.  At ~0.6 tok/s a long answer is minutes away,
-        so streaming is the difference between usable and not.
-
-        When the request carried "tools", a <tool_call> block can appear
-        anywhere in the generated text and must never reach the client as
-        raw content (Cline etc. would render the literal XML). There is no
-        cheap way to know a token is/isn't inside a future tool call as it
-        streams, so with has_tools this buffers the whole generation instead
-        of emitting live deltas, then runs parse_tool_calls() once at the
-        end -- same parser the non-streaming path uses. Requests without
-        tools are unaffected and keep the original token-by-token path.
-
-        Thinking (enable_thinking=True) is streamed incrementally too, but
-        on a SEPARATE wire field: everything up to (not including) the
-        closing </think> tag is sent as delta.reasoning_content, matching
-        the vLLM/SGLang/DeepSeek convention Cline and other OpenAI-
-        compatible clients already parse into their own collapsible
-        "thinking" UI -- see reasoning_content in streaming docs. This
-        replaces the older behaviour of buffering the whole response until
-        </think> closed and discarding everything before it: that made a
-        long reasoning block (this checkpoint's <think> routinely runs
-        1200-5700+ tokens) look like a multi-minute hang with zero bytes
-        on the wire, even though decode was running at its normal rate the
-        whole time -- the client had nothing to show, not because nothing
-        was happening. Streaming reasoning_content fixes the PERCEIVED
-        latency; it does not change decode throughput itself.
-
-        has_tools keeps the old whole-response buffer: a <tool_call> block
-        can appear anywhere in the generated text and must never reach the
-        client as raw content, and unlike the </think> boundary there is
-        no cheap way to know a token is/isn't inside a future tool call as
-        it streams, so this still buffers to run parse_tool_calls() once
-        at the end. Requests without tools use the incremental path below
-        regardless of `think` -- thinking and non-thinking content share
-        the same split-by-</think> logic, just with reasoning_content
-        empty (immediate switch to content) when </think> never appears
-        (e.g. --no-think, or a non-thinking checkpoint).
-
-        "stop" strings can span more than one streamed piece, so a small
-        trailing window (the longest stop string, minus one char) is always
-        held back before emitting; once a stop is found in the held buffer,
-        emission cuts off there and the rest of the generation (which still
-        runs to completion internally -- see _truncate_at_stop) is dropped
-        rather than sent.
-        """
-        # Only the POST-</think> content needs buffering for has_tools: a
-        # <tool_call> block is emitted by the checkpoint's own chat template
-        # convention only in the answer that follows </think>, never inside
-        # the reasoning block itself (the template puts <think> first,
-        # always closed before any tool-call or plain-answer text begins).
-        # So reasoning can stream incrementally exactly like the no-tools
-        # path -- only content AFTER </think> needs to wait for
-        # parse_tool_calls() to run once at the end. `buffer_all` now means
-        # "buffer post-</think> content", not "buffer everything"; a
-        # request with think=False and has_tools=True still buffers from
-        # the first byte, since there is no </think> to wait for.
-        buffer_all = has_tools
-        stops = stops or []
-        margin = max((len(s) for s in stops), default=1) - 1
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", self._cors_value())
-        self.send_header("Vary", "Origin")
-        self._end_close()
-        self.end_headers()
-
-        bundle = STATE["bundle"]
-        tok = bundle.tok          # model is reached via run_generate(bundle, ...)
-        _enter_home(bundle.model)
-        ids = tok(text, return_tensors="pt").input_ids
-        if bundle.use_gpu:
-            ids = ids.to(bundle.gpu_dev)
-        created = int(time.time())
-        model_id = MODEL_ID
-        chat = route == "/v1/chat/completions"
-
-        # Disconnect detection is a select()+recv() -- two syscalls. Doing
-        # it per token (the abort_check runs once per decode step) is a
-        # measurable serialising cost at this token rate, and a client that
-        # left is fine to notice a fraction of a second later. Throttle to
-        # a wall-clock interval; llama.cpp's server polls is_connection_
-        # closed roughly the same way rather than every token.
-        _PEER_POLL_S = 0.25
-        _peer_last = [0.0, False]   # [last_check_time, last_result]
-
-        # Bounds every socket write _pump() makes -- see its own comment
-        # for why an unbounded write is a real risk (it runs on the thread
-        # holding the global generation lock, for every emitted piece, not
-        # just the heartbeat). A slow-but-alive client legitimately
-        # reading at a trickle could in principle hit this and lose a
-        # piece; that is the correct tradeoff since the alternative is an
-        # unbounded stall of every other queued request on this server,
-        # not just the slow one.
-        _WRITE_TIMEOUT_S = 2.0
-
-        def _peer_gone(force: bool = False) -> bool:
-            now = time.monotonic()
-            if not force and now - _peer_last[0] < _PEER_POLL_S:
-                return _peer_last[1]
-            _peer_last[0] = now
-            try:
-                import select
-                sock = self.connection
-                r, _, _ = select.select([sock], [], [], 0)
-                gone = bool(r) and sock.recv(
-                    1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-            except (BlockingIOError, InterruptedError):
-                gone = False
-            except OSError:
-                gone = True
-            _peer_last[1] = gone
-            return gone
-
-        # SSE chunks are coalesced and flushed on a wall-clock interval
-        # rather than per token: a per-token write()+flush() syscall pair
-        # serialises with the decode at this token rate, and the client
-        # (Cline, a browser EventSource) renders on its own frame budget
-        # anyway. SGLang and llama.cpp both batch their stream writes.
-        _FLUSH_S = 0.05
-        _wbuf: list[bytes] = []
-        _wbuf_last = [time.monotonic()]
-
-        def _sse(obj) -> None:
-            _wbuf.append(b"data: " + json.dumps(obj, ensure_ascii=False).encode()
-                         + b"\n\n")
-
-        def _pump(force: bool = False) -> None:
-            # self.wfile.write()/flush() are BLOCKING socket calls with no
-            # timeout by default -- a slow or half-dead client (stopped
-            # reading but never closed cleanly) can stall this write
-            # indefinitely. Every call site runs on the thread holding
-            # STATE["lock"] for the WHOLE generation (emit()'s per-token
-            # writes during decode, not just _ping()'s 20s heartbeat), so
-            # an unbounded stall here blocks every other queued request on
-            # this server, not just the slow one. Bound with a send
-            # timeout; on expiry the write raises socket.timeout, which
-            # every caller already catches alongside BrokenPipeError/
-            # ConnectionResetError (a stalled client is the same "nothing
-            # left to deliver" outcome as a closed one from the caller's
-            # side).
-            if not _wbuf:
-                return
-            now = time.monotonic()
-            if not force and now - _wbuf_last[0] < _FLUSH_S:
-                return
-            self.connection.settimeout(_WRITE_TIMEOUT_S)
-            try:
-                self.wfile.write(b"".join(_wbuf))
-                self.wfile.flush()
-            finally:
-                self.connection.settimeout(None)
-            _wbuf.clear()
-            _wbuf_last[0] = now
-
-        def _ping() -> None:
-            # SSE keep-alive, passed to run_generate as on_heartbeat: fires
-            # on a wall-clock timer (HEARTBEAT_INTERVAL_S, spec_decode.py)
-            # during BOTH a long chunked prefill and a slow/stalled decode
-            # stretch, not just prefill -- decode tokens are normally their
-            # own heartbeat, but heavy draft rejection or GPU contention
-            # can still leave a real silent gap. A `:`-prefixed line is a
-            # COMMENT per the SSE spec, never a `data:` event, so every
-            # conformant client (including Cline's) ignores its content
-            # but still sees the byte traffic and resets its own body-read
-            # timeout. Confirmed root cause of Cline's own "terminated:
-            # BodyTimeoutError (UND_ERR_BODY_TIMEOUT)": a long silent
-            # stretch producing zero streamed bytes is exactly what a
-            # body-read timeout watches for -- Cline then cancels and
-            # resubmits, landing a NEW request behind the old one in this
-            # server's single-flight queue (see _peer_gone/the docstring
-            # above) and compounding the delay each retry. force=True:
-            # skip _pump's throttle, since the whole point is to land
-            # bytes on the wire promptly, not batch them with real content
-            # that has not started yet.
-            # force=True's write is bounded the same as every other _pump()
-            # call -- see that function's own comment. The heartbeat is
-            # best-effort by design (a missed ping just means the client's
-            # own body-read timeout fires sooner), so losing one to a
-            # write timeout is always safe to swallow.
-            _wbuf.append(b": ping\n\n")
-            try:
-                _pump(force=True)
-            except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
-                pass  # let the next _peer_gone() poll notice and abort
-
-        def emit(piece: str, reasoning: bool = False):
-            if _peer_gone():
-                raise _ClientGone()
-            if chat:
-                delta_key = "reasoning_content" if reasoning else "content"
-                obj = {"id": f"chatcmpl-{created}",
-                       "object": "chat.completion.chunk", "created": created,
-                       "model": model_id,
-                       "choices": [{"index": 0, "delta": {delta_key: piece}}]}
-            else:
-                # /v1/completions and /generate have no reasoning_content
-                # slot in their wire shape -- reasoning text is dropped
-                # there, same as this whole feature not existing pre-fix,
-                # since only the chat-completions shape has a place to put
-                # it and a client (Cline) actually parsing it.
-                if reasoning:
-                    return
-                obj = {"text": piece}
-            _sse(obj)
-            _pump()
-
-        buf: list[str] = []
-        pending = [""]      # held-back trailing window, for stop matching
-        stopped = [False]
-        # `think`-only requests (has_tools handled separately, still fully
-        # buffered): track whether </think> has closed yet, so held-back
-        # pending text can be routed to reasoning_content before the close
-        # and content after. _THINK_TAG is the tag itself, never emitted;
-        # margin must also cover it so a tag split across two writes is
-        # not missed the same way a stop string would not be.
-        _THINK_TAG = "</think>"
-        in_reasoning = [think]
-        reasoning_margin = max(margin, len(_THINK_TAG) - 1) if think else margin
-
-        # speculative_generate prints as it goes; capture that stream instead
-        # of re-implementing the loop, by swapping stdout for a shim.
-        # A model whose output OPENS its own <think> (Ripple) decides reasoning vs content from its first
-        # characters instead of assuming the prompt opened the block (Qwen). None = Qwen behaviour, unchanged.
-        _fmt = _chat_format()
-        _gate = _fmt.new_stream_gate() if (_fmt is not None and think) else None
-
-        class _Shim:
-            def write(_s, piece):
-                if not piece or stopped[0]:
-                    return
-                if _gate is not None:
-                    piece, _dec = _gate.feed(piece)
-                    if _dec is False:
-                        in_reasoning[0] = False
-                    if not piece:
-                        return
-                if buffer_all and not in_reasoning[0]:
-                    # Past </think> (or think=False, so in_reasoning started
-                    # False and there is no boundary to wait for) -- a
-                    # <tool_call> can appear anywhere in this remaining
-                    # text, so it must stay buffered for parse_tool_calls()
-                    # at the end.
-                    buf.append(piece)
-                    return
-                pending[0] += piece
-                cut = min((pending[0].index(s) for s in stops if s in pending[0]),
-                         default=None)
-                if cut is not None:
-                    stopped[0] = True
-                    out = pending[0][:cut]
-                    pending[0] = ""
-                elif len(pending[0]) > reasoning_margin:
-                    split = len(pending[0]) - reasoning_margin
-                    # BUG FIX: a fixed-width margin (len(_THINK_TAG)-1
-                    # trailing chars retained) is not enough on its own --
-                    # it protects the SUFFIX of pending[0] from being
-                    # released while it could still grow into the tag, but
-                    # says nothing about the split point ITSELF landing
-                    # inside a partial tag match. Concretely: pending[0] =
-                    # "...this. </think>" splits at len-7, releasing
-                    # "...this. <" (ending in the tag's OPENING '<') and
-                    # retaining "/think>" (7 chars) -- neither the released
-                    # prefix nor the retained suffix contains the full tag
-                    # any more, so out.find(_THINK_TAG) below can never
-                    # find it and in_reasoning[0] never flips. Confirmed:
-                    # this silently misclassified an ENTIRE response as
-                    # reasoning_content whenever the tag happened to land
-                    # on this exact boundary -- a real, pre-existing bug,
-                    # not new. Fix: while still in_reasoning, never let the
-                    # released slice's own tail be a partial prefix of the
-                    # tag -- pull the split point back to before that
-                    # partial match starts, so the tag stays whole and
-                    # detectable once enough of it has arrived.
-                    if in_reasoning[0]:
-                        window = pending[0][:split]
-                        max_check = min(len(_THINK_TAG) - 1, split)
-                        for i in range(max_check, 0, -1):
-                            if window.endswith(_THINK_TAG[:i]):
-                                split -= i
-                                break
-                    out = pending[0][:split]
-                    pending[0] = pending[0][split:]
-                else:
-                    return
-                if not out:
-                    return
-                # Split `out` at </think> if it closes inside this piece --
-                # everything up to the tag is reasoning, the tag itself is
-                # dropped (never shown to the client, same as before), the
-                # remainder is real content. Only relevant while still
-                # in_reasoning; once closed, every later write is plain
-                # content and this whole branch is skipped for speed.
-                pieces: list[tuple[str, bool]] = []  # (text, is_reasoning)
-                if in_reasoning[0]:
-                    tag_at = out.find(_THINK_TAG)
-                    if tag_at >= 0:
-                        if tag_at:
-                            pieces.append((out[:tag_at], True))
-                        rest = out[tag_at + len(_THINK_TAG):]
-                        in_reasoning[0] = False
-                        # pending[0] can ALREADY hold post-tag content at
-                        # this exact moment -- the margin window that just
-                        # released `out` was sized for reasoning_margin
-                        # (protecting a possibly-still-forming tag), so
-                        # pending[0] can be holding up to reasoning_margin
-                        # chars of text that arrived AFTER the tag closed,
-                        # not before it.
-                        #
-                        # buffer_all: drain pending[0] to EMPTY (not down
-                        # to `margin`), and prepend all of it to `rest`.
-                        # Every LATER write() call routes straight into buf
-                        # via the buffer_all-and-not-in_reasoning fast path
-                        # (bypassing pending[0]/the stop-margin machinery
-                        # entirely -- stop-string truncation for buffered
-                        # content happens once at the end, via
-                        # _truncate_at_stop on the fully joined buf, not
-                        # here). Leaving ANY residue in pending[0] at this
-                        # point means it only gets flushed by the tail
-                        # block after generation ends, landing AFTER every
-                        # char the fast path already appended in the
-                        # meantime -- a real, confirmed bug: "answer "
-                        # left in pending[0] (its length happened to equal
-                        # `margin` exactly, so the old margin-only drain
-                        # skipped it) surfaced as "STOPHERE junkanswer "
-                        # instead of "answer STOPHERE junk". has_tools=
-                        # False does not hit this: it keeps using
-                        # pending[0]+margin for its OWN stop-matching on
-                        # live content, so only the buffer_all branch drains
-                        # to zero here.
-                        if buffer_all:
-                            rest += pending[0]
-                            pending[0] = ""
-                        elif len(pending[0]) > margin:
-                            drain = len(pending[0]) - margin
-                            rest += pending[0][:drain]
-                            pending[0] = pending[0][drain:]
-                        if rest:
-                            if buffer_all:
-                                buf.append(rest)
-                            else:
-                                pieces.append((rest, False))
-                    else:
-                        pieces.append((out, True))
-                else:
-                    pieces.append((out, False))
-                try:
-                    for text, is_reasoning in pieces:
-                        emit(text, reasoning=is_reasoning)
-                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
-                    # The client is gone (Cline cancelling a request is
-                    # routine) or has stalled long enough to hit _pump's
-                    # write timeout -- same outcome either way: nothing
-                    # left to deliver. Swallowing this and carrying on means the
-                    # server keeps decoding every remaining token for
-                    # nobody, holding the global generation lock the whole
-                    # time and blocking real requests behind it. Raising
-                    # here unwinds speculative_generate -- which has no
-                    # interruption hook of its own, it just prints -- out
-                    # through _stream's try/finally (stdout restored,
-                    # empty_cache called) and into do_POST's handler.
-                    stopped[0] = True
-                    raise _ClientGone()
-            def flush(_s):
-                pass
-
-        drafter = STATE["drafter_obj"] if draft > 0 else None
-
-        # See generate(): draft>0 no longer forces greedy -- speculative
-        # sampling applies the request's temperature/top_k/top_p. The one
-        # KV-mode -> kwargs mapping is in run_generate; nothing here
-        # re-derives it. _request_params clamps max_output_tokens to
-        # ctx_size and folds in the base GenParams for any None field.
-        rp = _request_params(max_tokens, draft, temperature, top_k, top_p)
-
-        # ---- CONTINUOUS-BATCHING SCHEDULER PATH -----------------------
-        # When STATE["scheduler"] is set (qvb8_resident, see
-        # load()), route through it instead of the old STATE["lock"]-
-        # serialised call below -- this is what actually lets two Cline
-        # connections share one batched forward pass per decode step
-        # rather than queueing behind each other. Reuses the SAME emit()/
-        # _Shim/buf/pending machinery already built above (</think>
-        # split, tool-call buffering, stop-string truncation) -- only the
-        # SOURCE of the token text differs: instead of speculative_
-        # generate() printing to a swapped sys.stdout under one global
-        # lock, the scheduler's on_token callback (running on the
-        # scheduler's OWN background thread, batching this request
-        # together with whatever others are in the same round) pushes
-        # token ids into a queue THIS thread blocks reading, decoded
-        # incrementally the same way the non-batched path already does.
-        if STATE["scheduler"] is not None:
-            print(f"[serve] {_ts()} req #{req_id} arrived, "
-                  f"prompt {ids.shape[1]} tok", file=sys.__stdout__, flush=True)
-            ids_dev = ids
-            out_q = STATE["scheduler"].submit(
-                ids_dev, rp.max_output_tokens, rp.temperature or 0.0,
-                rp.top_k or 0, rp.top_p or 1.0, req_id)
-            _shim = _Shim()
-            from qv_band.decode.spec_decode import (
-                _IncStreamer, HEARTBEAT_INTERVAL_S as _HEARTBEAT_S)
-            _streamer = _IncStreamer(STATE["tok"])
-            st = None
-            n_recv = 0
-            t0 = time.time()
-            try:
-                while True:
-                    # Ping on WIRE silence, not queue silence: while a long
-                    # tool call is held back (parse_tool_calls() needs the
-                    # whole text) tokens keep arriving here every few ms, so a
-                    # get() timeout never fires, yet nothing reaches the
-                    # socket. _wbuf_last is the time of the last real write.
-                    # The timeout also covers a stalled engine (no tokens).
-                    try:
-                        item = out_q.get(timeout=1.0)
-                    except queue.Empty:
-                        item = None
-                        # Nothing from the engine for a second (a long prefill, say): is the client still
-                        # there? A cheap socket peek, so a stopped request frees its slot within ~1 s of
-                        # leaving instead of after the 10 s ping interval.
-                        if _peer_gone():
-                            raise _ClientGone()
-                    if time.monotonic() - _wbuf_last[0] >= _HEARTBEAT_S:
-                        if _peer_gone():
-                            raise _ClientGone()
-                        _ping()
-                    if item is None:
-                        continue
-                    if isinstance(item, Exception):
-                        raise item
-                    if hasattr(item, "stats"):   # _StreamDone sentinel
-                        st = item.stats
-                        break
-                    n_recv += 1
-                    piece = _streamer.feed([item])
-                    if piece:
-                        _shim.write(piece)
-                        if stopped[0]:
-                            # A stop string was hit: the answer is complete. Free the slot now
-                            # instead of letting it generate to max_tokens for nobody.
-                            STATE["scheduler"].cancel(req_id)
-                            break
-                if not stopped[0]:
-                    tail = _streamer.finish()
-                    if tail:
-                        _shim.write(tail)
-            except _ClientGone:
-                STATE["scheduler"].cancel(req_id)
-                print(f"[serve] {_ts()} req #{req_id} client disconnected after "
-                     f"{time.time()-t0:.1f}s (scheduler path)",
-                     file=sys.__stdout__, flush=True)
-                return
-            except Exception as e:
-                STATE["scheduler"].cancel(req_id)
-                traceback.print_exc()
-                try:
-                    _sse({"error": {"message": str(e), "type": type(e).__name__}})
-                    _wbuf.append(b"data: [DONE]\n\n")
-                    _pump(force=True)
-                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
-                    pass
-                return
-            dt = time.time() - t0
-            out = st.emitted if st else n_recv
-            STATE["served"] += 1
-            STATE["tokens"] += out
-            base_finish = ("stop" if stopped[0]
-                           else "length" if out >= rp.max_output_tokens else "stop")
-            if _gate is not None:
-                if _gate.decided is None:
-                    in_reasoning[0] = False                 # tiny output that never decided: plain content
-                pending[0] = _gate.take() + pending[0]      # + any tail the gate held back (e.g. "\n</thi")
-            try:
-                if not buffer_all:
-                    if not stopped[0] and pending[0]:
-                        flushed, _ = _truncate_at_stop(pending[0], stops)
-                        if flushed:
-                            delta_key = "reasoning_content" if in_reasoning[0] else "content"
-                            _sse({"id": f"chatcmpl-{created}", "object": "chat.completion.chunk",
-                                 "created": created, "model": model_id,
-                                 "choices": [{"index": 0, "delta": {delta_key: flushed}}]}
-                                if chat else {"text": flushed})
-                    finish = base_finish
-                    if chat:
-                        chunk = {"id": f"chatcmpl-{created}", "object": "chat.completion.chunk",
-                                 "created": created, "model": model_id,
-                                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
-                        if include_usage:
-                            chunk["usage"] = {"prompt_tokens": int(ids.shape[1]),
-                                              "completion_tokens": out,
-                                              "total_tokens": int(ids.shape[1]) + out}
-                        _sse(chunk)
-                else:
-                    joined, _stop_hit = _truncate_at_stop("".join(buf), stops)
-                    if _stop_hit:
-                        base_finish = "stop"
-                    if not chat:
-                        if joined:
-                            _sse({"text": joined})
-                        finish = base_finish
-                    elif has_tools:
-                        content, tool_calls = parse_tool_calls(joined)
-                        if tool_calls:
-                            delta = {"tool_calls": tool_calls}
-                            finish = "tool_calls"
-                        else:
-                            delta = {"content": content or joined or None}
-                            finish = base_finish
-                    else:
-                        delta = {"content": joined}
-                        finish = base_finish
-                    if chat:
-                        chunk = {"id": f"chatcmpl-{created}", "object": "chat.completion.chunk",
-                                 "created": created, "model": model_id,
-                                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                        if include_usage:
-                            chunk["usage"] = {"prompt_tokens": int(ids.shape[1]),
-                                              "completion_tokens": out,
-                                              "total_tokens": int(ids.shape[1]) + out}
-                        _sse(chunk)
-                _wbuf.append(b"data: [DONE]\n\n")
-                _pump(force=True)
-            except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError, _ClientGone):
-                pass
-            line = (f"[serve] {_ts()} req #{req_id} "
-                   f"(thread={threading.current_thread().name}) "
-                   f"streamed {out} tok in {dt:.1f}s "
-                   f"({out/dt:.2f} tok/s) [scheduler]")
-            if st and st.proposed:
-                line += (f"  |  drafted {st.proposed}, accepted {st.accepted} "
-                        f"({st.acceptance:.0%}), {st.emitted/max(1,st.steps):.2f} tok/step, "
-                        f"{st.steps} steps: draft {st.t_draft:.1f}s verify {st.t_verify:.1f}s")
-            print(line, file=sys.__stdout__, flush=True)
-            return
-        # ---- END SCHEDULER PATH ----------------------------------------
-
-        # Printed BEFORE acquiring STATE["lock"] vs after would tell "queued"
-        # from "actually running" apart -- this one fires the instant the
-        # request arrives (before it waits its turn, if any), so two
-        # requests logging "start" back-to-back with no "acquired the lock"
-        # gap between them is exactly what a real overlap (a working
-        # parallel scheduler) would look like, and what the current
-        # STATE["lock"]-serialised path never produces (request 2's "start"
-        # fires immediately, but its own prefill only begins once request
-        # 1's full generation has released the lock -- watch the gap
-        # between "start" and the first [prefill] line for each id).
-        print(f"[serve] {_ts()} req #{req_id} arrived "
-             f"(thread={threading.current_thread().name}), "
-             f"prompt {ids.shape[1]} tok",
-             file=sys.__stdout__, flush=True)
-        with STATE["lock"]:
-            t0 = time.time()
-            prefix_cache_in = STATE["prefix_cache"]
-            # BUG FIX: spec_decode.py's [prefill] lines read this via
-            # _REQ_ID.get() (a contextvar) to tag their log output with
-            # the request they belong to -- added alongside this line,
-            # but the .set() call to actually populate it was missing,
-            # so every [prefill] line printed "req #0" regardless of the
-            # real request, silently defeating the whole point of the
-            # feature. Set it once per request, right where this request
-            # starts genuinely running (inside the lock, not at arrival)
-            # so it matches "which request is the model working on RIGHT
-            # NOW" for a reader correlating [prefill] lines against
-            # [serve] req #N arrived timestamps.
-            from qv_band.decode.spec_decode import _REQ_ID
-            _REQ_ID.set(req_id)
-            # Captured INSIDE the lock (bug fix). It used to be read before the lock: a request that
-            # arrived while another was generating saved THAT request's _Shim as its "original" stdout and, when
-            # it finished, restored the dead shim process-wide -- every later print() then wrote into a closed
-            # socket (log lines vanished; a print could raise inside another request's handler and drop it with
-            # no trace: seen as a concurrent request that never logged "done"). Every swap happens under this
-            # lock, so here sys.stdout is always the real stream.
-            old = sys.stdout
-            try:
-                sys.stdout = _Shim()
-                # abort_check: stop if the client disconnected OR live CUDA
-                # memory reached --max-memory-gb. Polled every step (not
-                # only when a token is emitted, which is all _Shim.write's
-                # _ClientGone catches).
-                # A raised exception here (_ClientGone, a CUDA OOM, ...)
-                # means speculative_generate's own return_cache path never
-                # ran -- but the cache object it was mutating in place
-                # (STATE["prefix_cache"].past, the SAME object just passed
-                # in) may already reflect a partial run the OLD handle's
-                # token_ids does not account for. Reusing that stale handle
-                # next time would under-count what the cache actually
-                # holds and duplicate tokens into it. Invalidate up front;
-                # a successful run overwrites this with the fresh handle on
-                # the next line, so the drop only sticks on that failure
-                # path (via the except/finally below, since this line does
-                # not execute again after an exception).
-                STATE["prefix_cache"] = None
-                kv_stats: dict = {}
-                out, st, STATE["prefix_cache"] = run_generate(
-                    bundle, drafter, ids, rp, stream=True,
-                    abort_check=lambda: _peer_gone() or vram_abort_check(),
-                    prefix_cache=prefix_cache_in, return_cache=True,
-                    kv_stats=kv_stats, on_heartbeat=_ping)
-            except _ClientGone:
-                # Normal cancellation, not an error -- nothing to send, since
-                # the socket that would carry it is what just went away.
-                # Restore stdout first: the finally below has not run yet, so
-                # a print() here would go to the _Shim and be swallowed as if
-                # it were a generated token.
-                sys.stdout = old
-                print(f"[serve] {_ts()} client disconnected after "
-                      f"{time.time()-t0:.1f}s, generation aborted", flush=True)
-                return
-            except Exception as e:
-                # Any OTHER failure inside run_generate (a bad --kv-cache/
-                # --kv-tau-threshold combination raising ValueError from
-                # kv_band.py's codebook-overflow check, a CUDA error, ...)
-                # used to propagate straight out of _stream() uncaught --
-                # past do_POST's own try/except (which only wraps the
-                # non-streaming path; _stream() returns directly from
-                # do_POST's call site, outside that block) and up into
-                # BaseHTTPRequestHandler's own handling, which the client
-                # sees as a bare dropped/broken connection with no error
-                # body at all. Confirmed: a real tau overflow
-                # produced exactly this -- Cline got nothing usable, and
-                # from its side that looks identical to the body-timeout
-                # symptom this SSE path already works around elsewhere.
-                # This must never take the whole server down (a threading
-                # HTTP server survives one handler's uncaught exception
-                # regardless, but "survives by accident" is not the same
-                # as "the client gets told what happened") -- send it as a
-                # clean SSE error object instead, same shape a well-behaved
-                # OpenAI-compatible server uses, so Cline at least sees a
-                # real error instead of a silent hang/drop.
-                sys.stdout = old
-                traceback.print_exc()
-                try:
-                    _sse({"error": {"message": str(e), "type": type(e).__name__}})
-                    _wbuf.append(b"data: [DONE]\n\n")
-                    _pump(force=True)
-                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
-                    pass
-                return
-            finally:
-                sys.stdout = old
-                _maybe_empty_cache(bundle)
-            dt = time.time() - t0
-
-        STATE["served"] += 1
-        STATE["tokens"] += len(out)
-
-        # Why generation ended, in OpenAI terms. `stopped[0]` is a
-        # server-side stop-string hit; otherwise it is "length" iff the
-        # decode loop ran out its budget, else "stop" (EOS). rp is the
-        # resolved GenParams for this request -- max_output_tokens is the
-        # real budget speculative_generate used.
-        base_finish = ("stop" if stopped[0]
-                       else "length" if len(out) >= rp.max_output_tokens
-                       else "stop")
-        # This tail block sends the closing finish_reason chunk + [DONE] --
-        # the one write Cline actually depends on to know the response is
-        # over ("Response stream ended without a finish reason" is exactly
-        # what it prints when this write never happens). Generation is
-        # already finished by this point, so there is no decode loop left
-        # to protect by bailing out early on a disconnect check; re-running
-        # one here only risks losing this write to a stale/racy read.
-        # emit() calls _peer_gone() and raises _ClientGone on top of it --
-        # that is right for mid-generation pieces (bail out of a still-
-        # running decode loop), but wrong here, since it can skip this
-        # closing write entirely and reproduce the exact "no finish_reason"
-        # symptom on nothing more than a throttled liveness check flipping
-        # true at the wrong instant. So the final flush/emit calls below
-        # use _sse()+_pump() directly (no liveness check) wherever emit()
-        # was previously used only for its wire-shape formatting, and
-        # _ClientGone joins the except clause as a defensive catch-all for
-        # a genuine disconnect -- same treatment as the pipe errors, since
-        # by this point "client gone" and "nothing left to deliver" mean
-        # the same thing.
-        try:
-            # Flush any held-back trailing window FIRST, regardless of
-            # buffer_all -- it can still hold live-streamed reasoning text
-            # that _Shim.write never got to emit (the pending[0] margin
-            # withholds the last few chars of every write for stop-string
-            # matching, see _Shim.write). This used to run only when
-            # `not buffer_all`, which was correct back when buffer_all meant
-            # "nothing was ever streamed live" -- now that has_tools still
-            # streams reasoning_content incrementally, a trailing reasoning
-            # fragment can be sitting in pending[0] even for a buffer_all
-            # request, and skipping this flush silently dropped it (a
-            # generation cut off mid-<think> with has_tools=True lost its
-            # last few reasoning chars off the wire entirely).
-            if _gate is not None:
-                if _gate.decided is None:
-                    in_reasoning[0] = False                 # tiny output that never decided: plain content
-                pending[0] = _gate.take() + pending[0]      # + any tail the gate held back (e.g. "\n</thi")
-            if not stopped[0] and pending[0]:
-                flushed, _ = _truncate_at_stop(pending[0], stops)
-                if flushed:
-                    # Same </think> split as _Shim.write's incremental
-                    # path -- the held-back trailing window can still
-                    # contain the tag (or, if generation was cut off
-                    # mid-thought with no </think> ever emitted, be
-                    # entirely reasoning: in_reasoning[0] just stays
-                    # True and every remaining byte goes out as
-                    # reasoning_content, never promoted to content).
-                    tail_pieces: list[tuple[str, bool]] = []
-                    if in_reasoning[0]:
-                        tag_at = flushed.find(_THINK_TAG)
-                        if tag_at >= 0:
-                            if tag_at:
-                                tail_pieces.append((flushed[:tag_at], True))
-                            rest = flushed[tag_at + len(_THINK_TAG):]
-                            if rest:
-                                if buffer_all:
-                                    buf.append(rest)
-                                else:
-                                    tail_pieces.append((rest, False))
-                        else:
-                            tail_pieces.append((flushed, True))
-                    elif buffer_all:
-                        buf.append(flushed)
-                    else:
-                        tail_pieces.append((flushed, False))
-                    for text, is_reasoning in tail_pieces:
-                        delta_key = ("reasoning_content" if is_reasoning
-                                    else "content")
-                        _sse({"id": f"chatcmpl-{created}",
-                              "object": "chat.completion.chunk",
-                              "created": created, "model": model_id,
-                              "choices": [{"index": 0,
-                                           "delta": {delta_key: text}}]}
-                             if chat else {"text": text})
-            if not buffer_all:
-                finish = base_finish
-                if chat:
-                    chunk = {"id": f"chatcmpl-{created}",
-                             "object": "chat.completion.chunk",
-                             "created": created, "model": model_id,
-                             "choices": [{"index": 0, "delta": {},
-                                        "finish_reason": finish}]}
-                    if include_usage:
-                        chunk["usage"] = {"prompt_tokens": int(ids.shape[1]),
-                                          "completion_tokens": len(out),
-                                          "total_tokens": int(ids.shape[1]) + len(out)}
-                        chunk["timings"] = _timings(st, len(out), dt, int(ids.shape[1]))
-                    _sse(chunk)
-            else:
-                # buf holds only POST-</think> content now (reasoning
-                # streamed live above/in _Shim.write) -- no _strip_think
-                # needed, unlike the old whole-response buffer this
-                # replaced.
-                joined, _ = _truncate_at_stop("".join(buf), stops)
-                if not chat:
-                    # /generate and /v1/completions have no tool-call
-                    # contract; same {"text": ...} wire shape emit() sends.
-                    if joined:
-                        _sse({"text": joined})
-                    finish = base_finish
-                elif has_tools:
-                    content, tool_calls = parse_tool_calls(joined)
-                    if tool_calls:
-                        delta = {"tool_calls": tool_calls}
-                        finish = "tool_calls"
-                    else:
-                        delta = {"content": content or joined or None}
-                        finish = base_finish
-                else:
-                    delta = {"content": joined}
-                    finish = base_finish
-                if chat:
-                    chunk = {"id": f"chatcmpl-{created}",
-                             "object": "chat.completion.chunk", "created": created,
-                             "model": model_id,
-                             "choices": [{"index": 0, "delta": delta,
-                                        "finish_reason": finish}]}
-                    if include_usage:
-                        chunk["usage"] = {"prompt_tokens": int(ids.shape[1]),
-                                          "completion_tokens": len(out),
-                                          "total_tokens": int(ids.shape[1]) + len(out)}
-                        chunk["timings"] = _timings(st, len(out), dt, int(ids.shape[1]))
-                    _sse(chunk)
-            _wbuf.append(b"data: [DONE]\n\n")
-            _pump(force=True)
-        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError, _ClientGone):
-            pass
-        line = (f"[serve] {_ts()} req #{req_id} streamed {len(out)} tok in {dt:.1f}s "
-                f"({len(out)/dt:.2f} tok/s)")
-        _tm = _timings(st, len(out), dt, int(ids.shape[1]))
-        if _timings_str(_tm):
-            line += "  |  " + _timings_str(_tm)
-        # Same acceptance-rate line chat.py prints -- _stream() never had
-        # it, so a slow streaming request (the path Cline actually hits)
-        # gave no way to tell "drafter barely accepting, mostly falling
-        # back to plain decode" apart from any other slowdown. draft_k is
-        # rp's resolved value (0 disables drafting; st.proposed is then 0
-        # too, so the condition also covers that case without a separate
-        # check).
-        if rp.draft_k > 0 and st.proposed:
-            line += (f"  |  drafted {st.proposed}, accepted {st.accepted} "
-                     f"({st.acceptance:.0%}), {st.emitted/max(1,st.steps):.2f} tok/step, "
-                        f"{st.steps} steps: draft {st.t_draft:.1f}s verify {st.t_verify:.1f}s")
-        else:
-            line += "  |  drafting: NONE (draft_k=0 or nothing proposed)"
-        # Prompt size drives prefill cost, which this line otherwise hides
-        # inside the same wall-clock total as decode -- a long prompt with
-        # a normal tok/s decode rate can still look "slow overall" for a
-        # reason that has nothing to do with drafting or the KV codec.
-        # prefix_reused is an UPPER BOUND (the saved cache's whole token
-        # count, not the actual matched length -- that needs cache_config,
-        # internal to spec_decode.py) on how much of THIS prompt could have
-        # skipped prefill by reusing the prior turn's cache; 0 means either
-        # no prior cache existed or nothing could be shared.
-        prefix_reused = len(prefix_cache_in.token_ids) if prefix_cache_in else 0
-        line += f"  |  prompt {ids.shape[1]} tok, prefix_reused<={prefix_reused}"
-        if kv_stats.get("ratio_vs_dense") is not None:
-            line += (f"  |  KV {kv_stats['total_bytes']/2**20:.1f} MB "
-                     f"({100*kv_stats['ratio_vs_dense']:.1f}% of dense)")
-        # REAL BUG, confirmed: this used plain print()/sys.stdout, same
-        # mistake spec_decode.py's [prefill] lines already had to fix (see
-        # that fix's own comment). By the time THIS request's finally
-        # block restores sys.stdout, that is correct FOR THIS REQUEST --
-        # but under STATE["lock"] serialisation, the NEXT request's
-        # _stream() call can already be running by the time a slow
-        # client-write/logging path here actually executes, and that next
-        # request has ALREADY swapped sys.stdout to ITS OWN _Shim. This
-        # line then silently lands inside the SECOND request's response
-        # stream instead of the console -- confirmed by the user seeing it
-        # appear at the START of a later reply's thinking block, not at
-        # the end of the request it actually describes. sys.__stdout__ is
-        # never reassigned by any request's shim swap, so it is the only
-        # stream a genuinely out-of-band diagnostic line can safely use.
-        print(line, file=sys.__stdout__, flush=True)
 
 
 def main():
@@ -2937,7 +1973,7 @@ def main():
                     help="image input (image_url chat content). on (default): the vision tower is built lazily on "
                          "the first image request, so a text-only workload pays no memory for it; off: such "
                          "requests are refused with 400 and nothing vision-related is ever loaded. (Env: LLM_VISION.)")
-    ap.add_argument("--vision-tower", choices=("gpu", "host"), default=None,
+    ap.add_argument("--vision-tower", choices=("gpu", "host", "cpu"), default=None,
                     help="where the vision tower waits between image requests: gpu (default) or pinned host RAM, moved to "
                          "the card only while it encodes a picture (a full 16 GB card: 27B on one V100). (Env: LLM_VISION_TOWER.)")
     ap.add_argument("--no-scheduler", dest="scheduler", action="store_false",
@@ -2973,8 +2009,15 @@ def main():
     # minutes and ~24 GB of VRAM, and a port clash discovered afterwards
     # wastes all of that (the process then dies with "Address already in
     # use" only after the whole model is resident). Fail fast instead.
+    if int(os.environ.get("RANK", "0")) > 0:
+        # torchrun, a card other than rank 0 (engine/proc_tp): it never serves HTTP -- load() runs this card's share
+        # and then rank 0's commands until it quits (the adapter's build_target does not return here)
+        load(args.model, args.think, params)
+        return
     try:
         srv = QVHTTPServer((args.host, args.port), Handler)
+        from qv_band.common import tls as _tls
+        _tls.wrap_server(srv)                 # TLS when the deployment sets QV_TLS_* (qv_band/common/tls.py)
     except OSError as exc:
         print(f"[serve] cannot bind {args.host}:{args.port}: {exc}",
               file=sys.stderr, flush=True)

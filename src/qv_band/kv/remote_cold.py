@@ -106,7 +106,7 @@ def attend_numpy(q: np.ndarray, q_pos0: int, scale: float, blocks: list) -> tupl
 
 def prepare_torch(blk: dict, dev) -> dict:
     """A received block -> keys / values DECODED ONCE, resident on the GPU as fp16 (h, B, d): the same bytes as the
-    compact ids (2 per element), and a step then costs only its matmuls. Before 2026-11-15 every attend call copied
+    compact ids (2 per element), and a step then costs only its matmuls. Before every attend call copied
     the ids of every block from host RAM to the card and decoded them again (4 blocks of 8192 tokens: 134 MB moved
     and decoded per layer per step: 26 ms for a 16-row decode step, 146 ms for a 512-row prefill chunk)."""
     import torch
@@ -256,7 +256,8 @@ class RemoteCold:
         c = getattr(self._tls, "c", None)
         if c is None:
             import socket
-            c = self._tls.c = http.client.HTTPConnection(self.host, self.port, timeout=600)
+            from qv_band.common import tls as _qtls
+            c = self._tls.c = _qtls.http_connection(self.host, self.port, 600)
             c.connect()
             # http.client sends the headers and the body as two writes: with Nagle's algorithm the second waits for
             # the ACK of the first, which the host delays (~40 ms) -- per layer, per step
@@ -297,8 +298,6 @@ class RemoteCold:
             except Exception as e:                  # noqa: BLE001 - the block stays local; report once per block
                 print(f"[kv-host] shipping block {a}-{b} failed ({e}); it stays in local memory", flush=True)
                 done(False)
-            # drop every reference before waiting for the next block: a callback left bound here kept the last
-            # shipped layer's state alive, so its session stayed on the host until the idle timeout (2026-11-13)
             del item, sid, a, b, arrays, done
 
     def attend(self, sid: str, q_np: np.ndarray, q_pos0: int, scale: float) -> tuple:

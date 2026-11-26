@@ -350,7 +350,7 @@ def _vram_room(dev, nbytes: int) -> bool:
     """True if allocating nbytes more on dev still leaves _RESERVE of the card really free. The allocator's cached
     blocks are NOT counted: without expandable segments (the V100 launchers) they are fragmented -- 2.47 GB cached
     on a V100 could not give one 170 MB block, so this check kept saying "room" and the next prefill chunk ran out of
-    memory instead of the layer spilling its oldest KV to host RAM (2026-11-12, 27B two cards, 78k-89k token prompts)."""
+    memory instead of the layer spilling its oldest KV to host RAM."""
     free, _ = torch.cuda.mem_get_info(dev)
     return free - nbytes >= _RESERVE
 _COLD_BLOCK = int(_os.environ.get("QV_KV_COLD_BLOCK", "4096") or 4096)
@@ -420,7 +420,7 @@ def _staging(dev, dt, h, d):
 
 class CompactIds:
     """A cold block's 2-byte ids (a widened layer on the sm_70 CUDA kernel) kept as 1 byte per id plus the high byte of
-    only the (row, head) pairs that have one: host RAM and the per-step PCIe copy about halve (2026-11-13: 27B on one
+    only the (row, head) pairs that have one: host RAM and the per-step PCIe copy about halve (27B on one
     V100, 166k tokens, the 2-byte cold blocks were ~2x the packed KV). Rebuilt into the int16 staging slot on the GPU:
     the same values as the int16 block (low | high << 8, the uint16 bit pattern)."""
     __slots__ = ("lo", "idx", "hi")
@@ -525,9 +525,6 @@ class FusedKV:
             dt = self.ki.dtype if self.ki is not None else torch.uint8
             spare = need_tok + max(seg_len, 256)
             if cap > spare and not _vram_room(dev, 2 * cap * h * d * max(2, torch.empty((), dtype=dt).element_size())):
-                # a full card: no spare rows beyond this chunk. 27B on one 16 GB V100, a 10.7k-token prompt: the 4096
-                # spare rows (x 16 layers x K,V x 2-byte ids = 268 MB) were what the next MLP chunk could not get
-                # (2026-11-13: fresh prompt after a restore, out of memory at 4-6k tokens).
                 cap = spare
             ki = torch.empty(cap, h, d, dtype=dt, device=dev)
             vi = torch.empty_like(ki)
@@ -731,9 +728,6 @@ class FusedKV:
         issue(0)
         if len(cold) > 1:
             issue(1)
-        # every block's (o, lse) is kept and merged ONCE at the end: a pairwise merge per block was ~14 small kernels
-        # each, ~600 per layer per decode step at 94k tokens -- the V100 host could not launch them fast enough
-        # (profile 2026-11-12: one card, 18k launches per step, GPU idle ~75 %)
         outs, lses = [], []
         for j, (a, b, _, _, tt, _r) in enumerate(cold):
             s = j % 2

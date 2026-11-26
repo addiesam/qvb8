@@ -199,7 +199,7 @@ def handle_post(handler, route: str, body: dict) -> bool:
 # ---- receiver -------------------------------------------------------------------------------------------------------
 class _KeepLeases:
     """While a transfer with several parts runs, touch every lease once a minute (a zero-length piece): parts wait their
-    turn, and over a slow link a waiting part's lease would expire before its first piece (2026-11-13: two layer slices
+    turn, and over a slow link a waiting part's lease would expire before its first piece (two layer slices
     over Wi-Fi, the second slice's lease expired while the first one's 250 MB arrived)."""
 
     def __init__(self, items: list, every: float = 60.0):
@@ -227,7 +227,8 @@ class _KeepLeases:
 
 def _conn(base: str):
     u = urlsplit(base)
-    return http.client.HTTPConnection(u.hostname, u.port or 80, timeout=120)
+    from qv_band.common import tls
+    return tls.http_connection(u.hostname, u.port or 80, 120)
 
 
 def _get_json(base: str, path: str):

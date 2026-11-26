@@ -597,8 +597,8 @@ class DFlashDrafter:
         self.blocks += 1
         if temperature <= 0:
             return logits[:n].argmax(-1).tolist(), None
-        from qv_band.decode.spec_decode import _probs
-        probs = [_probs(logits[j], temperature, top_k, top_p) for j in range(n)]
+        from qv_band.engine.spec import sampling_probs
+        probs = [sampling_probs(logits[j], temperature, top_k, top_p) for j in range(n)]
         return [int(torch.multinomial(p, 1)) for p in probs], probs
 
 
@@ -828,6 +828,14 @@ def build_dflash_drafter(model, draft_dir: str, device: str = "cuda",
     if cfg.get("num_target_layers", n_target) != n_target or max(d.capture_layers) >= n_target:
         raise ValueError(f"{draft_dir} was trained for a {cfg.get('num_target_layers')}-layer "
                          f"target, this model has {n_target} layers")
+    srcs = cfg.get("target_feature_sources")          # a drafter fed by more than layer outputs lists every source
+    if srcs:
+        if [x for x in srcs if not isinstance(x, int)] not in ([], ["final_postnorm"]) or "final_postnorm" in srcs[:-1]:
+            raise ValueError(f"{draft_dir}: target_feature_sources {srcs}: only layer indices, then 'final_postnorm' last")
+        if [x for x in srcs if isinstance(x, int)] != list(d.capture_layers):
+            raise ValueError(f"{draft_dir}: target_feature_sources {srcs} differ from target_layer_ids {d.capture_layers}")
+        if "final_postnorm" in srcs:
+            d.capture_layers.append(n_target)            # tap index one past the last layer = the final norm's output
     if d.fc_in != len(d.capture_layers) * model.config.hidden_size:
         raise ValueError(f"{draft_dir} expects {d.fc_in // len(d.capture_layers)}-wide "
                          f"target hidden states, this model has {model.config.hidden_size}")

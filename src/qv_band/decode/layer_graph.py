@@ -1,7 +1,7 @@
 """CUDA-graph replay of WHOLE linear-attention decoder layers at verify / decode.
 
 WHY: the V100 host (Xeon E5-2673 v4) issues ~3,700 kernel launches per speculative verify step of the 27B; the GPUs
-were measured busy ~17% of the step (nsys, 2026-11-07: 63 ms of kernels in a ~360 ms step). moe_graph (the MLPs) and
+were measured busy ~17% of the step. moe_graph (the MLPs) and
 proj_graph (the four input projections) cover a few hundred of them; the rest -- RMSNorms, the conv window, the gated
 delta rule, the gated norm, out_proj, residual adds, dtype casts -- are ~50 small launches per Gated-DeltaNet layer,
 x 48 layers. Here each of those decoder layers (input norm, token mixer, residual, post norm, MLP, residual) replays
@@ -159,7 +159,7 @@ class _LayerGraph:
 
 def install(model) -> int:
     """Wrap every linear-attention decoder layer of `model` (Qwen3.5 / 3.6 / 3.8 hybrids). Returns how many."""
-    if os.environ.get("QV_LAYER_GRAPH", "0") != "1" or not torch.cuda.is_available():     # opt-in: measured no gain on V100 (2026-11-07)
+    if os.environ.get("QV_LAYER_GRAPH", "0") != "1" or not torch.cuda.is_available():
         return 0
     layers = getattr(getattr(model, "model", None), "layers", None) or []
     n = 0

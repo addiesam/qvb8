@@ -7,7 +7,7 @@
   drafter   LiLiCorr (chosen from the drafter's own config)
   vision    C-RADIO tower (layers/cradio_vision, ai_engine/generation/vision_cradio)
 
-NOT RUN since it was written (2026-11-10): no Nemotron pack is on the the dev GPU machine. It carries, unchanged, what
+NOT RUN since it was written: no Nemotron pack is on the the dev GPU machine. It carries, unchanged, what
 run_inference.py did inline before.
 """
 from __future__ import annotations

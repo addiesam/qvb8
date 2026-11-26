@@ -35,7 +35,7 @@ _MAX_HEADER = 1 << 20
 _MAX_TENSOR = 16 << 30          # bytes of one received tensor (a 12288-token chunk of hidden states is 126 MB)
 _DTYPES = {str(d).split(".")[1]: d for d in (
     torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64,
-    torch.bool)}
+    torch.bool, torch.float64, torch.complex64)}      # float64 / complex64: rotary tables of image / video block stages
 
 
 class StageLost(RuntimeError):
@@ -66,6 +66,8 @@ class Link:
         host, port = parse_addr(addr)
         try:
             sock = socket.create_connection((host, port), timeout=timeout)
+            from qv_band.common import tls
+            sock = tls.client_socket(sock, host)           # TLS when the deployment sets QV_TLS_*
         except OSError as e:
             raise StageLost(f"stage {addr}: cannot connect ({e})") from e
         sock.settimeout(None)
@@ -158,7 +160,8 @@ def listen(port: int, host: str = "0.0.0.0") -> socket.socket:
 
 def accept(srv: socket.socket) -> Link:
     sock, peer = srv.accept()
-    return Link(sock, f"{peer[0]}:{peer[1]}")
+    from qv_band.common import tls
+    return Link(tls.server_socket(sock), f"{peer[0]}:{peer[1]}")
 
 
 # ---------------------------------------------------------------------------------------------------------------------

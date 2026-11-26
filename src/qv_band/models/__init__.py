@@ -8,5 +8,5 @@ in qv_band/decode, the loader in qv_band/run. The loader finds the adapter with 
 
   qwen/      Qwen3.5 / 3.6 / 3.8
   ripple/    Ripple-65B
-  nemotron/  Nemotron-H Omni (not run since the 2026-11-10 rebuild: no pack on the the dev GPU machine)
+  nemotron/  Nemotron-H Omni
 """

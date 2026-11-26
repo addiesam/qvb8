@@ -4,6 +4,8 @@ title: "QVB8 inference engine"
 authors:
   - family-names: "Sam"
     given-names: "Chi Ngai"
+version: 1.3.0
+date-released: 2026-11-26
 license: Apache-2.0
 repository-code: "https://github.com/addiesam/qvb8"
 preferred-citation:
@@ -24,3 +26,26 @@ references:
     year: 2026
     doi: "10.5281/zenodo.23816044"
     url: "https://zenodo.org/records/23816044"
+  - type: article
+    title: "Applying Certified L∞-Bounded Compression to LLM Serving: Portable Saved State, Shared Pools and Mixed-Generation GPUs"
+    authors:
+      - family-names: "Sam"
+        given-names: "Chi Ngai"
+    year: 2026
+    doi: "10.5281/zenodo.24267208"
+    url: "https://zenodo.org/records/24267208"
+  - type: article
+    title: "Certified L∞-Bounded Compression for AI Models, III: Compressing the Model and the Trajectory: a Tau-Collocation ODE Solver for Compressed Diffusion and Video Models"
+    authors:
+      - family-names: "Sam"
+        given-names: "Chi Ngai"
+    year: 2026
+    doi: "10.5281/zenodo.23816181"
+    url: "https://zenodo.org/records/23816181"
+  - type: article
+    title: "Certified L∞-Bounded Compression of Large Language Model Weights via On-the-Fly Piecewise Chebyshev Approximation"
+    authors:
+      - family-names: "Sam"
+        given-names: "Chi Ngai"
+    year: 2026
+    url: "https://www.researchgate.net/publication/408496032_Certified_L_infty-Bounded_Compression_of_Large_Language_Model_Weights_via_On-the-Fly_Piecewise_Chebyshev_Approximation"

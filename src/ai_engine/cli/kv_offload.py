@@ -1,4 +1,4 @@
-"""KV-cache host-RAM tiering as server flags, with the V100 launchers' meaning (scripts/v100/Qwen3.8-27B_2e-3.sh --window /
+"""KV-cache host-RAM tiering as server flags, with the V100 launchers' meaning (scripts/v100/Qwen3.8-27B_2e-3_single-pcbackup.sh --window /
 --cold-block). The engine reads QV_KV_* once, when qv_band.kv.fused_attn is imported, so the flags must reach the
 environment BEFORE that import: call apply_from_argv() first thing in an entry point.
 
@@ -34,7 +34,7 @@ environment BEFORE that import: call apply_from_argv() first thing in an entry p
                          27B). exact (default): an fp32 copy. qvb8: the KV cache's codec at the MODEL's tau (read from the
                          pack manifest), a head that cannot meet it in 16 bits kept exact; every prefill rounds the state
                          the same way at each grid position, so a restore equals an uncached run. ~0.24x the size; the
-                         2026-11-12 PoC at tau 2e-3: perplexity change < 0.001, top-1 agreement 99.3-99.75 %
+                         PoC at tau 2e-3: perplexity change < 0.001, top-1 agreement 99.3-99.75 %
                                                                            -> QV_PREFIX_STATE
 
 Older KV is streamed back over PCIe on every attention call and attended exactly (merged by log-sum-exp), so the output

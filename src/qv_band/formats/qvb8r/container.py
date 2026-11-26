@@ -87,3 +87,31 @@ def runtime_tables(d: dict):
     tab = slot_tables(d['freq'])
     words = np.concatenate([d['words'], np.zeros(PAD_WORDS, np.uint32)])
     return tab, d['tiles'].astype(np.int64), words, d['tile_off'].astype(np.int64)
+
+
+import threading as _th
+
+_LAST = _th.local()
+
+
+def read_last(path: str) -> dict:
+    """read(path), reusing this thread's previous read when it was the same file: a Tensor Parallel loader cuts every
+    card's share of one table back to back on one thread, so the file is read and crc-checked once. One file per
+    thread at most (nothing else kept)."""
+    if getattr(_LAST, "path", None) == path:
+        return _LAST.d
+    _LAST.path, _LAST.d = None, None          # drop the previous file before reading the next
+    d = read(path)
+    _LAST.path, _LAST.d = path, d
+    return d
+
+
+def read_header(path: str) -> dict:
+    """Only the header (Q, P, T, K, N, cert, array table): the first few KB of the file, no arrays, no crc."""
+    with open(path, 'rb') as f:
+        head = f.read(16)
+        if head[:4] != MAGIC:
+            raise QVB8RFormatError(f'{path}: not a .qvb8r file')
+        hl = int(np.frombuffer(head, np.uint32, 1, 8)[0])
+        f.seek(12)
+        return json.loads(f.read(hl))

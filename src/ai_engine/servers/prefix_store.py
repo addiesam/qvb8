@@ -20,7 +20,7 @@ the servers and the router. Without it the store is open to the LAN (it holds pr
 
 MEMORY. At most --budget-gb of blob bytes (copies in flight included), least recently used prefix evicted first (a
 prefix being sent is kept). A prefix this store evicted, or that does not fit the budget at all, is NOT copied again
-while its source still lists it (before 2026-11-14 sources holding more than the budget made the store evict and
+while its source still lists it (before sources holding more than the budget made the store evict and
 re-copy the same prefixes for ever). Nothing is written to disk.
 
 SOURCES. One thread per --mirror source: a slow link or a powered-off machine delays only its own copies.
@@ -229,7 +229,8 @@ class Store:
 
 def _conn(base: str, timeout: float = 120.0) -> http.client.HTTPConnection:
     u = urlsplit(base)
-    return http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+    from qv_band.common import tls
+    return tls.http_connection(u.hostname, u.port or 80, timeout)
 
 
 def _get_json(base: str, path: str, timeout: float = 120.0):
@@ -360,6 +361,8 @@ def main(argv=None):
     for base in a.mirror:                      # one thread per source
         threading.Thread(target=store.mirror_loop, args=(base, a.poll), daemon=True, name=f"mirror-{base}").start()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    from qv_band.common import tls as _tls
+    _tls.wrap_server(srv)                 # TLS when the deployment sets QV_TLS_* (qv_band/common/tls.py)
     print(f"[store] prefix store on {a.host}:{a.port}, budget {a.budget_gb:g} GiB, mirroring {a.mirror or 'nothing'}",
           flush=True)
     srv.serve_forever()

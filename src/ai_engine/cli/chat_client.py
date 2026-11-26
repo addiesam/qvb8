@@ -54,7 +54,7 @@ def _ask(a, messages: list[dict]) -> str | None:
     answer, in_reasoning, usage, finish = [], False, None, None
     t_send, t_first, t_last = time.perf_counter(), None, None      # the client's own clock: the server is not asked
     try:
-        with urllib.request.urlopen(req, timeout=a.timeout) as resp:
+        with __import__('qv_band.common.tls', fromlist=['x']).urlopen(req, timeout=a.timeout) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
@@ -118,7 +118,7 @@ def _ask(a, messages: list[dict]) -> str | None:
 def main() -> None:
     a = _args()
     try:
-        with urllib.request.urlopen(a.url.rstrip("/") + "/health", timeout=10) as r:
+        with __import__("qv_band.common.tls", fromlist=["x"]).urlopen(a.url.rstrip("/") + "/health", timeout=10) as r:
             h = json.loads(r.read())
         print(f"[connected] {a.url}  model {h.get('model')}", file=sys.stderr)
     except (urllib.error.URLError, OSError, ValueError) as e:

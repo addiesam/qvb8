@@ -1,157 +1,410 @@
-# Certified L∞ Bounded Compression for AI Models - QVB8 Inference Engine
+# QVB8 Inference Engine
 
-QVB8 stores model weights in a compressed format where **the error of every restored weight is guaranteed to be less than the
-error bound τ**. The engine runs the compressed weights directly on the GPU: custom CUDA kernels decode them inside
-the matmuls, so large models run on small hardware. It provides an OpenAI-compatible HTTP server and a terminal chat
-client, with DFlash2 speculative decoding.
+**Run models on a new foundation: big models, small operating VRAM, certified.**
 
-> **New in v1.2.0 — certified KV cache that moves between machines.** The saved KV state is certified data (a proven error
-> bound), defined by its numbers and not by a GPU. A prompt prefilled on a DGX Spark (Blackwell) is restored on a V100
-> (Volta) instead of being computed again, with the same answer: [see how and what we measured](#kv-cache-shared-between-machines-and-between-different-gpus).
-> **A 27B model on one 16 GB GPU:** Qwen3.8-27B (QVB8R 2e-3) with its QVB8R DFlash2 drafter runs on a single V100 16 GB
-> (`./qvb8 get qwen-27b && ./qvb8 start qwen-27b`), or on two 16 GB cards with `--pipeline auto`.
-> New too: `./install.sh` and `./qvb8 start qwen-9b` for a three-step start, and `--pipeline auto` for several cards.
+> 💖 **Free and open. [Sponsor Dr. Addie Sam on GitHub](https://github.com/sponsors/addiesam) to unlock the next models and tests.**
 
-The engine is general CUDA code. **Version 1 provides a build for the NVIDIA DGX Spark (GB10, sm_121, aarch64).**
+QVB8 uses certified L∞-bounded compression to run massive AI models on limited hardware at near-bf16 quality. Every weight, cache and state stays within a user-defined worst-case error bound (τ), and models run directly from their packed size, with no VRAM expansion.
 
-## Why certified L∞-bounded compression?
+| **4.0x smaller: 54 GB → 13.6 GB** | **2.5x smaller: 54 GB → 21.6 GB, +0.08% perplexity** | **Real work, no round limit** |
+|---|---|---|
+| Qwen3.8-27B (QVB8R, τ = 2e-3) on one 16 GB card (perplexity +4.3%) | Qwen3.8-27B (QVB8, τ = 1e-3), WikiText-2 | Full system builds via an OpenAI-compatible API + Cline (600+ rounds and going) |
 
-Most quantization is judged by an average: a perplexity or benchmark score. An average hides the worst case. A format can
-look good on average and still leave a few weights with a large error, and a large error in the wrong weight can flip a
-single token. The result is a sudden wrong word or a stray character from another language in the middle of a normal
-answer, which an average score may not show. In our own tests with a 4-bit floating-point format we saw this in server logs.
+## A new foundation: the Virtual Band Index
 
-L∞-bounded means the **largest** error is controlled, not the average. For a QVB8 pack:
+Normal compression is like squeezing a sponge and hoping the water you need stays in. Nobody knows how much was lost in each place.
 
-- every restored weight differs from the original by less than **τ**, and no tensor is allowed to exceed it;
-- the check is made after packing, tensor by tensor, and the largest error found is stored in `manifest.json` (`max_err`);
-- τ is your choice: a smaller τ is a tighter bound, a larger file and a perplexity closer to the original; a larger τ is
-  a smaller file and a higher perplexity. You choose the trade-off knowing the worst case.
+The **Virtual Band Index** works differently. Think of a ruler. Instead of saving every number exactly, we save which mark on the ruler it is closest to. The marks are so close together that the number can be off by only a tiny, fixed amount. We call that amount **τ** (tau).
 
-What the bound does **not** do: it covers the stored weights only. It does not promise that the model's answers are
-identical to the original's, or correct. See the disclaimer at the end of this file.
+Then we **check every single number** after compressing, and write down the biggest mistake we found. **Math guarantees it: no number is ever wrong by more than τ.** That is what **certified** means: the error is controlled by you, and proven, not guessed.
 
-## What this version supports
+You pick τ. A small τ keeps the model almost the same as the original. A bigger τ makes the file smaller. The same idea also compresses the memory the model uses while it is talking (the KV cache), so the model needs less GPU memory to run, not only less disk. See the [papers](#papers).
 
-- **Model type:** large language models (text in, text out; image input for the Qwen models), served through a chat API.
-- **Model families** (each has an adapter in `src/qv_band/models/`; a pack directory is recognised by its own config):
+## Key Capabilities
 
-| Family | Models | Launcher | Drafters | Status of this build |
+- **A full serving engine, not just a format:**
+  - **One speculative-decoding layer for every model:** it measures the drafter's acceptance and the card's step cost, so a badly predicted text costs no extra time.
+  - **CUDA-graph decoding** on fixed request slots.
+  - **Tensor / data / pipeline parallel** across mixed GPUs, on one machine or many.
+  - **An OpenAI-compatible API**, with a router in front of any number of servers.
+- **Zero-expansion operating VRAM (2.5x to 4x smaller):**
+  - A model occupies only its packed size in GPU memory during inference: no full-size expansion, no OOM.
+  - Qwen3.8-27B 54 GB → 13.6 GB (4.0x); Ripple-65B-Preview 130 GB → 38.1 GB (3.4x); MiniMax-H3 video transformer 65.7 GB → 26.6 GB (2.5x).
+- **Certified worst-case accuracy:**
+  - Standard quantization optimizes the average error; here every weight is guaranteed to stay within your chosen error bound (τ).
+  - You pick τ: a small τ stays close to the original, a larger τ gives a smaller file.
+  - **No codebook to store:** each row is banded against a *virtual* codebook, so a weight is restored by one fused multiply-add (`μ + i·τₛ`), with its few parameters stored once per row.
+  - **The proof is the number the GPU writes:** the deployed kernel's `fmaf` was checked bit for bit against a true single-rounding fused multiply-add (Decimal arithmetic) over 2×10⁵ trials, so the certificate on paper is the value in memory, not an approximation of it.
+  - **A proven floor:** any certified, randomly accessible representation needs at least ⌈log₂ N_τ⌉ bits per element (N_τ = the τ-covering number of the weights); the codec is built around this bound.
+  - **4-bit codes with a guarantee:** on real Qwen3.8-27B embedding and down-projection weights, a 4-bit linear code at τ = 5e-3 escapes at most 0.008% of elements and holds 4.50–4.55 bits per element (3.5x smaller than bf16), with a machine-checked worst-case bound that a plain 4-bit code does not carry.
+  - **Measured on a small model:** at τ = 1e-3 on Qwen3.5-0.8B, GSM8K accuracy is statistically indistinguishable from dense bf16 and WikiText-2 / C4 perplexity move by about one percent. See the [papers](#papers).
+- **One card or mixed clusters:**
+  - **One small card:** fit a large model on a single 16 GB GPU (Qwen3.8-27B or MiniMax-H3 on one V100).
+  - **Many cards, many machines:** run in parallel or split across different GPU types (DGX Spark, V100, H100, H200, RTX).
+  - **Same result everywhere:** work prefilled on one card (GB10) is restored on another (V100) with the same answer.
+- **Full-pipeline compression:**
+  - One method packs every component: transformers, text encoders, VAEs, UNets, DFlash drafters, embedding and reranker models, voice models, LoRAs.
+  - So the whole stack fits, not only the language model.
+- **A KV cache that is certified, small, on-the-fly and shareable:**
+  - **Certified:** every cached key and value stays within the error bound (τ), the same guarantee as the weights, and so do the recurrent linear-attention state (Gated-DeltaNet) and the attention. No token is dropped or approximated by eviction.
+  - **Small:** about 26.5 KB per token on Qwen3.8-27B (KV τ = 0.2) against 64 KB in 16-bit. 150k tokens take 4.1 GB instead of 9.8 GB, at +0.006% perplexity.
+  - **On the fly:** each new token is compressed as it is generated, and the attention reads the compressed cache directly, so the cache never has to be expanded to 16-bit first.
+  - **Can be split over machines:** older KV and saved prompt prefixes move to system RAM or to a DRAM PC, and a prefix computed on one machine (a GB10) is restored on another (a V100) with the same result.
+- **Built for production workflows:**
+  - **Autonomous software engineering:** an OpenAI-compatible API driving VS Code + Cline for 600+ rounds.
+  - **End-to-end media pipelines:** script, images, video and voice on limited hardware, because every model in the chain is compressed.
+  - **Long history:** older history moves to system RAM, so a long session keeps going.
+
+## What's new in v1.3.0
+
+- **Two more model families:** [SenseNova-Loop-9B](scripts/sensenova_server.sh) (a looped hybrid: layers run twice with two mixed residual streams) with its DFlash2 drafter, and [Inkling-2-Mini](scripts/inkling_server.sh) (a looped mixture-of-experts model, experts in their published NVFP4 / MXFP8 form, bit-exact) with the DSpark drafter bundled in its checkpoint (`--drafter dspark`).
+- **One speculative-decoding layer for every model:** each step the server decides how many drafts to verify from the drafter's measured acceptance and the card's measured step cost, so text the drafter predicts badly costs no extra time. The same layer serves one card, several cards in one process, one process per card, and image prompts.
+- **CUDA-graph speculative decoding** on fixed request slots, sized at start from a measured prefill so that long prompts still fit.
+- **Faster looped models:** fused Triton kernels for the small per-token operations (routing, norms, short convolutions).
+- **Tensor parallel for Qwen models:** every layer split over the cards of one machine (`scripts/qwen_tp_server.sh`), with temperature / top-k / top-p sampling in every TP mode (single request with a drafter, `USERS=N` conversations together, and pipeline slots). On two V100 16 GB it answered the 27B in 7 s against 16 s on one card.
+- **Prebuilt CUDA kernels for V100 (sm_70) and DGX Spark (sm_121a)** are bundled, so neither needs a CUDA toolkit to run.
+
+Start them like the other models (port 8080):
+
+SenseNova-Loop-9B:
+
+```bash
+MODEL=./models/SenseNova-Loop-9B_qvb8_5e-4 DRAFT=./models/SenseNova-Loop-9B-DFlash2_qvb8_5e-4 scripts/sensenova_server.sh start
+```
+
+Inkling-2-Mini:
+
+```bash
+MODEL=./models/Inkling-2-Mini_qvb8_1e-3 scripts/inkling_server.sh start
+```
+
+Qwen3.8-27B by tensor parallel (two cards):
+
+```bash
+MODEL=./models/Qwen3.8-27B_qvb8_1e-3_fp16 DRAFT=./models/Qwen3.8-27B-DFlash2_qvb8_2e-3_fp16 scripts/qwen_tp_server.sh start
+```
+
+## Compression and Fidelity
+
+### Language models
+
+| Model | τ | Original (bf16) | QVB8 packed (ratio) | QVB8R packed (ratio) | Perplexity vs bf16 |
+|---|---|---|---|---|---|
+| [Qwen3.8-27B](https://huggingface.co/collections/addiesam/qwem38-27b) | 5e-4 | 54 GB | 25.2 GB (2.1x) | 20.8 GB (2.6x) | +0.18% (7.0641 vs 7.0517) |
+| [Qwen3.8-27B](https://huggingface.co/collections/addiesam/qwem38-27b) | 1e-3 | 54 GB | 21.6 GB (2.5x) | 17.2 GB (3.1x) | +0.08% (7.0570 vs 7.0517) |
+| [Qwen3.8-27B](https://huggingface.co/collections/addiesam/qwem38-27b) | 2e-3 | 54 GB | 18.8 GB (2.9x) | 13.6 GB (4.0x) | +4.3% (7.3549 vs 7.0517) |
+| [Qwen3.8-27B DFlash2](https://huggingface.co/collections/addiesam/qwem38-27b) | 2e-3 | 3.9 GB | 2.1 GB (1.8x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | — |
+| [Qwen3.8-27B DFlash2](https://huggingface.co/collections/addiesam/qwem38-27b) | 5e-3 | 3.9 GB | 1.7 GB (2.3x) | 1.5 GB (2.6x) | — |
+| [Qwen3.6-35B-A3B](https://huggingface.co/collections/addiesam/qwen36-35b-a3b) | 1e-4 | 70 GB | 42.9 GB (1.6x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | 0.00% (10.690 vs 10.690, C4) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/collections/addiesam/qwen36-35b-a3b) | 5e-4 | 70 GB | 31.5 GB (2.2x) | 29.5 GB (2.4x) | +0.13% (C4) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/collections/addiesam/qwen36-35b-a3b) | 1e-3 | 70 GB | 27.0 GB (2.6x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | +0.70% (C4) |
+| [Qwen3.6-35B-A3B DFlash2](https://huggingface.co/collections/addiesam/qwen36-35b-a3b) | 1e-3 | 1.1 GB | 0.6 GB (1.7x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | — |
+| [Ripple-65B-Preview](https://huggingface.co/collections/addiesam/ripple-65b-preview-qvb8) | 1e-3 | 130 GB | 57.3 GB (2.3x) | 46.6 GB (2.8x) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+| [Ripple-65B-Preview](https://huggingface.co/collections/addiesam/ripple-65b-preview-qvb8) | 2e-3 | 130 GB | 49.1 GB (2.6x) | 38.1 GB (3.4x) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+| [Ripple-65B-Preview](https://huggingface.co/collections/addiesam/ripple-65b-preview-qvb8) | 2.5e-3 | 130 GB | 48.1 GB (2.7x) | 35.5 GB (3.7x) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+| [Ripple-65B-Preview DFlash2](https://huggingface.co/collections/addiesam/ripple-65b-preview-qvb8) | 5e-3 | 8.1 GB | 4.1 GB (2.0x) | 3.4 GB (2.4x) | — |
+| [SenseNova-Loop-9B](https://huggingface.co/addiesam/SenseNova-Loop-9B-QVB8-5e-4) | 5e-4 | 19 GB | 8.8 GB (2.2x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+| [SenseNova-Loop-9B](https://huggingface.co/addiesam/SenseNova-Loop-9B-QVB8-1e-3) | 1e-3 | 19 GB | 7.7 GB (2.5x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+| [SenseNova-Loop-9B DFlash2](https://huggingface.co/addiesam/SenseNova-Loop-9B-DFlash2-QVB8-5e-4) | 5e-4 | 1.9 GB | 0.9 GB (2.1x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | — |
+| [Inkling-2-Mini](https://huggingface.co/addiesam/Inkling-2-Mini-QVB8-5e-4) | 5e-4 | 19 GB | 18 GB (1.1x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+| [Inkling-2-Mini](https://huggingface.co/addiesam/Inkling-2-Mini-QVB8-1e-3) | 1e-3 | 19 GB | 18 GB (1.1x) | [sponsor to calibrate](https://github.com/sponsors/addiesam) | [sponsor to measure](https://github.com/sponsors/addiesam) |
+
+### Image, video and audio models (unreleased: published once the [donation](https://github.com/sponsors/addiesam) target is reached)
+
+| Model / component | τ | Original (bf16) | QVB8 packed (ratio) | QVB8R packed (ratio) |
 |---|---|---|---|---|
-| **Ripple** (dense) | Ripple-65B-Preview | `scripts/ripple_server.sh` | DFlash2 | tested on a DGX Spark |
-| **Qwen** (dense, hybrid Gated-DeltaNet) | Qwen3.5-9B, Qwen3.8-27B | `scripts/qwen_server.sh` | DFlash, DFlash2, DSpine | tested on a DGX Spark |
-| **Qwen** (mixture of experts) | Qwen3.6-35B-A3B | `scripts/qwen_server.sh` | DFlash2 | tested on a DGX Spark |
-| **Nemotron-H** (Mamba-2 / attention / latent MoE) | Nemotron-3.5-Bolt-74B-A9B | `scripts/nemotron_server.sh` | LiLiCorr | code included, **not re-tested in this build** (no pack on the build machine) |
+| MiniMax-H3 (full package) | 1e-2 / 1e-3 | 137.6 GB | 57.8 GB (2.4x) | 45.9 GB (3.0x) |
+| - Video transformer | 1e-2 | 65.7 GB | 26.6 GB (2.5x) | 21.1 GB (3.1x) |
+| - 33B text encoder | 1e-3 | 66.7 GB | 29.1 GB (2.3x) | 23.0 GB (2.9x) |
+| - VAE | 1e-3 | 5.2 GB | 2.1 GB (2.5x) | 1.8 GB (2.9x) |
+| MiniMax-H3 low_ram (full package) | 1e-2 / 3e-3 / 1e-3 | 137.6 GB | 50.5 GB (2.7x) | 39.2 GB (3.5x) |
+| - Video transformer | 1e-2 | 65.7 GB | 26.6 GB (2.5x) | 21.1 GB (3.1x) |
+| - 33B text encoder | 3e-3 | 66.7 GB | 21.8 GB (3.1x) | 16.3 GB (4.1x) |
+| - VAE | 1e-3 | 5.2 GB | 2.1 GB (2.5x) | 1.8 GB (2.9x) |
+| Qwen-Image-Edit | 1e-3 | 58.0 GB | 29.9 GB (1.9x) | 26.3 GB (2.2x) |
+| Wan2.2-TI2V-5B | 1e-3 | 24.2 GB | 12.7 GB (1.9x) | 11.5 GB (2.1x) |
+| Sonic UNet | 1e-3 | 6.3 GB | 1.4 GB (4.5x) | 1.4 GB (4.5x) |
 
-- **Weight formats:** QVB8 and QVB8R packs (QVB8R is the smaller, entropy-coded variant).
-- **Interfaces:** an OpenAI-compatible HTTP server (streaming, tool calls, reasoning output) and a terminal chat client.
-- **Hardware:** one GPU, or several in one machine (`--pipeline cuda:0,cuda:1`, one process, the layers split across
-  the cards), or several machines (a remote stage worker runs a layer range on another box).
-- **KV cache:** the certified compressed KV cache, with optional offload of the cold history to system RAM
-  (`--kv-window` / `--kv-host`) for long contexts.
-- **Saved prompt prefixes:** a repeated prompt or the next chat turn restores its saved state and prefills only what is
-  new; with `--prefix-store shared` the servers of one machine share one pool in RAM.
-- **Admission control:** limits on live requests, live tokens and the waiting queue (HTTP 429 / 503 with Retry-After).
-- **Not in this version:** image, video and audio models, creating packs, int8 prefill, the MTP / DSpark drafters, a
-  CPU path. Published packs so far are the Ripple packs below; the launchers take any local pack directory.
+MiniMax-H3 package = video transformer + text encoder + VAE (the 0.6 GB audio decoder is kept dense and not counted). Sizes are the packs on disk.
 
-## Quick start (three steps, no setup knowledge needed)
+## Run AI Models using QVB8 Inference Engine
 
-Linux with an NVIDIA GPU and its driver. Nothing else to install by hand.
+### General setup
+
+Linux with an NVIDIA GPU and its driver is all you need.
+
+**1. Get the code and install** (about 10 minutes, creates `.venv`, no CUDA toolkit needed):
 
 ```bash
 git clone https://github.com/addiesam/qvb8.git && cd qvb8
-./install.sh                 # creates .venv, installs PyTorch + packages, checks the GPU (about 10 minutes)
-./qvb8 get qwen-9b           # downloads the model (9 GB)
-./qvb8 start qwen-9b         # starts the server in the background on port 8080 (first start: a few minutes)
-./qvb8 chat                  # chat in the terminal   (or point any OpenAI client at http://localhost:8080/v1)
-./qvb8 stop                  # when you are done
+./install.sh
 ```
 
-`./qvb8 list` shows the models you can run: `qwen-9b` and **`qwen-27b`, which fits one 16 GB card** (a V100: the 27B
-QVB8R pack 2e-3 plus its QVB8R DFlash2 drafter run on 16 GB of GPU memory). Settings for a small card (smaller chunk,
-KV window, one live request) are chosen automatically from its memory. Attention uses `sdpa`, which works on every card; on an
-Ampere or newer card `ATTN=flash_attention_2 ./qvb8 start qwen-9b` is faster but needs flash-attn (see Install below).
-Tested GPUs: DGX Spark (GB10) and V100. Several cards, several machines, Ripple and Nemotron: see the sections below.
-
-## Requirements
-
-- An NVIDIA GPU with about 62 GB of GPU memory for the qvb8 1e-3 pack (about 50 GB for the qvb8r 1e-3 pack).
-- **Provided build:** NVIDIA DGX Spark (GB10, sm_121, aarch64), Ubuntu 24.04, driver 580, CUDA 13.0, Python 3.12, PyTorch 2.14.
-  This is the build that has been tested. Its prebuilt CUDA kernels are bundled in the tree
-  (`src/qv_band/.prebuilt/sm_121a/`), so a GB10 needs no CUDA toolkit: download, install the packages, run.
-- **V100:** prebuilt kernels are bundled for it as well (`src/qv_band/.prebuilt/sm_70/`, built with PyTorch 2.14.1
-  for CUDA 12.6): a V100 with that PyTorch also runs without a CUDA toolkit.
-- **Other GPUs:** the source is not tied to one GPU. The kernels compile for your GPU on first use (for example sm_120 on an
-  RTX PRO 6000; a few minutes, the CUDA toolkit with `nvcc` is required), but only the DGX Spark build is tested for Ripple.
-- **Compute dtype, `--dtype bf16|fp16`:** the server launcher passes `--dtype fp16`; add `--dtype bf16` after it to
-  run in bf16, for example `scripts/ripple_server.sh start --dtype bf16`. Nothing
-  is chosen automatically. A GPU without bf16 support (for example the V100, sm_70) emulates bf16 and is slow, so run it
-  in fp16. On a GPU with bf16 (A100, H100, RTX 30/40/50, DGX Spark) both work: test which is faster on your card. The
-  packs below are certified for both fp16 and bf16, so the error of every restored weight is less than tau in either
-  dtype. fp16 tops out at 65504, so an activation can overflow in fp16 where bf16 would not; compare a few answers
-  against bf16 if you can.
-- **`escape_tables.json` (needed for fp16):** each pack folder on Hugging Face carries this small file next to
-  `manifest.json`. It holds the fp16 escape table: the few weights an fp16 decode must take from the stored originals.
-  An fp16 run without it stops at start-up and tells you to download it; a bf16 run does not need it.
-  For the V100 the code has its own kernel paths (register-blocked GEMV, WMMA attention) and needs CUDA 12.x, because
-  CUDA 13 dropped sm_70. The V100 path is not yet verified on Ripple.
-- Python 3.10+ (tested 3.12) and the packages in `requirements.txt` (tested versions pinned).
-- A Ripple target pack and a DFlash2 drafter pack (each pack dir carries its own config, modeling code and tokenizer).
-
-## Weight packs (Hugging Face)
-
-The packs are published separately on Hugging Face, from [huggingface.co/addiesam](https://huggingface.co/addiesam).
-Download one target pack and one matching draft pack:
-
-| Model | Original (bf16, about) | Compressed with QVB8 / QVB8R | Small draft pack | All packs |
-|---|---|---|---|---|
-| Qwen3.5-9B | 18 GB | **7.6 GB** | 1.4 GB | [collection](https://huggingface.co/collections/addiesam/qwen35-9b) |
-| Qwen3.8-27B | 54 GB | **13.6 – 21.6 GB** | 1.5 GB | [collection](https://huggingface.co/collections/addiesam/qwem38-27b) |
-| Qwen3.6-35B-A3B | 70 GB | **about 30 GB** | 0.6 GB | [collection](https://huggingface.co/collections/addiesam/qwen36-35b-a3b) |
-| Ripple-65B-Preview | 130 GB | **35.5 – 57 GB** | 3.4 – 4.1 GB | [collection](https://huggingface.co/collections/addiesam/ripple-65b-preview-qvb8) |
-
-The compressed size depends on the format and the error bound tau: `qvb8` is faster, `qvb8r` is smaller, a larger tau is
-smaller still. Each pack's size, format and tau are on its Hugging Face page. Rule of thumb: the pack must fit in GPU
-memory with some room for the KV cache; **a 16 GB card runs the 27B** (QVB8R 2e-3, 13.6 GB; on one card with the DRAM offload, see the V100 speed table).
-
-Every pack: [huggingface.co/addiesam](https://huggingface.co/addiesam).
-
-Each target pack is used together with a drafter pack (`./qvb8 get/start` downloads and starts the pair for you): `qwen-27b`
-= Qwen3.8-27B qvb8r 2e-3 + its DFlash2 qvb8r 5e-3 drafter, `qwen-9b` = Qwen3.5-9B qvb8 1e-3 + its DFlash qvb8 1e-3 drafter.
+**2. Download a model from Hugging Face** into `./models` (download and save all model files to a folder; the download resumes if it stops):
 
 ```bash
-pip install -U huggingface_hub
+hf download addiesam/<model card> --local-dir ./models/<model card>
+```
+
+### Scenario 1: Quick Try Qwen3.5-9B using the QVB8 Inference Engine
+
+**Use when:** you want to try the engine in about 10 minutes on any NVIDIA card with 16 GB or more.
+
+**Download the models:** (download and save all model files to a folder)
+
+| Model type | Model | Size | Hugging Face (download) |
+|---|---|---|---|
+| LLM | Qwen3.5-9B (τ = 1e-3, QVB8) | 7.6 GB | [addiesam/Qwen3.5-9B_qvb8_1e-3_fp16](https://huggingface.co/addiesam/Qwen3.5-9B_qvb8_1e-3_fp16) |
+| DFlash | Qwen3.5-9B DFlash (τ = 1e-3, QVB8) | 1.4 GB | [addiesam/Qwen3.5-9B-DFlash_qvb8_1e-3](https://huggingface.co/addiesam/Qwen3.5-9B-DFlash_qvb8_1e-3) |
+
+```bash
+hf download addiesam/Qwen3.5-9B_qvb8_1e-3_fp16 --local-dir ./models/Qwen3.5-9B_qvb8_1e-3_fp16
+hf download addiesam/Qwen3.5-9B-DFlash_qvb8_1e-3 --local-dir ./models/Qwen3.5-9B-DFlash_qvb8_1e-3
+```
+
+Or download both with one command:
+
+```bash
+./qvb8 get qwen-9b
+```
+
+**Run:**
+
+```bash
+# starts the QVB8 Inference server (OpenAI-compatible mode) on port 8080 (first start: a few minutes)
+./qvb8 start qwen-9b
+```
+
+**Chat in the terminal:**
+
+```bash
+./qvb8 chat
+```
+
+**Stop the server:**
+
+```bash
+./qvb8 stop
+```
+
+---
+
+### Scenario 2: runs Qwen3.8-27B on one 16 GB card (like a V100)
+
+**Use when:** you have one 16 GB card (like a V100) and want the 27B model.
+
+**Download the models:** (download and save all model files to a folder)
+
+| Model type | Model | Size | Hugging Face (download) |
+|---|---|---|---|
+| LLM | Qwen3.8-27B (τ = 2e-3, QVB8R) | 13.6 GB | [addiesam/Qwen3.8-27B_qvb8r_2e-3_fp16](https://huggingface.co/addiesam/Qwen3.8-27B_qvb8r_2e-3_fp16) |
+| DFlash | Qwen3.8-27B DFlash2 (τ = 5e-3, QVB8R) | 1.5 GB | [addiesam/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16](https://huggingface.co/addiesam/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16) |
+
+```bash
+hf download addiesam/Qwen3.8-27B_qvb8r_2e-3_fp16 --local-dir ./models/Qwen3.8-27B_qvb8r_2e-3_fp16
+hf download addiesam/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16 --local-dir ./models/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16
+```
+
+Or download both with one command:
+
+```bash
+./qvb8 get qwen-27b
+```
+
+**Run:**
+
+```bash
+# starts the QVB8 Inference server (OpenAI-compatible mode) on port 8080 (first start: a few minutes); the 16 GB card options are set for you
+./qvb8 start qwen-27b
+
+# the same start by hand
+MODEL=./models/Qwen3.8-27B_qvb8r_2e-3_fp16 DRAFT=./models/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16 DRAFT_K=7 \
+QVB8_MLP_GRAPH=1 QV_HOST_EMBED=1 QV_DRAFT_CTX=2048 ATTN=sdpa MAX_LIVE=1 scripts/qwen_server.sh start \
+  --prefill-chunk 512 --kv-window 4096 --kv-cold-block 8192 --prefix-store host --vision-tower host
+```
+
+**Chat in the terminal:**
+
+```bash
+./qvb8 chat
+```
+
+**Stop the server:**
+
+```bash
+./qvb8 stop
+```
+
+**Remark: long context needs the DRAM KV cache.** The 13.6 GB model leaves only a little VRAM on a 16 GB card, so the KV cache must live in system RAM (DRAM). `--kv-window 4096` keeps only the newest 4096 tokens in VRAM, `--kv-cold-block 8192` moves the older history to DRAM, and `--prefix-store host` keeps the saved prompt prefixes in DRAM. This is how a long context works on 16 GB: 150k tokens of KV take about 4 GB of DRAM (26.5 KB per token), so keep several GB of system RAM free.
+
+**Use it from your tools:** the server speaks the OpenAI API at `http://localhost:8080/v1`. In **VS Code + Cline**
+choose "OpenAI Compatible" and set that base URL.
+
+---
+
+### Scenario 3: a pair of 16 GB cards (two V100) runs Qwen3.8-27B at a tighter τ
+
+**Use when:** you have two 16 GB cards in one PC and want a tighter τ (closer to bf16).
+
+**Machine:** one PC with two 16 GB cards (two V100), one server process for both.
+
+A larger pack (QVB8 τ = 1e-3, 21.6 GB, perplexity +0.08%) is too big for one 16 GB card, so the layers are split over both cards in one process (about 11 GB per card, measured). Download `addiesam/Qwen3.8-27B_qvb8_1e-3_fp16` and `addiesam/Qwen3.8-27B-DFlash2_qvb8_2e-3_fp16` into `./models` as above, then:
+
+```bash
+MODEL=./models/Qwen3.8-27B_qvb8_1e-3_fp16 DRAFT=./models/Qwen3.8-27B-DFlash2_qvb8_2e-3_fp16 DRAFT_K=7 \
+QVB8_MLP_GRAPH=1 QV_HOST_EMBED=1 ATTN=sdpa scripts/qwen_server.sh start --pipeline auto
+```
+
+`--pipeline auto` uses every visible card and places the layers by weight size and free memory; cards of different sizes work. Choose the cards yourself with `--pipeline cuda:0,cuda:1`.
+
+---
+
+### Scenario 4: SSD + DRAM on one machine: a long context or a big model beyond the VRAM
+
+**Use when:** the context or the model is bigger than the VRAM, and the machine has RAM and an SSD.
+
+**Machine:** one GPU machine with enough system RAM and an SSD.
+
+- **LLM, DRAM:** older KV, saved prefixes and the vision tower live in system RAM (`--kv-window`, `--prefix-store host`, `--vision-tower host`, as in Scenario 2).
+- **Image and video models, SSD + DRAM:** the transformer blocks that do not fit the card are streamed from the SSD, with an optional DRAM buffer of 8 to 12 GB. Example: MiniMax-H3 (low_ram pack) on one 16 GB V100 made a 1280x704 video in 46.5 minutes.
+
+---
+
+### Scenario 5: a DRAM PC as the pool for the GPU machines
+
+**Use when:** several GPU machines need one big RAM pool for older KV and saved prefixes.
+
+A cheap PC with a lot of RAM and no GPU holds what the GPU machines cannot: the older KV of long requests and a copy of every saved prefix. The GPU memory then goes to live work, a restart of a GPU server loses nothing, and the PC needs only plain Python (no GPU, no storage service).
+
+| Machine | Hardware | Runs |
+|---|---|---|
+| DRAM PC | any PC with a lot of RAM, no GPU | `prefix_store` (copies of saved prefixes) and `kv_host` (older KV blocks) |
+| GPU machine A | for example a V100 (16 GB) or a DGX Spark | the model server, with `--prefix-backup` and `--kv-remote` pointing at the PC |
+| GPU machine B (optional) | any other generation | the same, so a prefix saved on A can be restored on B |
+
+```bash
+# on the DRAM PC (standard library only)
+python -m ai_engine.servers.prefix_store --mirror http://hostA:8080 --port 8082
+python -m ai_engine.servers.kv_host --port 8083 --budget-gb 8
+# on each GPU machine
+scripts/qwen_server.sh start --prefix-backup http://pc:8082 --kv-remote http://pc:8083 --kv-window 4096
+```
+
+---
+
+### Scenario 6: across machines, no matter new or old cards (architecture)
+
+**Use when:** you have machines with different GPU generations and want one service.
+
+Machines of different generations serve as one service: for example a DGX Spark (Blackwell, GB10) and a box of V100 cards (Volta).
+
+| Machine | Hardware | Runs |
+|---|---|---|
+| Machine 1 | DGX Spark (GB10) | a model server (port 8080) and the router (port 8000) |
+| Machine 2 | box with V100 cards | one model server per card (ports 8080 and 8081), the same pack as machine 1 |
+| DRAM PC (optional) | RAM, no GPU | the prefix store, so a prefix computed on one machine can be pulled by another (Scenario 5) |
+
+Usage cases:
+
+- **A team shares one coding service.** Every machine runs the same pack and one router URL sits in front. Each request goes to the machine that already holds its saved prefix, or the prefix is copied there when copying is faster than computing. A 94k-token prompt took 269 s on a V100 pair the first time and 66 s from the saved prefix; a repeated prompt sent through the router to the V100 that held it took 4.3 s.
+- **Prefill on the fast machine, continue on the old one.** A prompt prefilled on the GB10 is restored on a V100 with the same answer and no recompute.
+- **A model too big for one machine.** Run a stage worker for a range of layers on another machine and add it to the pipeline. Set the same `QV_POOL_TOKEN` on both. Tested: two V100 cards and a GB10 over Wi-Fi.
+
+```bash
+# on the other machine: runs layers 0 to 12
+python -m ai_engine.cli.stage_worker $MODEL --stage-port 8081 --stage-layers 0:12
+# on this machine: the rest of the layers
+scripts/qwen_server.sh start --pipeline host:8081,local --pipeline-split 12
+```
+
+```bash
+# one router URL for every client, over replicas on different machines
+python -m ai_engine.servers.router --port 8000 \
+    --backend gb10=http://127.0.0.1:8080 --backend v100c1=http://v100host:8080 --backend v100c0=http://v100host:8081
+```
+
+---
+
+### Scenario 7: data center, new and old cards co-work (H100, H200, B200, B300, V100 and older)
+
+**Use when:** you run a data center with new servers and older boxes together.
+
+Current server cards and older cards work in the same deployment, because the saved state and the packs are defined by their numbers and not by a GPU.
+
+| Machine | Hardware | Runs |
+|---|---|---|
+| New GPU servers | H100, H200, B200, B300 | the large models (one model over several cards, `--pipeline auto`) and the long-prompt replicas |
+| Older GPU boxes | V100 and other older cards | chat and agent replicas of the same pack, one per card |
+| DRAM pool machines | a lot of RAM, no GPU | the prefix store and the older KV (Scenario 5) |
+| Router machine | any CPU machine | the router, one URL for every client |
+
+Usage cases:
+
+- **A mixed fleet behind one router.** New cards (H100, H200, B200, B300) take the big models and the long prompts; older cards (V100 and the like) take the chat and agent replicas. The router chooses a replica by queue, saved-prefix hit and link speed.
+- **One huge model over many cards.** The layers are placed over the cards of one machine automatically (`--pipeline auto`), and over several machines with stage workers. On one 80 GB card, a 65B model runs as it is: Ripple-65B-Preview (QVB8, τ = 1e-3, 57.3 GB).
+
+```bash
 hf download addiesam/Ripple-65B-Preview-QVB8-1e-3 --local-dir ./models/Ripple-65B-Preview-QVB8-1e-3
 hf download addiesam/Ripple-65B-Preview-DFlash2-QVB8-5e-3 --local-dir ./models/Ripple-65B-Preview-DFlash2-QVB8-5e-3
 ```
 
-## Install
+Then start the server:
 
 ```bash
-git clone https://github.com/addiesam/qvb8.git && cd qvb8
-python -m venv .venv && . .venv/bin/activate
-# 1. PyTorch with CUDA support for your platform (see pytorch.org). Tested: 2.14.0 built for CUDA 13.0.
-# 2. The other packages:
-pip install -r requirements.txt
-# 3. flash-attn: REQUIRED for Ripple (its sliding-window attention layers use it; the server stops at load without it).
-#    It must be built against your PyTorch:  pip install flash-attn==2.8.3.post1 --no-build-isolation
-#    With PyTorch 2.14 the 2.8.3.post1 source needs one change before it compiles: its setup.py passes -std=c++17 and
-#    PyTorch 2.14's headers need C++20. Unpack the sdist, replace every -std=c++17 in setup.py with -std=c++20, then
-#    pip install . --no-build-isolation. To build for one GPU generation only, set FLASH_ATTN_CUDA_ARCHS (for example
-#    FLASH_ATTN_CUDA_ARCHS=80 for RTX 30/40 cards, 120 for a DGX Spark); TORCH_CUDA_ARCH_LIST is not read by that setup.py.
+MODEL=./models/Ripple-65B-Preview-QVB8-1e-3 DRAFT=./models/Ripple-65B-Preview-DFlash2-QVB8-5e-3 scripts/ripple_server.sh
 ```
 
-On a GB10 (or a V100 with the matching PyTorch) the bundled prebuilt kernels are used as-is: no compile, no CUDA
-toolkit. On any other GPU the CUDA kernels compile automatically on first use (a few minutes, `nvcc` required) into
-`.ext_cache/` and are reused after that.
+- **A super DRAM pool.** Machines with a lot of RAM and no GPU keep the saved prefixes and the older KV, so the GPU memory goes to live work and fewer GPUs are needed (Scenario 4).
+- **Many clusters in parallel.** Each cluster is one model over several GPUs; every cluster offloads to the shared DRAM pool.
+
+**Status:** tested on a DGX Spark (GB10) and V100 cards. H100, H200, B200 and B300 servers, and three or more cards, have not been tested: the layouts above are simulations. Prebuilt kernels are included for the GB10 (sm_121a) and the V100 (sm_70); on any other GPU the kernels compile on first use and need the CUDA toolkit. To get these tested, see [Support this project](#sponsor-this-project).
+
+---
+
+### Scenario 8: a team shares long documents and agent rounds
+
+**Use when:** a team or an agent asks about the same long text again and again.
+
+An agent (Cline, OpenCode) sends the whole history again in every round, and a team often asks about the same long document. The server saves the computed state of the beginning of the history, so the next round, or the next person, prefills only what is new.
+
+| Machine | Runs | Why |
+|---|---|---|
+| One GPU machine, several servers | `--prefix-store shared` | the servers of one machine share one RAM pool: a document prefilled on card 0 is restored on card 1, stored once |
+| Several GPU machines + the DRAM PC | the router, `--prefix-backup` on every server | a prefix saved on one machine is pulled by another when copying is faster than computing |
+
+---
+
+### Scenario 9: many users at once (throughput): replicas of a model split by layers
+
+**Use when:** many users send messages at the same time, or one model is too big for one machine and you also need more requests per second.
+
+**One message does not get faster by adding machines**: its tokens pass through the layers in order, so splitting by layers adds memory, not speed. What makes one message faster is the DFlash drafter, a saved prefix, and fewer hops (fewer machines). **More machines serve more messages at the same time.** Build it in two steps:
+
+1. **Split by layers inside each machine.** One server process per machine puts the layers on its cards in order (first layers on card 0, the next on card 1, and so on). You do not need one server per layer range.
+2. **Copy the machine, put one router in front.** Machines 2 and 3 run the same thing, and the router sends each new message to a free machine (or to the one that already holds its saved prefix).
+
+| Machine | Hardware | Runs |
+|---|---|---|
+| Machine 1 | 3 cards | one server, `--pipeline cuda:0,cuda:1,cuda:2`: layers split over its 3 cards |
+| Machine 2 | 3 cards, same | the same server and the same pack |
+| Machine 3 | 3 cards, same | the same server and the same pack |
+| Router machine | any CPU machine | the router, one URL for every client |
+
+```bash
+# on machine 1, 2 and 3 (the same command)
+MODEL=./models/<pack> DRAFT=./models/<drafter pack> DRAFT_K=7 scripts/qwen_server.sh start --pipeline auto
+# on the router machine
+python -m ai_engine.servers.router --port 8000 \
+    --backend m1=http://machine1:8080 --backend m2=http://machine2:8080 --backend m3=http://machine3:8080
+```
+
+Three machines serve three times as many messages at once. Inside each machine, the continuous-batching scheduler also serves several users together (`--max-live`). Not measured yet: the scaling beyond three replicas, and several requests overlapping inside one layer-split pipeline.
+
+## Sponsor this project
 
 <div align="center">
 
-# ❤️ SUPPORT THIS WORK ❤️
-
-## I am an independent researcher and I need machines to test on.
-## Every sponsor helps me publish more models, for free.
+# Every sponsor helps me publish more models, for free.
 
 # 👉 [**SPONSOR DR. ADDIE SAM ON GITHUB**](https://github.com/sponsors/addiesam) 👈
 
@@ -159,442 +412,97 @@ toolkit. On any other GPU the CUDA kernels compile automatically on first use (a
 
 </div>
 
-## Run the server
+QVB8 is built and tested by one person on a few old and new GPUs, and every pack, kernel and paper is free. Your sponsorship decides what comes next:
 
-```bash
-export MODEL=./models/Ripple-65B-Preview-QVB8-1e-3
-export DRAFT=./models/Ripple-65B-Preview-DFlash2-QVB8-5e-3
-scripts/ripple_server.sh            # start in the background, wait until ready
-scripts/ripple_server.sh status
-scripts/ripple_server.sh log        # follow scripts/logs/Ripple-65B.log
-scripts/ripple_server.sh startup    # the load / placement / kernel / memory lines from this start
-scripts/ripple_server.sh stop
-scripts/ripple_server.sh restart --no-think    # extra flags go to the server and win
-```
-
-A Qwen model (dense or mixture of experts) and a Nemotron-H model start the same way with their own launcher; each
-launcher's header lists its settings:
-
-```bash
-MODEL=./models/Qwen3.8-27B_qvb8r_2e-3_fp16 DRAFT=./models/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16 DRAFT_K=7 \
-  scripts/qwen_server.sh
-MODEL=./models/Qwen3.6-35B-A3B_qvb8_5e-4_fp16 DRAFT=./models/Qwen3.6-35B-A3B-DFlash2_qvb8_1e-3 DRAFT_K=7 \
-  scripts/qwen_server.sh
-MODEL=./models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B_qvb8_1e-3_fp16 DRAFT=./models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr \
-  scripts/nemotron_server.sh
-```
-
-More than one card in one machine: add `--pipeline auto` (every visible card) or `--pipeline cuda:0,cuda:1` (the
-cards you choose, in layer order; the last is the main card). **The layers are placed automatically** from each layer's
-weight size and each card's free memory (cards of different sizes work; the split is printed at load); `--pipeline-split`
-sets it by hand. One process; each card holds a contiguous range of layers, so a pack larger than one card's memory loads.
-Several machines: run `python -m ai_engine.cli.stage_worker $MODEL --stage-port 8081 --stage-layers 0:12` on the
-other box and add `--pipeline host:8081,local --pipeline-split 12` here. Set the same `QV_POOL_TOKEN` in the
-environment of both processes: the stage worker then accepts only a main server that presents it (without a token the
-port is open to the network it listens on). A neighbour that loses power or its link is detected within about a minute.
-
-Default port is 8080 (override with `PORT=...`). The server speaks the OpenAI chat API:
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Write a haiku about rivers"}],"max_tokens":200,"stream":false}'
-```
-
-It supports streaming, tool calls (JSON) and the reasoning (`<think>`) channel. It also accepts content-part lists,
-as sent by Cline and similar clients.
-
-## Chat in the terminal
-
-The chat is a client for a running server (it loads no model; standard library only):
-
-```bash
-scripts/chat.sh                                 # interactive, server on port 8080
-scripts/chat.sh "Explain entropy" --no-interactive
-PORT=9090 scripts/chat.sh                       # a server on another port
-URL=http://host:8080 scripts/chat.sh --no-think  # a server on another machine
-```
-
-In the chat: `/reset` starts a new conversation, `/exit` (or Ctrl-D) leaves, Ctrl-C stops the current answer.
-
-## Use it from VS Code (Cline) and other clients
-
-The server speaks the OpenAI chat API, so any client that lets you set a base URL works. For **Cline** in VS Code:
-Settings → API Provider **OpenAI Compatible**, then
-
-| Cline field | Value |
+| Your support | What it unlocks |
 |---|---|
-| Base URL | `http://HOST:8080/v1` (a single server) or `http://HOST:8000/v1` (the router) |
-| API Key | any text (the server does not check it) |
-| Model ID | any text with one model up; with a router and several models, a name from `GET /v1/models` |
-| Context window | what you want to use, up to the server's limit (a 16 GB V100: 32768 is a good start) |
-
-Used with Cline in VS Code for long coding tasks on V100 cards: slower than a big GPU, but a long task runs through to the
-end. The same settings work for Continue, Open WebUI, `curl` and the OpenAI Python client.
-
-### Keep the conversation going, also on another machine
-
-The server keeps no conversation. The client (Cline, your script) sends the **whole history** with every message. What
-the server saves is the *computed state of the beginning of that history* (the prefix), so the next message does not
-compute it again. Therefore you can point the client at another server at any moment and the conversation continues
-with the same answers; only the **speed** depends on whether the new server has the prefix:
-
-| Where the next message goes | What happens |
-|---|---|
-| Same server | the saved prefix is restored: only the new part is computed |
-| Another server on the same machine (another card) | restored from the shared pool (`--prefix-store shared`), instantly |
-| Another machine, through the **router** with a PC store | the router pulls the prefix there when that is faster than computing it (also from a GB10 to a V100) |
-| Another machine, no router / no store | the whole history is computed again: same answer, slower |
-| A server with another pack, τ or KV setting | the prefix is refused (different signature) and computed again |
-
-A prefix matches only if the beginning is **identical**: same system prompt, same chat template, same `think` setting.
-The terminal chat (`scripts/chat.sh`) keeps its history only in that window; to continue elsewhere use a client that
-stores the conversation, such as Cline. Details and commands: [docs/manual.md](docs/manual.md), section 9.
-
-### Why it matters: a change of paradigm, and sample use cases
-
-Certified L∞-bounded compression changes what can be assumed about a compressed model: every restored weight and every saved
-KV value is within a known bound, so the same model needs far less memory and the saved state stays valid on any GPU.
-The cases below are **samples**, from small to large. They are only the first ones we tried; with a bound that is proven
-rather than hoped for, new uses are open to test, and we are waiting for you to try, see, and report new use cases.
-
-- **One old card.** A 27B model runs on one V100 16 GB. It is not a 4-bit (Q4) model: every weight has a proven error
-  bound. With VS Code + Cline it finished coding tasks of 600+ conversation rounds. It is slower than a big GPU, but it
-  finishes the job. Speed: about 10 tok/s in real Cline use; the [V100 table](#speed-on-v100-16-gb-volta-measured-2026-11-16-on-an-idle-machine) has the benchmark numbers.
-- **Local setups.** 16 GB or 24 GB cards, several cards in one machine or several machines, hold a 27B or larger model
-  split by layers (`--pipeline auto`, or a network stage between machines): local coding agents and other AI work
-  without a big single GPU.
-- **Data centers.** New and old cards work together: the saved KV state moves between GPU generations (GB10 and V100
-  tested), and one model can be split over machines of different generations (two V100 to a GB10, tested over Wi-Fi).
-  A **super DRAM pool**, machines with a lot of RAM and no GPU, takes saved prefixes and old KV blocks, so GPU memory is
-  spent on live work and fewer GPUs are needed.
-
-The H100 / H200 / 288 GB layouts and many-cluster layouts below are **simulations**, not results. To test them for real,
-see [Support this project](#support-this-project). Found a new use? Open an issue and tell us.
-
-## Use cases: one card, many cards, many machines
-
-Three independent switches decide where the bytes live. Full manual with every command: [docs/manual.md](docs/manual.md).
-
-| Switch | Question | Example |
-|---|---|---|
-| **split** | Where do the weights live? | 27B on two 16 GB V100s: `--pipeline cuda:0,cuda:1` |
-| **share** | Where do saved prompt prefixes live? | two servers on one box, one RAM pool: `--prefix-store shared` |
-| **PC pool** | Where does the overflow live? | a GPU-less PC holds old KV and copies of prefixes: `--kv-remote`, `--prefix-backup` |
-
-**Why saved prefixes matter.** Prefilling a long prompt takes minutes. The engine saves the state; the next request with
-the same beginning (the same document, the next turn of a chat) restores it and prefills only what is new. A 94k-token
-prompt: **269 s → 66 s** (V100 pair).
-
-### Split: one model over several cards or machines
-
-![split](docs/img/fig1_split.svg)
-
-```bash
-MODEL=./models/Qwen3.8-27B_qvb8r_2e-3_fp16 DRAFT=./models/Qwen3.8-27B-DFlash2_qvb8r_5e-3_fp16 DRAFT_K=7 \
-ATTN=sdpa MAX_LIVE=1 scripts/qwen_server.sh start --pipeline cuda:0,cuda:1
-```
-
-### Share: one prefix pool per machine
-
-![share](docs/img/fig2_share.svg)
-
-```bash
-CUDA_VISIBLE_DEVICES=0 INSTANCE=c0 PORT=8080 scripts/qwen_server.sh start --prefix-store shared --prefix-shared-name demo
-CUDA_VISIBLE_DEVICES=1 INSTANCE=c1 PORT=8081 scripts/qwen_server.sh start --prefix-store shared --prefix-shared-name demo
-```
-
-A document prefilled on card 0 is restored on card 1: stored once, not twice.
-
-### PC DRAM pool: overflow to a machine that only has RAM
-
-![pc pool](docs/img/fig4_pc_pool.svg)
-
-```bash
-python -m ai_engine.servers.prefix_store --mirror http://hostA:8080 --port 8082     # on the PC, standard library only
-python -m ai_engine.servers.kv_host --port 8083 --budget-gb 8                      # on the PC
-scripts/qwen_server.sh start --prefix-backup http://pc:8082 --kv-remote http://pc:8083 --kv-window 4096
-```
-
-### Everything together: router, replicas, pools, PC
-
-![full stack](docs/img/fig5_full_stack.svg)
-
-One router URL for all clients; the router chooses the replica by queue, prefix hit and link speed.
-Step-by-step start-up of the whole stack: [docs/manual.md](docs/manual.md#6-the-full-stack-step-by-step).
-
-### Several rounds with an agent (Cline, OpenCode): what is computed, what is saved
-
-An agent sends the **whole history again in every round**. The server keeps no conversation; it keeps the computed state
-of the beginning of the history. Round 1 computes everything and saves that state; round 2 finds the same beginning,
-restores it and computes **only the difference**:
-
-![round 1, round 2, round n (sequence)](docs/img/fig7_two_rounds.svg)
-
-If round 2 reaches another machine or card, the router moves the saved state there (when that is faster than computing):
-
-![the same conversation over several machines (sequence)](docs/img/fig8_two_rounds_other_machine.svg)
-
-Step by step, with all cases: [docs/manual.md](docs/manual.md), section 10.
-
-### It is a toy on a desk, and it scales to a real server
-
-A replica, a split, a pool and a router are the same four parts on a 16 GB card and on a rack machine; a big server just
-has more of each. Below: a deployment for an 8-GPU machine with 288 GB per card. One huge model, `Qwen/Qwen3.8-2.4T-A95B`
-(2.4 trillion parameters, estimated pack about 1.2 TB), is split over 6 cards; another model runs as two replicas on the
-other 2 cards; a shared pool and one router sit in front. **We have only simulated this layout; we have never run it on H100 /
-H200 / H300 cards.** The settings extend the ones we did run (GB10, V100, a PC store).
-**To test it for real I need the hardware: GPU time, a card, or money to rent one. If you can donate any of these, please
-see [Support this project](#support-this-project).** Commands in [docs/manual.md](docs/manual.md), section 11.
-
-![big server](docs/img/fig6_big_server.svg)
-
-A data center: many isolated clusters run in parallel (each cluster = one model over several GPUs, layers in order), and every cluster offloads to a super DRAM pool. Again simulated only:
-
-![data center](docs/img/fig10_data_center.svg)
-
-One model too big for one card, over three 24 GB cards (each card holds a block of consecutive layers; `--pipeline auto`):
-(We ran the split over two cards only; three or more cards have been simulated, not run on real cards.)
-
-![three cards](docs/img/fig9_three_cards.svg)
-
-## KV cache shared between machines and between different GPUs
-
-![cross machine](docs/img/fig3_cross_machine.svg)
-
-**A prompt prefilled on one machine is restored on another machine with a different GPU, instead of being computed
-again.** The approach is deliberately simple:
-
-> The saved KV is *certified* data: integer ids plus a per-channel (min, step), value = min + id × step, with a proven
-> error bound τ. It is defined by the numbers, not by a GPU or a kernel, so any machine can restore it. Moving it is a
-> plain file copy with a hash check.
-
-In our set-up a DGX Spark (Blackwell, sm_121) and V100 cards (Volta, sm_70, no bf16, no flash-attn) exchange saved
-prefixes of the same model, through a GPU-less PC that only runs plain Python. This is a different design from the
-big serving engines, not a claim of being better at everything; it is simple, and it works on the machines we have.
-**We have tested it on these two GPU types only. If you try it on yours, please tell us how it went (GitHub issues).**
-
-What makes this possible:
-
-- **What moves is small and exact.** The saved state is the certified, compressed KV (L∞-bounded, about 28 KB per token
-  for the Qwen3.8-27B), not raw 16-bit KV. Its error bound holds on whatever hardware restores it.
-- **It is copied, not recomputed.** The receiver publishes a prefix only after every piece arrived and its blake2b hash
-  matched. A failed pull costs nothing but the prefill it would have saved.
-- **Safe by signature.** Both sides must report the same transfer signature (pack and τ, KV τ, KV residual, checkpoint
-  grid, dtype, drafter) before one byte moves.
-- **Cost-aware router.** A prefix is pulled only when copying is faster than recomputing, using the link speed it has
-  measured.
-- **The store needs no GPU and no extra service.** A 16 GB PC with Python holds the copies.
-
-### What we measured (release v1.2.0, 2026-11-15)
-
-Qwen3.8-27B (qvb8r, τ 2e-3, fp16), one prompt of 15,316 tokens, greedy, one run each. A GB10 and one V100, a PC store, and
-the router. This is a functional check, not a benchmark; the network is a Wi-Fi test link.
-
-| Step | Result |
-|---|---|
-| GB10 prefills the prompt (cold) | 19.8 s; the same prompt again, restored from its own pool: 4.9 s |
-| V100, a different prompt of the same length (cold) | 40.2 s |
-| V100 pulls the saved prefix (12,288 tokens, 496 MB) from the GB10 | 335 s at 1.5 MB/s on Wi-Fi (about 5 s at 1 Gb/s, calculated) |
-| V100 answers the same prompt after the pull | **restored 12,288 of 15,316 tokens, prefilled 3,028: 10.3 s**, answer identical to the GB10's |
-| Router, same prompt | sent to the V100 that holds the prefix (14,336 tokens cached): 4.3 s |
-
-Both servers printed the same transfer signature before anything moved. The two GPUs are different generations
-(Blackwell sm_121a, Volta sm_70).
-
-## Compared with SGLang
-
-SGLang is a fast, mature serving engine. We compare design ideas, not speed. This comparison is from its public
-documentation ([HiCache design](https://docs.sglang.io/advanced_features/hicache_design.html),
-[PD disaggregation](https://docs.sglang.io/advanced_features/pd_disaggregation.html), read 2026-11-15); **we did not
-benchmark SGLang**, so there are no speed claims here.
-
-**SGLang can also share KV between instances and machines**: its HiCache has a third tier (L3, a distributed store such
-as Mooncake, 3FS or NIXL) shared by all instances, and its prefill/decode disaggregation moves KV between machines. The
-difference is *what* is shared and *what it takes*:
-
-| | SGLang (public docs) | QVB8 |
-|---|---|---|
-| KV shared between machines | yes: HiCache L3, PD disaggregation | **yes: built in** (pool, transfer, store, router) |
-| Host-RAM tier shared by the servers of one machine | no: L2 is private to one instance | **yes: one `/dev/shm` pool for all servers** |
-| What is stored and moved | the KV in the model's KV dtype (16-bit; FP8 optional) | **certified L∞-bounded compressed KV**, about 28 KB/token (27B) |
-| What the shared store needs | a deployed storage service (Mooncake, 3FS, NIXL, AIBrix) | **a PC with plain Python, no GPU** (`prefix_store.py`, standard library) |
-| Mixed GPU generations in one deployment | transfer engines are device-agnostic; the docs give no compatibility matrix for mixed generations | **run and measured: GB10 (sm_121) + V100 (sm_70)** |
-| Copy or recompute | per-backend policy | **router prices the copy against the prefill from the measured link speed** |
-| Integrity | per backend | **blake2b per piece, all-or-nothing publish, signature checked first** |
-| Weights compressed with a per-weight error bound | no | **yes: every restored weight is within τ** |
-
-### The KV state itself: compressed and certified
-
-This is where the designs differ most. Both systems can move a saved KV; what is *inside* the saved state is different.
-
-| | SGLang (public docs) | QVB8 |
-|---|---|---|
-| Format of the saved KV | the model's KV dtype (bf16 / fp16), or FP8 (E4M3 / E5M2) | per-channel `(min, step)` plus integer ids: value = min + id × step |
-| Scale | FP8: **one scalar per tensor**; if no scale is supplied it defaults to 1.0, which the docs warn "may cause accuracy issues" | **one `(min, step)` per channel**, stored inside the state |
-| Error guarantee | none stated: "typically minimal degradation", larger drops on smaller models and harder reasoning | **certified**: every restored value is within the bound, by construction of the codec |
-| Size, Qwen3.8-27B (16 full-attention layers × 4 KV heads × 256) | 64 KB/token in 16-bit, 32 KB/token in FP8 | **about 28 KB/token** (measured) |
-| Restoring on another machine | HiCache storage layout depends on TP and layout settings; sharing between different TP sizes uses a documented extra setting (`tp_lcm_size`) | **nothing depends on the machine**: the state is just numbers; only the transfer signature has to match |
-| Whether a restored KV is the same as the saved one | a copy of the stored tensors | a copy of the stored integers, hash-checked per piece |
-
-Honest reading of the size row: FP8 is already about the size of our state (32 vs 28 KB/token, about 12 % apart). What
-QVB8 adds is not a smaller number but a **guarantee** (a per-value bound that does not depend on a calibration scale)
-and a state that is **independent of the machine that restores it**, so the same saved prefix can be restored on a GB10, a
-V100 or any machine that reads the format.
-
-Sources: [SGLang quantized KV cache](https://docs.sglang.io/advanced_features/quantized_kv_cache.html),
-[SGLang HiCache best practices](https://docs.sglang.io/advanced_features/hicache_best_practices.html).
-
-Where SGLang is ahead, and we do not claim otherwise: throughput at scale, tensor / expert / data parallelism, RDMA
-transports, the number of supported model architectures, production maturity and community. QVB8 is a research engine
-that runs a few model families (Ripple, Qwen, Nemotron-H) on a few machines.
-
-## Supported options
-
-The release supports GPU only. These are the supported settings (the defaults are in the launcher):
-
-- `--kv-cache qvb8` (certified compressed KV) or `bf16`
-- `--prefill-linear qvb8`
-- `--drafter dflash` (DFlash, DFlash2, DSpine and LiLiCorr checkpoints or packs; the kind is read from the drafter's own
-  config), `n-gram`, `n-gram_with_dflash`, or `--draft 0` for none
-- `--pipeline cuda:0,cuda:1,...` (several cards in one machine; the last card is the main card). The layers are split
-  by weight bytes and each card's free memory, keeping `--pipeline-reserve-mb` (default 2048) free on every card for
-  activations and the KV cache, so cards of different sizes work; `--pipeline-split s1,...` sets the split by hand
-- `--kv-window N|auto`, `--kv-host`, `--kv-cold-block T`, `--kv-gpu-reserve-mb M` (KV cache offload to system RAM)
-
-- `--prefill-chunk N`: tokens per prefill pass. The saved state at a prompt's end sits on a chunk boundary, so a
-  smaller chunk makes a repeated prompt or the next chat turn cheaper and a new long document a little slower
-- `--prefix-store gpu|host|shared`, `--prefix-shared-name NAME`, `--prefix-shared-gb N`: where saved prompt prefixes
-  live; `shared` is one pool in `/dev/shm` for every server of the machine
-- `--max-live N`, `--max-live-tokens T`, `--max-queue N`, `--queue-wait S`: admission control (0 = no limit). A request
-  enters the live batch only when it fits; the waiting queue is first in, first out; a full queue answers 429 and a
-  wait past the limit 503, both with `Retry-After`
-
-`--device cpu` is listed by the CLI help but is not part of this release.
-
-## Speed (measured 2026-11-16, DGX Spark GB10)
-
-Release code and launcher as shipped (`./qvb8 start`-style settings, `ATTN=sdpa`, KV cache qvb8, speculative decoding),
-greedy (temperature 0), thinking off, 400 generated tokens, streaming; the second of two runs of each prompt. One
-measurement per row on an otherwise idle machine, so read the numbers as a reference, not a promise.
-
-| Pair (target + drafter) | Decode, code | Decode, prose | Two requests at once (total) | **Prefill** (57k-token prompt) |
-|---|---|---|---|---|
-| Qwen3.8-27B **qvb8 1e-3** + DFlash2 qvb8r 5e-3 (K=7), `--prefill-chunk 12288` | **18.7 tok/s** | **14.4 tok/s** | **23.9 tok/s** | **about 980 tok/s** (58 s) |
-| Qwen3.6-35B-A3B qvb8 5e-4 + DFlash2 qvb8 1e-3 (K=7) | **53.6 tok/s** | **37.2 tok/s** | **50.2 tok/s** | **about 1,920 tok/s** (30 s) |
-| Qwen3.8-27B qvb8r 2e-3 + DFlash2 qvb8r 5e-3 (K=7), the 16 GB-card pack | 15.5 tok/s | 12.0 tok/s | 18.9 tok/s | about 760 tok/s (75 s) |
-| Qwen3.5-9B qvb8 1e-3 + DFlash qvb8 1e-3 (K=15) | 62.7 tok/s | 45.1 tok/s | 68.8 tok/s | about 2,700 tok/s (21 s) |
-
-The 27B qvb8 row was also measured with chunk 4096 (about 880 tok/s) and 24576 (about 855 tok/s): 12288 is the fastest on the GB10.
-The qvb8 pack is faster than the qvb8r pack (qvb8r is smaller: 13.6 GB instead of 21.6 GB, which is what lets the 27B fit
-one 16 GB card). Prefill uses the int8 path (`--prefill-linear qvb8`) on a qvb8 pack.
-
-Code is faster than prose because the drafter guesses code better (more drafted tokens are accepted per step).
-Speculative decoding is verified by the full model; in our tests greedy output matched plain decoding, and where two
-tokens are an exact near-tie the choice can differ.
-
-### Speed on V100 16 GB (Volta, measured 2026-11-16 on an idle machine)
-
-Qwen3.8-27B qvb8r 2e-3 + DFlash2 qvb8r 5e-3 (K=7), `ATTN=sdpa`, one live request (`MAX_LIVE=1`), same prompts and settings as above, prefill with a 15,263-token prompt.
-
-| V100 setup | Decode, code | Decode, prose | **Prefill** (15k-token prompt) | GPU memory used |
-|---|---|---|---|---|
-| **One card**, DRAM offload (`--prefill-chunk 512 --kv-window 4096 --kv-cold-block 8192 --prefix-store host --vision-tower host`) | 4.9 tok/s | 3.1 tok/s | about 135 tok/s (113 s) | 14.8 GB of 16 |
-| **Two cards**, `--pipeline auto --prefill-chunk 2048` | 7.9 tok/s | 5.8 tok/s | about 310 tok/s (49 s) | split over both cards |
-
-One card needs the DRAM offload (older KV blocks, saved prefixes and the vision tower live in host RAM), and it did
-complete the 15k-token prompt in this test. The V100 has no `causal_conv1d` kernel and no flash-attn, so it uses the
-plain PyTorch paths; it is the slow, small-memory case, not the speed case.
-
-## Update history
-
-**v1.2.0**
-- All LLM families of the engine: Qwen (dense and mixture of experts) and Nemotron-H join Ripple, each with its own
-  launcher; `scripts/ripple_chat.sh` is now `scripts/chat.sh` (it talks to any server).
-- New drafter kind: DSpine (`tencent/Qwen3.8-27B-DSpine-b16`), from the checkpoint or a qvb8 / qvb8r pack of it.
-- `--pipeline auto` uses every visible card; the layers are placed automatically from the weight size of each layer and
-  each card's free memory (`--pipeline-split` still sets it by hand).
-- Several cards with a main card other than `cuda:0` (GitHub issue #1): the main card is one indexed device for the
-  whole process; the automatic split follows each card's free memory and checks the main card too.
-- Admission control in the server; a scheduler that stops reports it (waiting requests fail, the server reports itself
-  unusable) where clients used to wait for ever; the output budget is limited to the context left after the prompt; a
-  non-streaming client that disconnects frees its slot; malformed request fields answer 400.
-- Saved prefixes in a pool shared by the servers of a machine (`--prefix-store shared`); processes are identified by pid
-  and start time, a failed save gives its room back, and a request that cannot fit no longer empties the pool.
-- Saved prefixes move between machines (`/v1/pool/export`, `/v1/pool/pull`, hash-checked pieces, same transfer signature
-  on both sides; `QV_POOL_TOKEN` protects these endpoints). Old KV can live on another machine, which computes the
-  attention over it (`remote_cold` client).
-- The release now includes the router (`ai_engine.servers.router`), the prefix store (`ai_engine.servers.prefix_store`)
-  and the KV host (`ai_engine.servers.kv_host`), a deployment manual with diagrams (`docs/manual.md`), and `INSTANCE=`
-  in the launchers (several servers of one launcher on one machine, each with its own log and pid file).
-- Stage link between machines: token check, dead-peer detection, bounded message sizes.
-- flash-attn is required for Ripple; the build note for flash-attn 2.8.3.post1 with PyTorch 2.14 is in the setup section.
-
-**v1.1.0**
-- The engine is updated to the current development code: the model runs through the engine adapter (the Ripple
-  adapter is registered by name), the continuous-batching scheduler is the current one, and the KV cache gains the
-  sliding-window layers and the certified per-channel codec of the current engine.
-- Several GPUs in one machine: `--pipeline cuda:0,cuda:1` splits the layers across the cards in one process
-  (placement by layer range; the last card is the main card). This replaces tensor parallelism, which is no longer
-  in the engine.
-- Several machines: a remote stage worker (`python -m ai_engine.cli.stage_worker`) runs a layer range on another
-  box; the server reaches it with `--pipeline host:port,local --pipeline-split N`.
-- KV cache offload to system RAM for long contexts: `--kv-window N|auto` keeps the last N tokens (or an automatic
-  window) in VRAM and the cold history in pinned host RAM; `--kv-host` moves the whole cache to host RAM.
-- The terminal chat is now a client for a running server (`scripts/chat.sh`, standard library only): it sends
-  OpenAI-style requests and prints the answer; it loads no model and works from any machine that can reach the
-  server.
-- The server launcher passes `--dtype fp16` (measured faster on the DGX Spark) and `--kv-tau-threshold 0.2`; add
-  `--dtype bf16` to run in bf16.
-- The launcher keeps a startup log (`scripts/logs/Ripple-65B.startup.log`, action `startup`): the command line and
-  everything the server printed until it answered the health check -- the load, placement, kernel and memory lines,
-  apart from the request log.
-- Prebuilt CUDA kernels are bundled in the tree (`src/qv_band/.prebuilt/`): sm_121a for the DGX Spark (PyTorch
-  2.14.0 for CUDA 13.0) and sm_70 for the V100 (PyTorch 2.14.1 for CUDA 12.6). A machine with the matching PyTorch
-  runs without a CUDA toolkit; the sidecar next to each kernel records the sources, torch and platform it was built
-  for, and anything else compiles on first use as before. The sidecar match no longer binds to the torch install
-  path.
-
-**v1.0.1**
-- One switch for the compute dtype: `--dtype bf16|fp16` (replaces the `QV_MODEL_DTYPE` variable). The launchers set
-  the default; nothing is chosen automatically.
-- Two escape tables: an fp16 run reads only the fp16 table from `escape_tables.json`; a bf16 run reads the pack's full
-  list. The pack files are unchanged. In our test (QVB8-1e-3, fp16, DGX Spark, one prompt, greedy) decoding went from
-  about 1.8 to about 5.7 tokens per second; bf16 is unchanged.
-- An fp16 run needs `escape_tables.json` in the pack folder; without it, the engine stops with an error at start-up.
-- The server log: a client that hangs up before the reply (for example a start-up health check) is one `[http] ...` line, not a traceback; an fp16 run no longer prints the bf16 GEMM count as if it were in use.
-
-**v1.0.0: First release**
-- QVB8 Inference Engine for Ripple-65B-Preview, with the QVB8 and QVB8R weight packs.
+| **Sponsor on GitHub** | the [image, video and audio model packs](#image-video-and-audio-models-unreleased-published-once-the-donation-target-is-reached) are published once the donation target is reached; more language-model packs and faster releases |
+| **A GPU card, or GPU time** | testing on H100 / H200 / H300 servers and on three or more cards (today only a DGX Spark and V100 cards are tested), and the TP + DP numbers that are still "not measured" |
+| **Server access or rented GPU hours** | long runs: perplexity of the packs still marked "sponsor to measure", and the data center layouts that are simulations today |
+| **Companies** | custom model packs (other models, other GPUs) and support |
+
+**Contact:** open an issue or write to the author through [github.com/addiesam](https://github.com/addiesam).
+
+If QVB8 saved you a GPU, please [sponsor](https://github.com/sponsors/addiesam). Even a small amount keeps it going.
+
+## Every way to start the API server (one card, TP, DP, PP, TP + DP, DRAM, disk, many machines)
+
+**Use when:** you want to pick how the server uses your cards. Every row starts the same OpenAI-compatible API (`http://host:port/v1`); only the start command differs. A model that does not fit is refused at start with the numbers, not later.
+
+| Mode | What it does | Best for | Start (Qwen3.8-27B; add `MODEL=` and `DRAFT=` as in Scenario 2 / 3) |
+|---|---|---|---|
+| **Single card** | one card holds the model | a model that fits one card | `scripts/qwen_server.sh start` |
+| **PP**: layers split | layers 0..n on card 0, the rest on card 1, one process | a model too big for one card | `scripts/qwen_server.sh start --pipeline cuda:0,cuda:1` |
+| **DP**: one server per card + router | each card holds the whole model; the router sends each request to a free card | many users at once | two single-card servers on ports 8081 / 8082, then `python -m ai_engine.servers.router --port 8080 --backend a=http://localhost:8081 --backend b=http://localhost:8082` |
+| **TP**: tensor parallel | every layer split over the cards (heads and experts), in one process | one request as fast as possible (measured 7 s vs 16 s on one card for Qwen3.8-27B on 2 x V100) | `scripts/qwen_tp_server.sh start` (Qwen family, 2 cards); `QV_TP_DEVICES=cuda:0,cuda:1 scripts/inkling_server.sh start` (Inkling-2-Mini) |
+| **TP + DP** | each router backend is itself a TP group (4 cards = 2 groups of 2) | fast single requests and many users | start one TP server per card pair (`CUDA_VISIBLE_DEVICES=0,1` and `2,3`, ports 8081 / 8082), then the router as in DP. *Not yet run on four cards.* |
+| **DRAM** | older KV, saved prefixes and the vision tower in system RAM | long context on a small card | `--kv-window 4096 --prefix-store host --vision-tower host` (Scenario 2) |
+| **DRAM + disk** | experts or blocks that do not fit the card stay in host RAM or are streamed from the SSD | a model bigger than VRAM + RAM | `QV_EXPERTS=host scripts/inkling_server.sh start` (experts in host RAM) |
+| **DRAM PC pool** | a RAM-only PC keeps saved prefixes and older KV for all GPU machines | many machines, long shared documents | `--prefix-backup http://pc:8082 --kv-remote http://pc:8083` (Scenario 5) |
+| **Many machines, different cards (replicas)** | every machine runs the whole model on its own cards (a GB10, V100 boxes, RTX ...); one router URL in front. A prefix prefilled on a fast machine is restored on an old card with the same answer | a team or a data center mixing new and old GPUs | on each machine `scripts/qwen_server.sh start` (one server per card, own port), then `python -m ai_engine.servers.router --port 8000 --backend gb10=http://gb10:8080 --backend v100a=http://v100host:8080 --backend v100b=http://v100host:8081` (Scenarios 6, 7, 9) |
+| **Many machines, one big model (layers split)** | machine 1 runs layers 0..n, machine 2 the rest, whatever the cards are | a model too big for one machine | on machine 2 `python -m ai_engine.cli.stage_worker $MODEL --stage-port 8081 --stage-layers 0:12`, on machine 1 `scripts/qwen_server.sh start --pipeline host:8081,local --pipeline-split 12` (Scenario 6; set the same `QV_POOL_TOKEN` on both) |
+
+Combine them: for example, DRAM + PP on two cards, or a router over machines that each run PP. On two V100 16 GB, [every mode was measured](#two-16-gb-v100-every-parallel-mode-measured). Qwen-family TP is `scripts/qwen_tp_server.sh` (single-message speed path by default, `USERS=N` to serve N conversations together; greedy or sampled per request).
+
+### Two 16 GB V100: every parallel mode, measured
+
+One machine, 2 × V100 16 GB (no P2P between the cards), 31 GB host RAM. Each cell is one real request through the
+local API, including the server's own per-request work. Modes: **single** = one card; **dual (PP)** = the layers split
+over both cards; **TP** = tensor parallel over both cards; **pair (DP)** = one server per card behind one router URL.
+
+| Model | Request | single | dual (PP) | TP | pair (DP) |
+|---|---|---|---|---|---|
+| Z-Image-Turbo | 832×480 image | ✅ 8 s | ✅ 8 s | ✅ 10 s | ✅ 6–8 s |
+| Qwen3.8-27B | ~110-token reply | ✅ 16 s | ✅ 13 s | ✅ 7 s | ✅ 14–45 s |
+| Qwen-Image-Edit-2511 | 832×480, 3 reference images | ✅ 162 s (3e-3 text encoder, 8 GB RAM buffer) | ✅ 114 s | ✅ 287 s | ✅ 510 s; two at once: 300 s and 714 s |
+| MiniMax-H3 | 832×480 video + audio, 124 frames, first-frame | ✅ 400 s | ✅ 841 s | ✅ 723 s | ✅ 851 s; two at once: 300 s and 660 s |
+| Sonic (lip-sync) | 4 s clip | ✅ 131 s | — no card split for this server | — | ✅ 130 s (684 s on the throttled card) |
+| Qwen3-ASR / ForcedAligner / TTS | 16 s Cantonese clip / same / one sentence | ✅ 3 s / 1 s / 20 s | — small models, one card is enough | — | ✅ 3 s / 1 s / 9–19 s |
+| Qwen3.5-9B | 120-token reply (first request) | ✅ 19 s (warm: 14–17 tok/s) | ✅ 7 s | ✅ 3 s | ✅ 6 s |
+| SenseNova-Loop-9B | ~85-token reply | ✅ 29 s | ✅ 39 s | ✅ 16 s | ✅ 36 s |
+| Inkling-2-Mini | 120-token reply | ✅ 109 s | ✅ 101 s | ✅ 16 s | — two copies need more than 31 GB of host RAM |
+| Qwen3.6-35B-A3B | — | — the 30 GB pack needs more than one card | refused at start: needs 29.7 GiB, the cards have 2 × 13 | refused at start: 14.9 GiB per card, 13 free | — as single |
+
+On this board one card ran hot and throttled, which explains the spread in the pair (DP) times. Card-to-card copies
+go through host memory here, so TP does not beat one card for a model that fits a single card (Z-Image). A model
+that cannot fit is refused when the server starts, with the numbers, instead of failing later.
+
+On a DGX Spark (GB10, one GPU, 121 GB unified memory) the same servers were checked with one small request each,
+beside other running jobs: Z-Image, Wan2.2-TI2V-5B, Qwen-Image-Edit, Sonic, Qwen3-ASR / ForcedAligner / TTS,
+Qwen3.5-9B, SenseNova-Loop-9B, Qwen3.8-27B, Inkling-2-Mini and Qwen3.6-35B-A3B all answered.
+
+
+Design (architecture, every serving mode with diagrams, each key capability in detail) and reference (install, options, measured speed): [DESIGN.md](DESIGN.md).
 
 ## Papers
 
-The certified compression method (every restored weight within error bound τ of the original) and its use on language models
-are described in:
+Five papers by the author describe the method and this system. Papers 1 and 2 describe the certified compression method (every restored weight within error bound τ of the original) and its use on language models; paper 3 extends it to diffusion and video models; paper 4 describes the serving system (saved state that moves between machines); paper 5 describes on-the-fly piecewise Chebyshev approximation.
 
-> Sam, Chi Ngai. *Certified L∞-Bounded Compression for AI Models, I: The Contract and the Virtual-Band Index.*
+> 1. Sam, Chi Ngai. *Certified L∞-Bounded Compression for AI Models, I: The Contract and the Virtual-Band Index.*
 > Zenodo, 2026. [doi:10.5281/zenodo.23815007](https://doi.org/10.5281/zenodo.23815007)
 
-> Sam, Chi Ngai. *Certified L∞-Bounded Compression for AI Models, II: Compressing a Language Model's Weights, Key–Value Cache and Activations.*
+> 2. Sam, Chi Ngai. *Certified L∞-Bounded Compression for AI Models, II: Compressing a Language Model's Weights, Key–Value Cache and Activations.*
 > Zenodo, 2026. [doi:10.5281/zenodo.23816044](https://doi.org/10.5281/zenodo.23816044)
+
+> 3. Sam, Chi Ngai. *Certified L∞-Bounded Compression for AI Models, III: Compressing the Model and the Trajectory: a Tau-Collocation ODE Solver for Compressed Diffusion and Video Models.*
+> Zenodo, 2026. [doi:10.5281/zenodo.23816181](https://doi.org/10.5281/zenodo.23816181)
+
+> 4. Sam, Chi Ngai. *Applying Certified L∞-Bounded Compression to LLM Serving: Portable Saved State, Shared Pools and Mixed-Generation GPUs.*
+> Zenodo, 2026. [doi:10.5281/zenodo.24267208](https://doi.org/10.5281/zenodo.24267208)
+
+> 5. Sam, Chi Ngai. *Certified L∞-Bounded Compression of Large Language Model Weights via On-the-Fly Piecewise Chebyshev Approximation.*
+> [ResearchGate](https://www.researchgate.net/publication/408496032_Certified_L_infty-Bounded_Compression_of_Large_Language_Model_Weights_via_On-the-Fly_Piecewise_Chebyshev_Approximation)
 
 ## License
 
 The code is © 2026 Sam, Chi Ngai, licensed under [Apache-2.0](LICENSE) (see [NOTICE](NOTICE)).
 Questions and bug reports: please open a [GitHub issue](https://github.com/addiesam/qvb8/issues).
 
-The paper is licensed under CC BY-NC-ND 4.0.
 The model weights are not part of this repository and keep their own license.
 
-## Support this project
-
-- **Individuals:** if this project is useful to you, please consider
-  [sponsoring Dr. Addie Sam on GitHub](https://github.com/sponsors/addiesam).
-- **Hardware or GPU time:** I have not been able to test on H100 / H200 / H300 servers or on three or more cards. A donated card,
-  access to a GPU server, or money for rented GPU hours directly decides what gets tested next. Open an issue or contact
-  the author through [github.com/addiesam](https://github.com/addiesam).
-- **Companies:** for custom model packs (other models, other GPUs) or support, open a GitHub issue or contact the author through [github.com/addiesam](https://github.com/addiesam).
-
 ## Disclaimer — no warranty, no liability
+
+**Acknowledgements.** This work was conducted entirely by the author personally, as a hobby in non-working hours, on the author's own devices. The ideas and mathematical formulation are the author's own, developed through discussion with AI models. The author also used an ensemble of frontier AI models, including the compressed model discussed in this series, to assist in writing the papers and implementing the code. All work and empirical measurements were carried out on the author's own machine.
 
 THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL

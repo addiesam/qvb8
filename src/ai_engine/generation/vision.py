@@ -208,22 +208,10 @@ class VisionAdapter:
                                                  trust_remote_code=True)
         if getattr(self.config, "vision_config", None) is None:
             raise RuntimeError(f"{pack} has no vision_config: this model cannot take images")
+        # The vision tower is DENSE in the pack (its dense bundle, at the source dtype): calibration never quantizes
+        # it (pack_model.py), and qv_band.formats.qvb8.vision_dense brings older packs in line. The pack alone is
+        # enough -- no source checkpoint is read.
         source = pack
-        man = os.path.join(pack, "manifest.json")
-        if os.path.isfile(man):
-            source = json.load(open(man)).get("hf_model") or pack
-        # The manifest's "hf_model" is the checkpoint the pack was built FROM.
-        # It may have been moved or deleted since (here the bf16 source under
-        # ./models is gone, only the FP8 one survives), so a missing
-        # source must not kill vision -- look for another dense checkpoint of
-        # the same model instead. The pack itself always keeps the dense
-        # remainder (biases/norms/embeddings) in model.safetensors.
-        #
-        # Only the DENSE path needs such a source: in pack mode the linears
-        # come from the pack's own .qvband files, so resolving a dense source
-        # here would raise for no reason (and would run on every request).
-        if os.environ.get("LLM_VISION_WEIGHTS", "source") != "pack":
-            source = self._resolve_source(source, pack)
         # Image processor only (PIL backend): the stock Qwen3VLProcessor also
         # builds a video processor that imports torchvision, which is not in
         # the serving venv (same reason as pipelines/image_edit._processor).
@@ -237,6 +225,13 @@ class VisionAdapter:
 
         # Vision tower class + rope-index owner for this architecture.
         mt = self.config.model_type
+        # a model whose config CLASS derives from Qwen3.5's (SenseNova-Loop: SenseNovaLoopConfig(Qwen3_5Config)) has
+        # the Qwen3.5 tower and rope index
+        bases = {c.__name__ for c in type(self.config).__mro__}
+        if mt != "qwen3_5_moe" and "Qwen3_5MoeConfig" in bases:
+            mt = "qwen3_5_moe"
+        elif mt not in ("qwen3_5", "qwen3_5_moe") and "Qwen3_5Config" in bases:
+            mt = "qwen3_5"
         if mt == "qwen3_5_moe":
             from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as mod
             vis_cls, owner_cls = mod.Qwen3_5MoeVisionModel, mod.Qwen3_5MoeModel
@@ -253,27 +248,8 @@ class VisionAdapter:
         with init_empty_weights():
             visual = vis_cls(vcfg)
         dtype = torch.bfloat16
-        mode = os.environ.get("LLM_VISION_WEIGHTS", "source")   # source (dense bf16) | pack (qvb8, ~15% feature drift, unverified end-to-end)
-        self.weights_from = None
-        if mode == "pack" and os.path.isfile(man):
-            try:
-                visual = self._load_from_pack(visual, pack, dev, dtype)
-                self.weights_from = f"{pack} (qvb8)"
-            except Exception as e:                 # fall back, never lose vision
-                print(f"[vision] qvb8 pack load failed ({type(e).__name__}: {e}); "
-                      f"falling back to dense", flush=True)
-                # Resolve the dense source NOW (skipped in pack mode above):
-                # the manifest's hf_model may be gone, and the pack alone does
-                # not carry the linears' dense weights.
-                try:
-                    source = self._resolve_source(source, pack)
-                except Exception:
-                    raise
-                with init_empty_weights():
-                    visual = vis_cls(vcfg)
-        if self.weights_from is None:
-            visual = self._load_dense(visual, source, dtype, safe_open)
-            self.weights_from = f"{source} (dense bf16)"
+        visual = self._load_dense(visual, pack, dtype, safe_open)
+        self.weights_from = f"{pack} (dense)"
         # Non-persistent buffers (rotary inv_freq) were built on meta: rebuild.
         for name, mod_ in visual.named_modules():
             if hasattr(mod_, "inv_freq") and mod_.inv_freq.is_meta:
@@ -283,7 +259,12 @@ class VisionAdapter:
         # --vision-tower host (LLM_VISION_TOWER=host): the tower lives in pinned host RAM and visits the card only while it
         # encodes a picture -- a 16 GB card holding the whole 27B has no room left for it beside a long prompt
         self.tower_host = os.environ.get("LLM_VISION_TOWER", "gpu") == "host" and str(dev) != "cpu"
-        if self.tower_host:
+        # --vision-tower cpu: the tower RUNS on the host (fp32) and only its image embeddings go to the card -- a 16 GB
+        # card holding the whole 27B has not even room for the tower's visit (measured V100: out of memory at 340 MB)
+        self.tower_cpu = os.environ.get("LLM_VISION_TOWER", "gpu") == "cpu"
+        if self.tower_cpu:
+            self.visual = visual.to("cpu", torch.float32).eval()
+        elif self.tower_host:
             self.visual = visual.to("cpu").eval()
             # one pinned host copy per tensor; _tower_to swaps which copy the module points at
             self._host_tensors = [(t_, t_.data.pin_memory()) for t_ in list(self.visual.parameters()) + list(self.visual.buffers())]
@@ -294,112 +275,17 @@ class VisionAdapter:
         self.dev = dev
         if verbose:
             n = sum(p.numel() for p in self.visual.parameters()) / 1e6
-            print(f"[vision] tower {n:.0f}M dense params + {self.n_packed} qvb8 tensors "
-                  f"from {self.weights_from} "
+            print(f"[vision] tower {n:.0f}M dense params from {self.weights_from} "
                   f"({time.time() - t0:.1f}s)"
-                  + ("; kept in pinned host RAM, on the card only while encoding" if self.tower_host else ""), flush=True)
-
-    n_packed = 0
-
-    # Where a dense vision source may live when the manifest's "hf_model" is
-    # gone. Same spirit as qv_band's DRAFT_ROOTS: the boot disk gets pruned
-    # and the checkpoint moves to the backup volume.
-    SOURCE_ROOTS = ("./models",)
-
-    def _resolve_source(self, source: str, pack: str) -> str:
-        """A checkpoint we can actually read the DENSE vision weights from.
-
-        Preference order:
-          1. the manifest's "hf_model", if it still exists;
-          2. the pack itself -- model.safetensors keeps the dense remainder
-             (biases, norms, patch/pos embeddings) but NOT the packed
-             linears' weights, so it alone is not enough;
-          3. another dense checkpoint of the same model (FP8/bf16) found by
-             name under SOURCE_ROOTS.
-        Returns the chosen dir; raises if nothing can supply the weights.
-        """
-        def has_dense_weights(d: str) -> bool:
-            """True if this dir carries the FULL dense vision weights.
-
-            The pack's own model.safetensors keeps only the dense REMAINDER
-            (biases, norms, patch/pos embeddings) -- the linears live in
-            .qvband files. So "has a model.visual.* key" is NOT enough: we
-            need a real ".weight" tensor for the block linears, which is what
-            a dense checkpoint has and the pack does not.
-            """
-            keys = []
-            idx = os.path.join(d, "model.safetensors.index.json")
-            if os.path.isfile(idx):
-                try:
-                    wm = json.load(open(idx))["weight_map"]
-                except Exception:
-                    return False
-                keys = list(wm)
-            else:
-                sf = os.path.join(d, "model.safetensors")
-                if not os.path.isfile(sf):
-                    return False
-                try:
-                    from safetensors import safe_open
-                    with safe_open(sf, framework="pt", device="cpu") as f:
-                        keys = list(f.keys())
-                except Exception:
-                    return False
-            vis = [k for k in keys
-                   if k.startswith(("model.visual.", "visual."))
-                   and k.endswith(".weight")]
-            if not vis:
-                return False
-            # A dense checkpoint has block linears (attn.qkv.weight etc.).
-            return any(("attn.qkv.weight" in k or "attn.proj.weight" in k
-                        or "mlp.linear_fc1.weight" in k) for k in vis)
-
-        if source and os.path.isdir(source) and has_dense_weights(source):
-            return source
-        if has_dense_weights(pack):
-            return pack
-        # Same model name, any checkpoint: "<name>" or "<name>-FP8"/"-bf16"...
-        base = os.path.basename((source or pack).rstrip("/"))
-        for root in self.SOURCE_ROOTS:
-            if not os.path.isdir(root):
-                continue
-            for cand in sorted(os.listdir(root)):
-                d = os.path.join(root, cand)
-                if not os.path.isdir(d):
-                    continue
-                if cand != base and not cand.startswith(base + "-"):
-                    continue
-                if has_dense_weights(d):
-                    return d
-            # one level down (e.g. <root>/Qwen/<model>)
-            for sub in sorted(os.listdir(root)):
-                sd = os.path.join(root, sub)
-                if not os.path.isdir(sd):
-                    continue
-                try:
-                    for cand in sorted(os.listdir(sd)):
-                        d = os.path.join(sd, cand)
-                        if not os.path.isdir(d):
-                            continue
-                        if cand != base and not cand.startswith(base + "-"):
-                            continue
-                        if has_dense_weights(d):
-                            return d
-                except OSError:
-                    continue
-        raise RuntimeError(
-            f"no dense vision weights for {base}: the manifest's hf_model "
-            f"({source}) is gone and no sibling checkpoint under "
-            f"{self.SOURCE_ROOTS} carries model.visual.* weights. Set "
-            f"LLM_VISION_WEIGHTS=pack to use the pack's own qvb8 vision "
-            f"tower instead (some feature drift).")
+                  + ("; kept in pinned host RAM, on the card only while encoding" if self.tower_host else "")
+                  + ("; runs on the CPU, only its embeddings go to the card" if self.tower_cpu else ""), flush=True)
 
     @staticmethod
     def _visual_tensors(sd_keys):
         return {k[len("model.visual."):]: k for k in sd_keys if k.startswith("model.visual.")}
 
     def _load_dense(self, visual, source, dtype, safe_open):
-        """Every vision tensor dense, from the source checkpoint."""
+        """Every vision tensor dense, from the pack's dense bundle."""
         idx = os.path.join(source, "model.safetensors.index.json")
         files = (sorted(set(json.load(open(idx))["weight_map"].values()))
                  if os.path.isfile(idx) else ["model.safetensors"])
@@ -414,65 +300,10 @@ class VisionAdapter:
             raise RuntimeError(f"no visual.* weights in {source}")
         missing = set(dict(visual.named_parameters())) - set(sd)
         if missing:
-            raise RuntimeError(f"vision weights missing: {sorted(missing)[:5]} ...")
+            raise RuntimeError(f"{source}: the vision tower is not dense in this pack ({len(missing)} tensors missing, "
+                               f"e.g. {sorted(missing)[:3]}): python -m qv_band.formats.qvb8.vision_dense --pack {source}")
         visual.load_state_dict({k: v.to(dtype) for k, v in sd.items()},
                                strict=False, assign=True)
-        return visual
-
-    def _load_from_pack(self, visual, pack, dev, dtype):
-        """The pack's own vision tower: packed linears (model_visual_*, each
-        read by its own file extension through the format registry --
-        .qvband, or .qvb8r in a qvb8r pack -- calibrated with the rest of the
-        pack) + the dense remainder (biases, norms, patch/pos embeddings) from
-        the pack's model.safetensors."""
-        import torch
-        from safetensors import safe_open
-        from qv_band.formats.qvb8.module import enable_bf16_gemm
-        from qv_band.common.formats import get_format
-
-        man = json.load(open(os.path.join(pack, "manifest.json")))
-        packed = {k[len("model.visual."):]: v for k, v in man["tensors"].items()
-                  if k.startswith("model.visual.")}
-        if not packed:
-            raise RuntimeError("pack has no packed model.visual.* tensors")
-        # 1) dense remainder first, so packed linears can take their real bias.
-        sd = {}
-        with safe_open(os.path.join(pack, "model.safetensors"), framework="pt",
-                       device="cpu") as f:
-            for k in f.keys():
-                if k.startswith("model.visual."):
-                    sd[k[len("model.visual."):]] = f.get_tensor(k).to(dtype)
-        visual.load_state_dict(sd, strict=False, assign=True)
-        # 2) swap each packed nn.Linear for its QVB8 module.
-        n = 0
-        for key, info in packed.items():
-            if not key.endswith(".weight"):
-                raise RuntimeError(f"unexpected packed vision tensor {key}")
-            mod_path = key[:-len(".weight")]
-            parent_path, _, attr = mod_path.rpartition(".")
-            parent = visual.get_submodule(parent_path) if parent_path else visual
-            owner = getattr(parent, attr)
-            pf = os.path.join(pack, info["pack"])
-            spec = get_format(os.path.splitext(pf)[1].lstrip("."))
-            if isinstance(owner, torch.nn.Embedding):        # pos_embed
-                setattr(parent, attr, spec.embedding.from_packfile(
-                    pf, out_dtype=dtype, device=dev))
-                n += 1
-                continue
-            bias = None if owner.bias is None or owner.bias.is_meta else owner.bias
-            lin = spec.linear.from_packfile(pf, bias=bias, device=dev)
-            if isinstance(owner, torch.nn.Conv3d):
-                lin = _patch_conv_cls()(lin, owner, dtype).to(dev)
-            elif not isinstance(owner, torch.nn.Linear):
-                raise RuntimeError(f"{mod_path} is {type(owner).__name__}, not Linear")
-            setattr(parent, attr, lin)
-            n += 1
-        still_meta = [k for k, p in list(visual.named_parameters()) + list(visual.named_buffers())
-                      if p.is_meta and not k.endswith("inv_freq")]
-        if still_meta:
-            raise RuntimeError(f"vision tensors with no data: {still_meta[:5]}")
-        enable_bf16_gemm(visual)        # prefill-sized GEMMs (all patches at once)
-        self.n_packed = n
         return visual
 
     # Saved prompt prefixes, most recently used first. Each holds a DENSE HF cache (~1.7 GB for the
@@ -531,6 +362,48 @@ class VisionAdapter:
         return self._owner_cls.get_rope_index(owner, input_ids, mm_types,
                                               image_grid_thw=grid_thw)
 
+    def prepare(self, messages, tok, embed, dev, *, tools=None, think=False):
+        """An image chat for a server that runs the language model itself (the TP service): (prompt ids, the input
+        embeddings [n, H] on `dev` with every picture's vision features in place, M-RoPE positions [3, n] (cpu),
+        rope delta). `embed`: the language model's input embedding. Same template, processor, tower and rope index as
+        generate()."""
+        import torch
+        msgs, images = split_messages(messages)
+        text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                       tools=tools or None, enable_thinking=bool(think))
+        px = self.image_processor(images=images, return_tensors="pt")
+        grid = px["image_grid_thw"]
+        merge = self.image_processor.merge_size ** 2
+        pad = "<|image_pad|>"
+        pieces = text.split(pad)
+        if len(pieces) - 1 != len(images):
+            raise ValueError(f"template has {len(pieces) - 1} image slots for {len(images)} images")
+        text = pieces[0] + "".join(pad * int(g.prod() // merge) + rest for g, rest in zip(grid, pieces[1:]))
+        ids = tok(text, return_tensors="pt").input_ids
+        img_id = self.config.image_token_id
+        with torch.no_grad():
+            emb = embed(ids.to(dev))                                   # [1, n, H]
+            pv = px["pixel_values"]
+            if self.tower_cpu:
+                feats = self.visual(pv.float(), grid_thw=grid, return_dict=True).pooler_output
+            else:
+                if self.tower_host:
+                    for t_, h_ in self._host_tensors:
+                        t_.data = h_.to(self.dev, non_blocking=True)
+                try:
+                    feats = self.visual(pv.to(self.dev, torch.bfloat16), grid_thw=grid.to(self.dev),
+                                        return_dict=True).pooler_output
+                finally:
+                    if self.tower_host:
+                        for t_, h_ in self._host_tensors:
+                            t_.data = h_
+                        torch.cuda.empty_cache()
+            emb = emb.to(dev)
+            mask = (ids.to(dev) == img_id).unsqueeze(-1).expand_as(emb)
+            emb = emb.masked_scatter(mask, feats.to(dev, emb.dtype))
+            pos, delta = self._rope_index(ids, (ids == img_id).int(), grid)
+        return ids[0].tolist(), emb[0], pos[:, 0].cpu(), int(delta.reshape(-1)[0])
+
     def generate(self, messages, *, tools=None, think=False, max_new=1024,
                  temperature=0.0, top_k=20, top_p=0.95, on_token=None,
                  should_stop=None, on_progress=None, prefill_chunk=None) -> dict:
@@ -582,12 +455,15 @@ class VisionAdapter:
             emb = model.get_input_embeddings()(ids[:, start:])
             if n_cov < len(hashes):
                 p_cov = sum(patches[:n_cov])
-                pv = pv_cpu[p_cov:].to(self.dev, torch.bfloat16)
+                pv = pv_cpu[p_cov:].float() if self.tower_cpu else pv_cpu[p_cov:].to(self.dev, torch.bfloat16)
                 if self.tower_host:
                     for t_, h_ in self._host_tensors:
                         t_.data = h_.to(self.dev, non_blocking=True)
                 try:
-                    feats = self.visual(pv, grid_thw=grid[n_cov:], return_dict=True).pooler_output
+                    if self.tower_cpu:
+                        feats = self.visual(pv, grid_thw=grid[n_cov:].cpu(), return_dict=True).pooler_output.to(self.dev)
+                    else:
+                        feats = self.visual(pv, grid_thw=grid[n_cov:], return_dict=True).pooler_output
                 finally:
                     if self.tower_host:
                         for t_, h_ in self._host_tensors:

@@ -305,6 +305,278 @@ void fwd(torch::Tensor q, torch::Tensor ki, torch::Tensor vi,
 
 
 // ===========================================================================
+// Static decode (engine/static_decode.StaticQKV, CUDA graphs) -- every launch shape fixed, lengths read on the device.
+//   ids  ki / vi (S, Hkv, cap, D) uint8, params (S, nb, Hkv, D) fp32 = min / step of each QBLK-key block
+//   tail tk / tv (S, Hkv, Bt, D) fp16: the open block (+ the keys of a speculative step not yet committed)
+//   lc (S) int64 keys held as ids (all visible to every query), vis (S, T) int64 tail keys seen by query t
+// grid (S*Hkv, NSP + 1, row blocks): split sp < NSP reads ids tiles [sp*tps*BN, ..) below lc, split NSP the tail.
+// qvstatic_combine then merges the splits (log-sum-exp) into o (S, Hq, T, D) fp32 + lse (S, Hq, T): two launches
+// per layer (the first version merged with ~30 torch ops: 2/3 of the time on V100, 2026-11-24).
+// ===========================================================================
+template <int D>
+__device__ __forceinline__ void load_dense(half* dst, const half* src, int start, int nlen) {
+    constexpr int LDK = Smem<D>::LDK;
+    for (int idx = threadIdx.x; idx < BN * D / 8; idx += NT) {
+        int n = idx / (D / 8), c8 = (idx % (D / 8)) * 8;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (n < nlen) v = *reinterpret_cast<const uint4*>(src + (long)(start + n) * D + c8);
+        *reinterpret_cast<uint4*>(dst + n * LDK + c8) = v;
+    }
+}
+
+// one key tile already in KVs (synced): S = Q K^T, online softmax over the visible keys, then V (loadV) and O += P V
+template <int D, typename VisF, typename LoadV>
+__device__ __forceinline__ void tile_body(const half* Qs, half* KVs, float* Ss, half* Ps, float* scr, float* m_s,
+                                          float* l_s, float* a_s,
+                                          wmma::fragment<wmma::accumulator, 16, 16, 16, float>* acc,
+                                          float scale, VisF vis, LoadV loadV) {
+    using S = Smem<D>;
+    constexpr int NFC = D / 16 / 2;
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, fr = warp / 2, fc0 = (warp % 2) * NFC;
+    {
+        const int sr = warp / 2, sc = warp % 2;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> sa;
+        wmma::fill_fragment(sa, 0.f);
+#pragma unroll 4
+        for (int k = 0; k < D; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+            wmma::load_matrix_sync(a, Qs + sr * 16 * S::LDQ + k, S::LDQ);
+            wmma::load_matrix_sync(b, KVs + sc * 16 * S::LDK + k, S::LDK);
+            wmma::mma_sync(sa, a, b, sa);
+        }
+        wmma::store_matrix_sync(Ss + sr * 16 * S::LDS + sc * 16, sa, S::LDS, wmma::mem_row_major);
+    }
+    __syncthreads();
+    {
+        const int r = tid / 4, j = tid % 4;
+        float sv[8], mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int n = j * 8 + i;
+            sv[i] = vis(r, n) ? Ss[r * S::LDS + n] * scale : -INFINITY;
+            mx = fmaxf(mx, sv[i]);
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+        const float m_old = m_s[r];
+        const float m_new = fmaxf(m_old, mx);
+        const float m_safe = m_new == -INFINITY ? 0.f : m_new;
+        float sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            half p = __float2half(sv[i] == -INFINITY ? 0.f : __expf(sv[i] - m_safe));
+            Ps[r * S::LDP + j * 8 + i] = p;
+            sum += __half2float(p);
+        }
+        sum += __shfl_xor_sync(0xffffffff, sum, 1);
+        sum += __shfl_xor_sync(0xffffffff, sum, 2);
+        __syncwarp();
+        if (j == 0) {
+            const float alpha = m_old == -INFINITY ? 0.f : (m_new == m_old ? 1.f : __expf(m_old - m_safe));
+            l_s[r] = l_s[r] * alpha + sum;
+            m_s[r] = m_new;
+            a_s[r] = alpha;
+        }
+    }
+    __syncthreads();
+    loadV();
+    {
+        const bool need = __any_sync(0xffffffff, lane < 16 && a_s[fr * 16 + lane] != 1.f);
+        if (need) {
+#pragma unroll
+            for (int f = 0; f < NFC; ++f) {
+                wmma::store_matrix_sync(scr, acc[f], 16, wmma::mem_row_major);
+                __syncwarp();
+                for (int e = lane; e < 256; e += 32) scr[e] *= a_s[fr * 16 + e / 16];
+                __syncwarp();
+                wmma::load_matrix_sync(acc[f], scr, 16, wmma::mem_row_major);
+                __syncwarp();
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < BN; k += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+        wmma::load_matrix_sync(a, Ps + fr * 16 * S::LDP + k, S::LDP);
+#pragma unroll
+        for (int f = 0; f < NFC; ++f) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+            wmma::load_matrix_sync(b, KVs + k * S::LDK + (fc0 + f) * 16, S::LDK);
+            wmma::mma_sync(acc[f], a, b, acc[f]);
+        }
+    }
+    __syncthreads();
+}
+
+template <int D>
+__global__ void __launch_bounds__(NT) qvattn_static(
+    const half* __restrict__ Q, long sq_s, long sq_h, long sq_t,
+    const uint8_t* __restrict__ KI, const uint8_t* __restrict__ VI, long si_s, long si_h,
+    const float* __restrict__ KMIN, const float* __restrict__ KSTEP,
+    const float* __restrict__ VMIN, const float* __restrict__ VSTEP, long p_s,
+    const half* __restrict__ TK, const half* __restrict__ TV, long st_s, long st_h, int Bt,
+    const long* __restrict__ LC, const long* __restrict__ VIS, int T,
+    float* __restrict__ O, float* __restrict__ M, float* __restrict__ L,
+    int tps, int QBLK, float scale, int n_rows, int G, int NHKV) {
+    using S = Smem<D>;
+    constexpr int NFC = D / 16 / 2;
+    extern __shared__ __align__(128) unsigned char sm[];
+    __shared__ int vrow[BM];
+    half* Qs = reinterpret_cast<half*>(sm + S::q);
+    half* KVs = reinterpret_cast<half*>(sm + S::kv);
+    float* Ss = reinterpret_cast<float*>(sm + S::s);
+    half* Ps = reinterpret_cast<half*>(sm + S::p);
+    const int tid = threadIdx.x, warp = tid / 32, fr = warp / 2, fc0 = (warp % 2) * NFC;
+    float* scr = reinterpret_cast<float*>(sm + S::scr) + warp * 256;
+    float* m_s = reinterpret_cast<float*>(sm + S::st);
+    float* l_s = m_s + BM;
+    float* a_s = l_s + BM;
+    const int slot = blockIdx.x / NHKV, h = blockIdx.x % NHKV, sp = blockIdx.y, rb = blockIdx.z;
+    const int NSP = gridDim.y - 1, row0 = rb * BM;
+
+    for (int idx = tid; idx < BM * D; idx += NT) {             // rows r = t * G + g
+        int r = idx / D, c = idx % D, row = row0 + r;
+        half v = __float2half(0.f);
+        if (row < n_rows) v = Q[slot * sq_s + (long)(h * G + row % G) * sq_h + (long)(row / G) * sq_t + c];
+        Qs[r * S::LDQ + c] = v;
+    }
+    if (tid < BM) {
+        m_s[tid] = -INFINITY; l_s[tid] = 0.f;
+        int row = row0 + tid;
+        vrow[tid] = row < n_rows ? (int)VIS[slot * T + row / G] : 0;
+    }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[NFC];
+#pragma unroll
+    for (int f = 0; f < NFC; ++f) wmma::fill_fragment(acc[f], 0.f);
+    __syncthreads();
+
+    if (sp < NSP) {                                            // closed blocks: 8-bit ids, every key below lc visible
+        const int lc = (int)LC[slot];
+        const uint8_t* ki = KI + slot * si_s + h * si_h;
+        const uint8_t* vi = VI + slot * si_s + h * si_h;
+        const int a = sp * tps * BN, b = min(a + tps * BN, lc);
+        for (int start = a; start < b; start += BN) {
+            const int nlen = min(BN, b - start);
+            const long pb = slot * p_s + ((long)(start / QBLK) * NHKV + h) * D;
+            load_tile<D, uint8_t>(KVs, ki, D, start, nlen, KMIN + pb, KSTEP + pb, 0.f);
+            __syncthreads();
+            tile_body<D>(Qs, KVs, Ss, Ps, scr, m_s, l_s, a_s, acc, scale,
+                         [&](int r, int n) { return row0 + r < n_rows && n < nlen; },
+                         [&]() { load_tile<D, uint8_t>(KVs, vi, D, start, nlen, VMIN + pb, VSTEP + pb, 0.f); });
+        }
+    } else {                                                   // the dense tail: causal per query
+        const int last = min(row0 + BM, n_rows) - 1 - row0;
+        const int vmax = min(vrow[last], Bt);
+        const half* tk = TK + slot * st_s + h * st_h;
+        const half* tv = TV + slot * st_s + h * st_h;
+        for (int start = 0; start < vmax; start += BN) {
+            const int nlen = min(BN, Bt - start);
+            load_dense<D>(KVs, tk, start, nlen);
+            __syncthreads();
+            tile_body<D>(Qs, KVs, Ss, Ps, scr, m_s, l_s, a_s, acc, scale,
+                         [&](int r, int n) { return row0 + r < n_rows && n < nlen && start + n < vrow[r]; },
+                         [&]() { load_dense<D>(KVs, tv, start, nlen); });
+        }
+    }
+    const long base = (((long)slot * gridDim.y + sp) * NHKV + h) * n_rows;
+#pragma unroll
+    for (int f = 0; f < NFC; ++f) {
+        wmma::store_matrix_sync(scr, acc[f], 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = threadIdx.x % 32; e < 256; e += 32) {
+            int row = row0 + fr * 16 + e / 16;
+            if (row < n_rows) O[(base + row) * D + (fc0 + f) * 16 + e % 16] = scr[e];
+        }
+        __syncwarp();
+    }
+    if (tid < BM && row0 + tid < n_rows) {
+        M[base + row0 + tid] = m_s[tid];
+        L[base + row0 + tid] = l_s[tid];
+    }
+}
+
+// the splits of one (slot, kv head, row) -> out (S, Hq, T, D) fp32 normalised, lse (S, Hq, T)
+__global__ void qvstatic_combine(const float* __restrict__ O, const float* __restrict__ M, const float* __restrict__ L,
+                                 float* __restrict__ OUT, float* __restrict__ LSE, int NSP1, int NHKV, int n_rows,
+                                 int D, int G, int T) {
+    const int idx = blockIdx.x, r = idx % n_rows, h = (idx / n_rows) % NHKV, s = idx / (n_rows * NHKV);
+    float mx = -INFINITY;
+    for (int p = 0; p < NSP1; ++p) {
+        long i = (((long)s * NSP1 + p) * NHKV + h) * n_rows + r;
+        if (L[i] > 0.f) mx = fmaxf(mx, M[i]);
+    }
+    const int t = r / G, g = r % G, Hq = NHKV * G;
+    const long oo = (((long)s * Hq + h * G + g) * T + t);
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float den = 0.f, acc = 0.f;
+        for (int p = 0; p < NSP1; ++p) {
+            long i = (((long)s * NSP1 + p) * NHKV + h) * n_rows + r;
+            float l = L[i];
+            if (l > 0.f) { float w = __expf(M[i] - mx); den += w * l; acc += w * O[i * D + d]; }
+        }
+        OUT[oo * D + d] = den > 0.f ? acc / den : 0.f;
+        if (d == 0) LSE[oo] = den > 0.f ? mx + logf(den) : -INFINITY;
+    }
+}
+
+template <int D>
+static void launch_static(torch::Tensor q, torch::Tensor ki, torch::Tensor vi, torch::Tensor kmin,
+                          torch::Tensor kstep, torch::Tensor vmin, torch::Tensor vstep, torch::Tensor tk,
+                          torch::Tensor tv, torch::Tensor lc, torch::Tensor vis, torch::Tensor o, torch::Tensor m,
+                          torch::Tensor l, torch::Tensor out, torch::Tensor lse, int tps, int qblk, double scale) {
+    const int S = q.size(0), Hq = q.size(1), T = q.size(2), nhkv = ki.size(1), G = Hq / nhkv, n_rows = T * G;
+    const int nsp1 = o.size(1);
+    const size_t smem = Smem<D>::bytes;
+    static bool attr[64] = {};
+    const int dev = q.get_device();
+    if (!attr[dev]) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(qvattn_static<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        attr[dev] = true;
+    }
+    auto st = c10::cuda::getCurrentCUDAStream();
+    dim3 grid(S * nhkv, nsp1, (n_rows + BM - 1) / BM);
+    qvattn_static<D><<<grid, NT, smem, st>>>(
+        reinterpret_cast<const half*>(q.data_ptr<at::Half>()), q.stride(0), q.stride(1), q.stride(2),
+        ki.data_ptr<uint8_t>(), vi.data_ptr<uint8_t>(), ki.stride(0), ki.stride(1),
+        kmin.data_ptr<float>(), kstep.data_ptr<float>(), vmin.data_ptr<float>(), vstep.data_ptr<float>(), kmin.stride(0),
+        reinterpret_cast<const half*>(tk.data_ptr<at::Half>()), reinterpret_cast<const half*>(tv.data_ptr<at::Half>()),
+        tk.stride(0), tk.stride(1), (int)tk.size(2),
+        lc.data_ptr<int64_t>(), vis.data_ptr<int64_t>(), T,
+        o.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(), tps, qblk, (float)scale, n_rows, G, nhkv);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    qvstatic_combine<<<S * nhkv * n_rows, D, 0, st>>>(o.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
+        out.data_ptr<float>(), lse.data_ptr<float>(), nsp1, nhkv, n_rows, D, G, T);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// q (S, Hq, T, D) fp16 (D contiguous); o (S, NSP+1, Hkv, T*G, D), m / l (S, NSP+1, Hkv, T*G) fp32 scratch;
+// out (S, Hq, T, D) fp32, lse (S, Hq, T) fp32 contiguous
+void fwd_static(torch::Tensor q, torch::Tensor ki, torch::Tensor vi, torch::Tensor kmin, torch::Tensor kstep,
+                torch::Tensor vmin, torch::Tensor vstep, torch::Tensor tk, torch::Tensor tv, torch::Tensor lc,
+                torch::Tensor vis, torch::Tensor o, torch::Tensor m, torch::Tensor l, torch::Tensor out,
+                torch::Tensor lse, int64_t tps, int64_t qblk, double scale) {
+    const c10::cuda::OptionalCUDAGuard _g(device_of(q));
+    TORCH_CHECK(q.scalar_type() == at::kHalf && q.stride(3) == 1, "q must be fp16, contiguous in D");
+    TORCH_CHECK(ki.scalar_type() == at::kByte && ki.stride(3) == 1 && ki.stride(2) == ki.size(3)
+                && ki.strides() == vi.strides(), "ids (S, Hkv, cap, D)");
+    TORCH_CHECK(kmin.stride(3) == 1 && kmin.stride(2) == kmin.size(3) && kmin.stride(1) == kmin.size(2) * kmin.size(3)
+                && kmin.strides() == kstep.strides() && kmin.strides() == vmin.strides()
+                && kmin.strides() == vstep.strides(), "params (S, nb, Hkv, D)");
+    TORCH_CHECK(tk.scalar_type() == at::kHalf && tk.stride(3) == 1 && tk.stride(2) == tk.size(3)
+                && tk.strides() == tv.strides(), "tail (S, Hkv, Bt, D) fp16");
+    TORCH_CHECK(lc.scalar_type() == at::kLong && vis.scalar_type() == at::kLong && vis.is_contiguous(), "lc / vis");
+    TORCH_CHECK(o.is_contiguous() && m.is_contiguous() && l.is_contiguous() && out.is_contiguous()
+                && lse.is_contiguous(), "outputs");
+    const int d = q.size(3);
+    if (d == 256) launch_static<256>(q, ki, vi, kmin, kstep, vmin, vstep, tk, tv, lc, vis, o, m, l, out, lse, tps, qblk, scale);
+    else if (d == 128) launch_static<128>(q, ki, vi, kmin, kstep, vmin, vstep, tk, tv, lc, vis, o, m, l, out, lse, tps, qblk, scale);
+    else TORCH_CHECK(false, "head_dim must be 128 or 256");
+}
+
+
+// ===========================================================================
 // Gated DeltaNet chunked forward (fla chunk_gated_delta_rule_fwd_h +
 // chunk_fwd_o) with WMMA for sm_70, whose Triton has no tensor-core dot.
 // Same math and the same stored dtypes as fla (h and v_new rounded to the
@@ -608,6 +880,7 @@ void gdn_o(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor h, t
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
     mod.def("fwd", &fwd);
+    mod.def("fwd_static", &fwd_static);
     mod.def("gdn_h", &gdn_h);
     mod.def("gdn_o", &gdn_o);
 }

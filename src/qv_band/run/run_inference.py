@@ -243,6 +243,8 @@ def main():
                     "'format' picks the readers)")
     ap.add_argument("--prompt", default="Explain entropy in one sentence.")
     ap.add_argument("--max-new-tokens", type=int, default=128)
+    ap.add_argument("--repair-pack", action="store_true",
+                    help="one-off, offline: write the pack's missing model.safetensors (the engine itself never writes)")
     ap.add_argument("--no-compress", action="store_true",
                     help="stream everything dense (native dtype) -- VRAM/speed baseline")
     ap.add_argument("--seed", type=int, default=None,
@@ -318,6 +320,7 @@ def _install_pipeline_hooks(model, place, pl=None) -> int:
     forward: the copies are dropped when the next forward starts, so they never
     pin a previous request's masks / hidden states. Returns the layers wrapped."""
     layers = model.model.layers
+    plan = getattr(model, "_qv_execution_plan", None)          # an unrolled loop model (SenseNova): slot -> physical layer
     shared: dict = {}
 
     def _move(x, dev):
@@ -341,7 +344,7 @@ def _install_pipeline_hooks(model, place, pl=None) -> int:
     # of each card and gives the card to the next round after the card's last layer.
     from qv_band.decode import stage_gate as _sg
     gate = first = last = None
-    if pl is not None:
+    if pl is not None and plan is None:                      # (the stage gate follows the physical order: not with an unrolled loop)
         edges = [0] + list(pl.bounds) + [len(layers)]
         spans = list(zip(edges, edges[1:]))
         gate = _sg.StageGate(len(spans), spans)
@@ -350,7 +353,7 @@ def _install_pipeline_hooks(model, place, pl=None) -> int:
         model._qv_stage_gate = gate
     n = 0
     for i, layer in enumerate(layers):
-        dev = torch.device(place(f"model.layers.{i}.weight"))
+        dev = torch.device(place(f"model.layers.{plan[i] if plan else i}.weight"))
         orig = layer.forward
 
         def fwd(*args, _orig=orig, _dev=dev, _i=i, **kwargs):
@@ -444,12 +447,42 @@ def _stream_fp8_experts(model, model_dir, wm, device, block, resolve_key):
     return len(layers)
 
 
+def _build_target(args, base_cls):
+    """(target, tok) from an adapter with its own forward, or None (the HF-skeleton path)."""
+    import json as _json
+    from types import SimpleNamespace
+    from qv_band.engine import find_adapter
+    cfg_path = os.path.join(args.pack_dir or args.model, "config.json")
+    try:
+        raw = _json.load(open(cfg_path))
+    except OSError:
+        return None
+    try:
+        adapter = find_adapter(SimpleNamespace(**raw))
+    except Exception:                      # an adapter that needs a full config object: the normal path decides
+        return None
+    if adapter is None or type(adapter).build_target is base_cls.build_target:
+        return None
+    print(f">>> model adapter: {adapter.name} (own forward: no HF skeleton)", flush=True)
+    built = adapter.build_target(args.pack_dir or args.model, device=args.device, dtype=args.dtype,
+                                 kv_cache=os.environ.get("QV_KV_CACHE", "bf16"),
+                                 kv_tau=float(os.environ.get("QV_KV_TAU", "0.1")))
+    return built
+
+
 def _load_qv_model_impl(args):
     device = args.device
     if not (torch.cuda.is_available() or
             (hasattr(torch, "xpu") and torch.xpu.is_available())):
         raise RuntimeError("inference requires a CUDA or XPU GPU")
     backend = _backend(device)
+
+    # A model adapter that runs its own forward (ModelAdapter.build_target) gets the folder instead of an HF
+    # skeleton. Matched on config.json itself, so the installed transformers need not know the architecture.
+    from qv_band.engine.adapter import ModelAdapter as _MA
+    _built = _build_target(args, _MA)
+    if _built is not None:
+        return _built
 
     # Pipeline placement over N cards (QV_PIPELINE=cuda:0,...,cuda:N-1, one process; run/placement.py):
     # each card holds a contiguous range of decoder layers, the LAST card is the main card (embedding, final norm,
@@ -520,9 +553,6 @@ def _load_qv_model_impl(args):
         else:
             model = AutoModelForCausalLM.from_config(text_cfg, trust_remote_code=True)
     model_dtype = getattr(text_cfg, "torch_dtype", None) or torch.bfloat16
-    # --dtype fp16 / bf16 (the user's choice; never picked from the GPU): fp16 for GPUs with no bf16 hardware (V100,
-    # sm_70), where every bf16 op is emulated. The risk of fp16 is activation overflow (fp16 tops out at 65504), so
-    # compare outputs against bf16 first. Unset: the model's own dtype.
     _dt = getattr(args, "dtype", None)
     if _dt:
         _dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16}
@@ -626,15 +656,20 @@ def _load_qv_model_impl(args):
                       f"{len(down_packs)}/{num_experts} down packed -- "
                       f"streaming this stack dense instead", flush=True)
                 continue
-            if spec.experts is None:
+            # The stack's own file extension picks the reader, like the linears and
+            # embeddings above: a mixed pack (qvb8 linears + qvbq NVFP4/FP8 experts)
+            # must not decode a .qvbq stack with the run-wide format's codec.
+            stack_fmt = os.path.splitext(next(iter(gate_up_packs.values())))[1].lstrip(".")
+            stack_spec = get_format(stack_fmt) if stack_fmt != fmt else spec
+            if stack_spec.experts is None:
                 # This format has no expert-stack reader. Streaming the
                 # stack dense is the SAME thing this loop already does for
                 # a partially-packed stack above, so the model still loads;
                 # it just does not get this stack compressed.
-                print(f"[qv] '{block_path}': format {fmt} has no expert "
+                print(f"[qv] '{block_path}': format {stack_fmt} has no expert "
                       f"reader -- streaming this stack dense", flush=True)
                 continue
-            replacement = spec.experts.from_packfiles(
+            replacement = stack_spec.experts.from_packfiles(
                 gate_up_packs, down_packs, num_experts=num_experts,
                 act_fn=getattr(owner_block, "act_fn", None),
                 device=_place(block_path),     # pipeline placement: this layer's card, not the main one
@@ -652,10 +687,20 @@ def _load_qv_model_impl(args):
         # module docstring). Same path list and order this loop's own
         # `tensors.items()` filter produces, computed once up front.
         from qv_band.common.prefetch import PackfilePrefetcher
+        def _is_linear(mod_name):
+            for cand in (mod_name, "model." + mod_name):
+                try:
+                    return isinstance(_resolve(model, cand), nn.Linear)
+                except AttributeError:
+                    continue
+            return False
         _prefetch_paths = [
             os.path.join(args.pack_dir, info["pack"])
             for tkey, info in tensors.items()
-            if _parse_expert_key(tkey)[1] is None and _held(tensor_key_to_module(tkey))]
+            if _parse_expert_key(tkey)[1] is None and _held(tensor_key_to_module(tkey))
+            and not _is_linear(tensor_key_to_module(tkey))]
+        _lin_jobs = []
+        _prefetch_set = set(_prefetch_paths)
         _prefetcher = PackfilePrefetcher(_prefetch_paths)
         for tkey, info in tensors.items():
             base, eidx = _parse_expert_key(tkey)
@@ -665,7 +710,7 @@ def _load_qv_model_impl(args):
             if not _held(module):
                 continue
             packfile = os.path.join(args.pack_dir, info["pack"])
-            _blob = _prefetcher.get(packfile)
+            _blob = _prefetcher.get(packfile) if packfile in _prefetch_set else None   # linears: the parallel loader
             try:
                 owner = _resolve(model, module)
             except AttributeError:
@@ -782,41 +827,12 @@ def _load_qv_model_impl(args):
                     embed_module_name = module
                     embed_packfile = packfile
             elif isinstance(owner, nn.Linear):
+                # the common loader (run/weight_load.py): every linear is built after this walk, one weight per worker
                 bias = None if owner.bias is None or owner.bias.is_meta else owner.bias
-                # Same per-tensor extension rule as the embedding branch
-                # above: a Linear packed at a different restore than the
-                # run-wide format (currently only embed_tokens/lm_head can
-                # be, when tied and owned by an nn.Linear rather than an
-                # nn.Embedding) must be read with ITS format's class.
                 tensor_fmt = os.path.splitext(info["pack"])[1].lstrip(".")
                 tensor_spec = get_format(tensor_fmt) if tensor_fmt != fmt else spec
-                tensor_lin_cls = tensor_spec.linear
-                if tensor_lin_cls is QVBandLinearV8:
-                    try:
-                        repl = tensor_lin_cls.from_packfile(
-                            packfile, bias=bias, device=device,
-                            tau=tau_used, blob=_blob)
-                    except UncertifiableTensor as e:
-                        # See the embedding branch above for why this
-                        # tensor has no dense-bundle fallback and must
-                        # be re-read from the source checkpoint here.
-                        print(f"[qv] '{module}': cannot be certified at "
-                              f"its stored precision -- loading dense "
-                              f"from source instead ({e})", flush=True)
-                        if not _load_dense_from_source(
-                                manifest, tkey, module, model, device):
-                            raise RuntimeError(
-                                f"'{module}' refused at load time and "
-                                f"its source checkpoint "
-                                f"({manifest.get('hf_model')}) does not "
-                                f"have '{tkey}' either -- no way to "
-                                f"recover real data for this tensor.") from e
-                        skip_weights.add(module + ".weight")
-                        continue
-                else:
-                    repl = tensor_lin_cls.from_packfile(
-                        packfile, bias=bias, device=device)
-                _setattr_dotted(model, module, repl)
+                _lin_jobs.append((module, tkey, packfile, bias, device, tensor_spec.linear))
+                continue
             elif (isinstance(getattr(owner, "weight", None), torch.nn.Parameter)
                   and getattr(owner, "weight").dim() == 2
                   and getattr(owner, "bias", "MISSING") in (None, "MISSING")):
@@ -878,6 +894,32 @@ def _load_qv_model_impl(args):
             else:
                 continue
             skip_weights.add(module + ".weight")
+        _prefetcher.close(); _prefetcher = None
+
+        # every linear at once: the common loader (one weight per worker, QV_LOAD_WORKERS, capped by host RAM),
+        # put in place in manifest order -- whatever the model, its placement (one card, PP stages) decided `device`
+        from qv_band.run.weight_load import load_parallel, on_card as _on_card
+
+        def _build_linear(job):
+            _m, _tk, pf, bias, dev, cls = job
+            try:
+                kw = {"tau": tau_used} if cls is QVBandLinearV8 else {}
+                with _on_card(dev):
+                    return cls.from_packfile(pf, bias=bias, device=dev, **kw)
+            except UncertifiableTensor as e:
+                return e
+        for (module, tkey, pf, bias, dev, cls), repl in zip(_lin_jobs, load_parallel(_build_linear, _lin_jobs)):
+            if isinstance(repl, UncertifiableTensor):
+                print(f"[qv] '{module}': cannot be certified at its stored precision -- loading dense from source "
+                      f"instead ({repl})", flush=True)
+                if not _load_dense_from_source(manifest, tkey, module, model, dev):
+                    raise RuntimeError(
+                        f"'{module}' refused at load time and its source checkpoint ({manifest.get('hf_model')}) does "
+                        f"not have '{tkey}' either -- no way to recover real data for this tensor.") from repl
+            else:
+                _setattr_dotted(model, module, repl)
+            skip_weights.add(module + ".weight")
+        _lin_jobs = None
         device = main_device
         backend.empty_cache()
 
@@ -895,6 +937,13 @@ def _load_qv_model_impl(args):
         # leaving those tensors on `meta` (which crashes deep inside the
         # embedding forward with a confusing "Cannot copy out of meta tensor"
         # instead of a message that points at the actual cause).
+        # The ENGINE never writes to disk: a pack without its dense file is fixed once, offline, by
+        #   python -m qv_band.run.run_inference --model PACK --pack-dir PACK --repair-pack
+        if not getattr(args, "repair_pack", False):
+            raise RuntimeError(
+                f"{args.pack_dir}: no model.safetensors (the norms / biases / small tensors the pack does not compress). "
+                f"The engine does not write to disk; build it once with: python -m qv_band.run.run_inference "
+                f"--model {args.model} --pack-dir {args.pack_dir} --repair-pack")
         _repair_pack_dir_missing_dense(args.pack_dir, manifest,
                                        skip_weights, _resolve_key)
         has_dense_here = os.path.exists(
@@ -1017,15 +1066,15 @@ def _load_qv_model_impl(args):
     # linears into one launch, each group on its members' card) -- no format names here
     if not args.no_compress and spec.finalize is not None:
         print(f">>> {fmt} finalize: {spec.finalize(model)}", flush=True)
+    model._qv_adapter = adapter
+    if adapter is not None:                  # BEFORE the pipeline hooks: an adapter may rebuild the layer list (SenseNova's unrolled loop)
+        adapter.install(model, model_dir=args.model, config=config, tok=tok)
     if pl is not None:
         _install_pipeline_hooks(model, _place, pl)
     model._qv_placement = pl
 
     gc.collect()
     backend.empty_cache()
-    model._qv_adapter = adapter
-    if adapter is not None:
-        adapter.install(model, model_dir=args.model, config=config, tok=tok)
     model._qv_vram_weights = backend.memory_allocated() / 1e6
     model._qv_tau_used = tau_used
     model._qv_dtype = model_dtype

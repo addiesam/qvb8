@@ -59,27 +59,30 @@ def disable_unusable_kernels(verbose: bool = True) -> None:
     Only touches what is actually broken: `fla` is Triton (JIT-compiled per
     device) and runs fine on sm_70, so it is deliberately left alone.
     """
-    try:
-        from transformers.models.qwen3_5 import modeling_qwen3_5 as q35
-    except Exception:
+    import importlib
+    mods = []
+    # every transformers modeling file that binds the kernels (dense Qwen3.5 AND its MoE twin, Qwen3-Next ...): each keeps its OWN
+    # copy of the name, so patching one leaves the others calling the broken kernel (the 35B-A3B MoE died on a V100 this way)
+    for mod in ("qwen3_5.modeling_qwen3_5", "qwen3_5_moe.modeling_qwen3_5_moe", "qwen3_next.modeling_qwen3_next"):
+        try:
+            mods.append(importlib.import_module("transformers.models." + mod))
+        except Exception:
+            pass
+    if not mods:
         return                                # not this architecture; nothing to do
 
     if _can_execute_causal_conv1d():
         return
 
-    # Only the causal-conv pair. `fla`'s scan is Triton (JIT-compiled per
-    # device) and verified running on sm_70, and torch_chunk_gated_delta_rule
-    # is the real attribute name here -- chunk_gated_delta_rule /
-    # fused_recurrent_gated_delta_rule do not exist on this module, so
-    # nulling the names the CPU loader lists would silently do nothing here.
-    for name in ("causal_conv1d_fn", "causal_conv1d_update"):
-        fn = getattr(q35, name, None)
-        if fn is None and not hasattr(q35, name):
-            continue
-        # Newer transformers call these unconditionally (the decorated
-        # function carries its pure-torch body in __wrapped__); older ones
-        # test them for None. Use the torch body when there is one, else None.
-        setattr(q35, name, getattr(fn, "__wrapped__", None))
+    # Only the causal-conv pair. `fla`'s scan is Triton (JIT-compiled per device) and verified running on sm_70.
+    for q35 in mods:
+        for name in ("causal_conv1d_fn", "causal_conv1d_update"):
+            fn = getattr(q35, name, None)
+            if fn is None and not hasattr(q35, name):
+                continue
+            # Newer transformers call these unconditionally (the decorated function carries its pure-torch body in
+            # __wrapped__); older ones test them for None. Use the torch body when there is one, else None.
+            setattr(q35, name, getattr(fn, "__wrapped__", None))
     if verbose:
         print("[serve] disabled causal_conv1d kernels -> pure-torch "
               "Gated-DeltaNet conv (this GPU has no matching cubin); "

@@ -36,7 +36,7 @@ if [ -n "${DRY:-}" ]; then PIP="pip"; else PIP=".venv/bin/python -m pip"; fi
 run $PIP install --upgrade pip
 
 say "PyTorch (large download, a few GB)"
-run $PIP install "torch>=2.14" --index-url "$TORCH_INDEX"
+run $PIP install "torch>=2.14,<2.15" --index-url "$TORCH_INDEX"
 
 say "Other packages"
 # torch brings the triton build it needs: the pinned triton line of requirements.txt is left out here

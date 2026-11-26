@@ -54,22 +54,41 @@ def _mm_f32(xh: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         return F.linear(xh / _FP16_HEADROOM, W).float() * _FP16_HEADROOM
 
 
+_SHARED_ATTRS = ("out_features", "in_features", "T", "chunks", "chunks_bf16", "fp16_table_missing", "cert",
+                 "bf16_certified")
+
+
+def _shared(path) -> bool:
+    from qv_band.run.weight_source import shared_host
+    return shared_host(path)
+
+
 class QVBandLinearV8R(nn.Module):
     # Rows of dense weight decoded per matmul in the M > 16 path. A whole tensor in ONE decode + ONE F.linear gives the
     # same fp16 results as QVB8's path (cuBLAS picks its kernel, and so its accumulation order, per matmul SHAPE: 32 MB
     # row chunks made the results differ by an ulp here and there although every weight is bit-identical) and fewer,
     # larger GEMMs (MiniMax-H3 denoise 101 s -> 81 s). Every layer tensor of the 27B (<= 178 MB) and of MiniMax-H3
     # (<= 308 MB) is one chunk; lm_head (2.5 GB) still is not.
-    CHUNK_BYTES = 512 << 20
+    CHUNK_BYTES = int(os.environ.get("QVB8R_CHUNK_MB", "512")) << 20   # decoded-weight chunk of an M > 16 pass (a full 16 GB card: lower it)
     # Opt-in per module (enable_bf16_gemm, set by loaders of bf16-native models), as QVB8's: a bf16 activation with M > 8
     # decodes the band to bf16 and runs bf16 GEMMs -- the model's own precision, with bf16's range. Only for a pack whose
     # certificate covers bf16 (restore "fp16+bf16"): the fp16 path below would clamp a bf16 stream at 65504, and a bf16
     # network (MiniMax-H3 DiT: massive activations) turns NaN there.
     bf16_gemm = False
 
-    def __init__(self, d: dict, bias=None, device="cuda", path: str | None = None):
+    def __init__(self, d: dict, bias=None, device="cuda", path: str | None = None, rows=None, cols=None):
+        """rows / cols: keep only these output rows ([(r0, r1), ...]) x input columns ((c0, c1)) -- a Tensor Parallel
+        share cut in place from the stream (cut.py, no re-encoding). The caller cuts the bias."""
         super().__init__()
         self.path = path
+        self._cut = (rows, cols)
+        esc_keep = None
+        if rows is not None or cols is not None:
+            from .cut import cut_dict
+            full_esc = d["esc_idx"]
+            d, esc_keep = cut_dict(d, rows, cols)
+            if d is None:
+                raise ValueError(f"qvb8r: cannot cut {path} in place: {esc_keep}")
         tab, tiles, words, off = QF.runtime_tables(d)
         Q, P = int(d["Q"]), int(d["P"])
         self.out_features, self.in_features, self.T = Q, P, int(d["T"])
@@ -108,7 +127,9 @@ class QVBandLinearV8R(nn.Module):
             if lst is None:
                 self.fp16_table_missing = True
             else:
-                need = select_fp16(ei_b, lst, str(path))
+                need = select_fp16(ei_b if esc_keep is None else np.asarray(full_esc, np.int64), lst, str(path))
+                if esc_keep is not None:
+                    need = need[esc_keep]
         d = dict(d, esc_idx=ei_b[need], esc_val=ev_b[need], esc_delta=np.asarray(d["esc_delta"], np.float32)[need])
         ei = d["esc_idx"].astype(np.int64)
         # the kernel correction (fix_escapes) groups the escapes by output q (CSR, sorted by q then c): one thread per
@@ -159,23 +180,87 @@ class QVBandLinearV8R(nn.Module):
         buf("chunk_eflat", f16); buf("chunk_evals", v16)
         buf("chunk_eflat_bf16", fb); buf("chunk_evals_bf16", vb)
 
+    @classmethod
+    def ref(cls, path: str, bias=None):
+        """Header-only stand-in (as device="disk" but without reading the arrays): shape, path, bias; no buffers."""
+        h = QF.read_header(path)
+        m = cls.__new__(cls)
+        nn.Module.__init__(m)
+        m.path, m._cut, m.on_disk, m.is_ref = path, (None, None), True, True
+        m.out_features, m.in_features, m.T = int(h["Q"]), int(h["P"]), int(h["T"])
+        m.cert = h.get("cert", {})
+        m.bf16_certified = m.cert.get("restore") == "fp16+bf16"
+        m.fp16_table_missing = False
+        for n in ("words", "off", "states", "tiles", "drow", "tab", "perm", "blocks8", "blocks16", "min_s", "tau_s",
+                  "esc_uq", "esc_ptr", "esc_c", "esc_delta", "esc_delta16", "esc_flat", "esc_val", "esc_flat_bf16",
+                  "esc_val_bf16", "chunk_orows", "chunk_eflat", "chunk_evals", "chunk_eflat_bf16", "chunk_evals_bf16"):
+            m.register_buffer(n, None, persistent=False)
+        m.chunks, m.chunks_bf16 = [], []
+        m.bias = None if bias is None else nn.Parameter(bias.detach().to("cpu"), requires_grad=False)
+        return m
+
     def rebuild_buffers(self) -> dict:
         """Disk mode: read this module's file again and return its buffers as host (pageable) tensors -- the same bytes a
         resident load builds. The file's pages are dropped from the page cache afterwards."""
         import os
-        tmp = type(self)(QF.read(self.path), device="cpu", path=self.path)
-        fd = os.open(self.path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
+        tmp = type(self)(QF.read(self.path), device="cpu", path=self.path, rows=self._cut[0], cols=self._cut[1])
+        from qv_band.run.weight_source import keeps_page_cache
+        if not keeps_page_cache(self.path):
+            fd = os.open(self.path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        # a header-only module (ref) learns the table layout here (same file, same values every visit)
+        for a in ("chunks", "chunks_bf16", "fp16_table_missing", "T"):
+            if hasattr(tmp, a):
+                setattr(self, a, getattr(tmp, a))
         return dict(tmp._buffers)
 
     @classmethod
     def from_packfile(cls, path: str, *, bias=None, tau: float | None = None, device: str = "cuda",
-                      blob: bytes | None = None):
-        """`tau` is accepted for call-site compatibility and ignored: each file carries its own certified tau."""
-        return cls(QF.read(path, blob), bias=bias, device=device, path=path)
+                      blob: bytes | None = None, rows=None, cols=None):
+        """`tau` is accepted for call-site compatibility and ignored: each file carries its own certified tau.
+        rows / cols: load only a Tensor Parallel share, cut in place (cut.py).
+        device="ref": a reference only (header read, nothing else): a Tensor Parallel loader cuts each card's share
+        from the file afterwards, so the table is read once, by the cut."""
+        if device == "ref":
+            m = cls.ref(path, bias=bias)
+            if rows is not None or cols is not None:     # a Tensor Parallel share still in its file: cut on each visit
+                from .cut import can_cut
+                why = can_cut(m.in_features, cols)
+                if why:
+                    raise ValueError(f"qvb8r: cannot cut {path} in place: {why}")
+                rl = [rows] if isinstance(rows, tuple) and len(rows) == 2 and not isinstance(rows[0], (tuple, list)) else rows
+                m._cut = (None if rl is None else [tuple(r) for r in rl], None if cols is None else tuple(cols))
+                if rl is not None:
+                    m.out_features = int(sum(b - a for a, b in rl))
+                if cols is not None:
+                    m.in_features = int(cols[1]) - int(cols[0])
+            return m
+        cut = rows is not None or cols is not None
+        shared = device == "cpu" and blob is None and _shared(path)
+        if shared:                              # dram:shared -- attach to the owner's copy, or become the owner
+            from qv_band.swap import shared_host as SH
+            rl = None if rows is None else ([rows] if isinstance(rows, tuple) and len(rows) == 2
+                                            and not isinstance(rows[0], (tuple, list)) else list(rows))
+            key = SH.cut_key(rl, cols)
+            got = SH.claim(path, key)            # attached copy, or None: this process owns (loads + publishes) it
+            if got is not None:
+                bufs, attrs = got
+                m = cls.ref(path, bias=bias)
+                m.on_disk = m.is_ref = False
+                m._cut = (rl, None if cols is None else tuple(cols))
+                for k_, v_ in attrs.items():
+                    setattr(m, k_, [tuple(c) for c in v_] if k_ in ("chunks", "chunks_bf16") else v_)
+                for k_, v_ in bufs.items():
+                    m._buffers[k_] = v_
+                return m
+        d = QF.read_last(path) if cut and blob is None else QF.read(path, blob)
+        m = cls(d, bias=bias, device=device, path=path, rows=rows, cols=cols)
+        if shared:                              # the owner: one pinned DRAM copy every other process attaches to
+            SH.publish(m, path, key, {a: getattr(m, a) for a in _SHARED_ATTRS if hasattr(m, a)})
+        return m
 
     # decode metadata: the kernels read these as fp32; a dtype cast (module.to(torch.bfloat16), pipe.to(...)) must never narrow them
     _FP32_BUFFERS = ("min_s", "tau_s", "esc_val", "esc_delta", "esc_delta16", "chunk_evals",
@@ -234,11 +319,9 @@ class QVBandLinearV8R(nn.Module):
             # output order (a contiguous Q x P row copy) and let the GEMM write y directly, as _chunked does. The y[:, orows]
             # below is a strided column scatter of the whole M x Q result -- Qwen-Image-Edit 1 MP: 0.9 s of index_put per
             # call, 11%. Same values: each output element is the same row . column product plus the same bias.
-            b0, nb, base, rows, o0, o1, e0, e1 = self.chunks_bf16[0]
-            W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 1, b0, nb, base, rows)
-            if e1 > e0:
-                W.view(-1)[self.chunk_eflat_bf16[e0:e1]] = self.chunk_evals_bf16[e0:e1].to(torch.bfloat16)
-            return F.linear(x2, torch.empty_like(W).index_copy_(0, self.chunk_orows[o0:o1], W), bias)
+            # decoded straight into output row order (row_base -1, as dense()): no row copy after it
+            W = self._whole(torch.bfloat16)
+            return F.linear(x2, W, bias)
         for b0, nb, base, rows, o0, o1, e0, e1 in self.chunks_bf16:
             W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 1, b0, nb, base, rows)
             if e1 > e0:
@@ -259,15 +342,7 @@ class QVBandLinearV8R(nn.Module):
         # trained in bf16 on a GPU without bf16, e.g. MiniMax-H3 on a V100 -- would turn NaN). An fp16 activation: F.linear.
         wide = x2.dtype in (torch.float32, torch.bfloat16)
         if len(self.chunks) == 1 and x2.dtype != torch.bfloat16:
-            # ONE chunk (every layer up to CHUNK_BYTES of decoded weight): put the decoded WEIGHT rows back in output order
-            # (a contiguous row copy, Q x P fp16) and let the GEMM write y directly. The old y[:, orows] = ... was a strided
-            # column scatter of the whole M x Q result -- Z-Image 1 MP on a V100: 325 ms of index_put per step. Same values:
-            # each output element is the same row . column product.
-            b0, nb, base, rows, o0, o1, e0, e1 = self.chunks[0]
-            W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 0, b0, nb, base, rows)
-            if e1 > e0:
-                W.view(-1)[self.chunk_eflat[e0:e1]] = self.chunk_evals[e0:e1].half()
-            Wo = torch.empty_like(W).index_copy_(0, self.chunk_orows[o0:o1], W)
+            Wo = self._whole(torch.float16)
             return _mm_f32(xh, Wo).to(x2.dtype) if wide else F.linear(xh, Wo)
         for b0, nb, base, rows, o0, o1, e0, e1 in self.chunks:
             W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 0, b0, nb, base, rows)
@@ -311,6 +386,16 @@ class QVBandLinearV8R(nn.Module):
         if self.bias is not None and path != "_chunked_bf16":
             y = y + self.bias.to(y.dtype)
         return y.to(out_dtype).reshape(*shp[:-1], self.out_features)
+
+    def _whole(self, dtype):
+        """The whole weight (Q, P) fp16 / bf16 in output row order, escapes applied: the decode writes each row at its
+        own index (row_base -1); the escape tables of that order (esc_flat*) are the ones dense() uses."""
+        W = _load_ext().decode(*self._core(self.blocks8), self.in_features, 0 if dtype == torch.float16 else 1,
+                               0, self.blocks8.shape[0], -1, 0)
+        ef, ev = (self.esc_flat_bf16, self.esc_val_bf16) if dtype == torch.bfloat16 else (self.esc_flat, self.esc_val)
+        if ef.numel():
+            W.view(-1)[ef] = ev.to(W.dtype)
+        return W
 
     def dense(self, dtype=torch.bfloat16):
         """The exact weight (Q, P) in `dtype` (escapes applied) -- for audits / re-packing, never on the hot path."""

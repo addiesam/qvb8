@@ -36,6 +36,32 @@ class Drafter(Protocol):
     def feedback(self, n_accepted: int, n_proposed: int) -> None: ...
 
 
+@runtime_checkable
+class BatchTarget(Protocol):
+    """A model that runs its OWN forward (no HF module stack), batched over requests of different lengths.
+    Returned by ModelAdapter.build_target(); served by engine/target_engine.TargetBatchEngine (continuous
+    batching + prompt-prefix reuse) behind the same server, router and limits as every other model.
+
+    state       one request's cache (whatever the model needs: K/V, recurrent / convolution states, position)
+    forward     rows = [(state, token ids)] -> logits [len(rows), vocab] of each row's LAST token; every state
+                advances by its row. Prompt chunks and one-token decodes come in the same call.
+    stop_ids    token ids that end a reply
+    export_state / import_state   (for --prefix-store shared: the machine's pool and machine-to-machine transfer)
+                state -> a tree of dict / list / tuple / tensors / kv.codec.BandedKV / plain numbers, and back onto
+                a device. The pool walks that tree (decode/shared_prefix.py); sealed BandedKV segments are kept
+                once across checkpoints of the same prompt.
+    """
+
+    stop_ids: set
+
+    def new_state(self) -> Any: ...
+    def clone_state(self, state) -> Any: ...
+    def state_nbytes(self, state) -> int: ...
+    def forward(self, rows: list) -> Any: ...
+    def export_state(self, state) -> Any: ...
+    def import_state(self, tree, device) -> Any: ...
+
+
 # -- adapter -------------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ServeDefaults:
@@ -75,11 +101,22 @@ class ModelAdapter:
         """(model, text_config) built under init_empty_weights, or None = AutoModelForCausalLM.from_config."""
         return None
 
+    def execution_layer_types(self, raw_config: dict) -> list | None:
+        """Layer type per cache layer when the model runs some layers more than once (one cache layer per
+        execution), from the raw config.json; None = one per physical layer (config layer_types)."""
+        return None
+
     def install(self, model, *, model_dir: str, config, tok) -> None:
         """Called once after the weights are in place: choose the layer / cache kinds for this model."""
 
     def generate_fn(self):
         """The decode loop for one request, or None = spec_decode.speculative_generate."""
+        return None
+
+    def build_target(self, model_dir: str, *, device: str = "cuda", dtype: str | None = None, kv_cache: str = "bf16",
+                     kv_tau: float = 0.1):
+        """(BatchTarget, tokenizer) for a model that runs its own forward -- the loader then builds NO HF skeleton
+        and the server batches it with engine/target_engine. None (default) = the HF-skeleton path."""
         return None
 
     def build_drafter(self, model, draft_dir: str, *, device: str = "cuda", pack_dir: str | None = None):
@@ -117,7 +154,13 @@ def _discover() -> None:
         return
     _ENTRY_POINTS_LOADED = True
     import importlib
-    for name in _IN_TREE:
+    import os as _os
+    # One model type = one folder: every qv_band/models/<name>/adapter.py present is loaded (a deployment that
+    # leaves a folder out simply does not have that model). _IN_TREE keeps the historical order first.
+    _root = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "models")
+    _found = sorted(d for d in (_os.listdir(_root) if _os.path.isdir(_root) else ())
+                    if _os.path.isfile(_os.path.join(_root, d, "adapter.py")))
+    for name in list(_IN_TREE) + [d for d in _found if d not in _IN_TREE]:
         try:
             importlib.import_module(f"qv_band.models.{name}.adapter")
         except ModuleNotFoundError:        # a release without that model part

@@ -5,5 +5,5 @@ Layering (enforced by tests/test_layering.py):
 Nothing here imports qv_band.models; a model plugs in by registering a ModelAdapter.
 """
 from qv_band.engine.adapter import (  # noqa: F401
-    Drafter, ModelAdapter, ServeDefaults, Target, find_adapter, register, registered,
+    BatchTarget, Drafter, ModelAdapter, ServeDefaults, Target, find_adapter, register, registered,
 )
