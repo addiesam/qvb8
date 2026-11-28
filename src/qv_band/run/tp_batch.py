@@ -183,6 +183,11 @@ def serve_rank0(bd, jobs, eos, tp, device, state, log=print):
             if payload is not None:
                 torch.distributed.broadcast(payload, 0, group=tp.group)
 
+    def _load():                                          # the router's load view: what is still to decode
+        live = [s_ for s_ in slots if s_ is not None]
+        state["busy"] = bool(live)
+        state["running_decode"] = sum(max(0, s_["job"]["max_new"] - s_["n"]) for s_ in live)
+
     def finish(i):
         slots[i]["job"]["out"].put(None)
         state["served"] += 1
@@ -198,6 +203,11 @@ def serve_rank0(bd, jobs, eos, tp, device, state, log=print):
             except _q.Empty:
                 break
             state["queue"] -= 1
+            state["queued_prompt"] = state.get("queued_prompt", 0) - job.get("q_prompt", len(job["ids"]))
+            state["queued_decode"] = state.get("queued_decode", 0) - job.get("q_decode", job["max_new"])
+            if job.get("cancel"):                             # the client left while it waited
+                job["out"].put(None)
+                continue
             ids = job["ids"]
             bcast(2, i, len(ids), torch.tensor(ids, dtype=torch.long, device=device))
             tok = bd.prefill_slot(i, ids)
@@ -208,8 +218,12 @@ def serve_rank0(bd, jobs, eos, tp, device, state, log=print):
             if tok in eos or job["max_new"] <= 1:
                 finish(i)
             active = [j for j in range(B) if slots[j] is not None]
+        for i in range(B):                                    # the client left: free the slot (card 0 only decides;
+            if slots[i] is not None and slots[i]["job"].get("cancel"):   # a free slot's step is ignored)
+                finish(i)
         active = [i for i in range(B) if slots[i] is not None]
         if not active:
+            _load()                                       # idle now: no stale load
             continue
         toks = [slots[i]["last"] if slots[i] is not None else 0 for i in range(B)]
         bcast(3, 0, 0, torch.tensor(toks, dtype=torch.long, device=device))
@@ -225,7 +239,7 @@ def serve_rank0(bd, jobs, eos, tp, device, state, log=print):
             s["last"] = t
             if t in eos or s["n"] >= s["job"]["max_new"]:
                 finish(i)
-        state["busy"] = any(slots)
+        _load()
 
 
 def serve_follower(bd, tp, device):

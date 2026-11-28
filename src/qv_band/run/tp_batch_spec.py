@@ -304,6 +304,11 @@ def serve_rank0(bd, drafters, jobs, eos, tp, device, state):
             if payload is not None:
                 torch.distributed.broadcast(payload, 0, group=tp.group)
 
+    def _load():                                          # the router's load view: what is still to decode
+        live = [s_ for s_ in slots if s_ is not None]
+        state["busy"] = bool(live)
+        state["running_decode"] = sum(max(0, s_["job"]["max_new"] - s_["n"]) for s_ in live)
+
     def finish(i):
         slots[i]["job"]["out"].put(None)
         state["served"] += 1
@@ -318,6 +323,11 @@ def serve_rank0(bd, drafters, jobs, eos, tp, device, state):
             except _q.Empty:
                 break
             state["queue"] -= 1
+            state["queued_prompt"] = state.get("queued_prompt", 0) - job.get("q_prompt", len(job["ids"]))
+            state["queued_decode"] = state.get("queued_decode", 0) - job.get("q_decode", job["max_new"])
+            if job.get("cancel"):                             # the client left while it waited
+                job["out"].put(None)
+                continue
             ids = job["ids"]
             bcast(2, i, len(ids), torch.tensor(ids, dtype=torch.long, device=device))
             tok = bd.prefill_slot(i, ids, drafters[i])
@@ -329,8 +339,12 @@ def serve_rank0(bd, drafters, jobs, eos, tp, device, state):
             slots[i] = {"job": job, "n": 1, "last": tok}
             if tok in eos or job["max_new"] <= 1:
                 finish(i)
+        for i in range(B):                                    # the client left: free the slot (the mask says so)
+            if slots[i] is not None and slots[i]["job"].get("cancel"):
+                finish(i)
         active = [slots[i] is not None for i in range(B)]
         if not any(active):
+            _load()                                       # idle now: no stale load
             continue
         cand = [b for b in range(B) if active[b] and drafters[b] is not None]
         ks = dict(zip(cand, plan.plan_k([(b, bd.T - 1) for b in cand], whole=True)))   # the graphs: all drafts or none
@@ -362,7 +376,7 @@ def serve_rank0(bd, drafters, jobs, eos, tp, device, state):
                 s["last"] = new[-1]
             if (new and new[-1] in eos) or s["n"] >= s["job"]["max_new"]:
                 finish(b)
-        state["busy"] = any(slots)
+        _load()
 
 
 def serve_follower(bd, drafters, tp, device):

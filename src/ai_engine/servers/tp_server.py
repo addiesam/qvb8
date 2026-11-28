@@ -1,7 +1,7 @@
 """OpenAI-compatible server for ONE model service on n cards: Tensor Parallel (TP).
 
     torchrun --nproc-per-node 2 -m ai_engine.servers.tp_server PACK [--draft DFLASH_PACK] [--port 8080]
-             [--host 0.0.0.0] [--max-len 16384] [--tp-weights 1,1]
+             [--host 0.0.0.0] [--max-len N] [--tp-weights 1,1]
 
 Every card holds its share of every matrix of the model (qv_band/design_doc/tensor_parallel.md); one
 message is computed by all cards together. Card 0 (rank 0) runs HTTP and the queue; for each request it broadcasts
@@ -161,7 +161,7 @@ def _handler_cls():
                 mark = 0 if vision else _turn_mark(body, chat, ids)
             except Exception as e:                                   # noqa: BLE001
                 return self._send(400, {"error": f"bad request: {e}"})
-            max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
+            max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or ARGS.max_len)   # no client limit: the room
             room = ARGS.max_len - len(ids) - 16
             if room <= 0:
                 return self._send(400, {"error": f"prompt is {len(ids)} tokens; this service holds {ARGS.max_len}"})
@@ -184,12 +184,24 @@ def _handler_cls():
             created, cid = int(time.time()), f"{'chatcmpl' if chat else 'cmpl'}-{int(time.time() * 1000)}"
             if body.get("stream"):
                 return self._stream(job, chat, cid, created)
-            toks = []
+            toks, t_chk = [], time.time()
             while True:
-                item = job["out"].get()
+                try:
+                    item = job["out"].get(timeout=1.0)
+                except queue.Empty:
+                    item = ()
+                if time.time() - t_chk >= 1.0:                    # once a second, tokens arriving or not
+                    t_chk = time.time()
+                    if not job.get("cancel") and self.peer_closed():
+                        job["cancel"] = True                      # the cards stop it at their next check
+                        print("[tp-server] client left: stopping its request", flush=True)
+                if item == ():
+                    continue
                 if item is None:
                     break
                 toks.extend(item)
+            if job.get("cancel"):
+                return
             if job.get("error"):
                 return self._send(400, {"error": job["error"]})
             ids = job["ids"]                                         # an image chat: set by the serving loop
@@ -228,7 +240,8 @@ def _handler_cls():
                     self.wfile.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
                 except OSError:
-                    alive = False          # the client left; the cards still finish this request (v1: no abort)
+                    alive = False          # the client left: the cards stop this request at their next check
+                    job["cancel"] = True
 
             def chunk(text, fin=None):
                 if chat:
@@ -243,8 +256,20 @@ def _handler_cls():
                      "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
             toks, shown = [], ""
             hold = "<tool_call>"
+            t_chk = time.time()
             while True:
-                item = job["out"].get()
+                try:
+                    item = job["out"].get(timeout=1.0)
+                except queue.Empty:
+                    item = ()
+                if time.time() - t_chk >= 1.0:             # once a second: reasoning writes nothing, so a write
+                    t_chk = time.time()                    # error alone would not show that the client left
+                    if alive and self.peer_closed():
+                        alive = False
+                        job["cancel"] = True
+                        print("[tp-server] client left: stopping its request", flush=True)
+                if item == ():
+                    continue
                 if item is None:
                     break
                 toks.extend(item)
@@ -366,6 +391,9 @@ def _pp_main(a, device):
         STATE["queue"] -= 1
         STATE["queued_prompt"] -= len(ids)
         STATE["queued_decode"] -= max_new
+        if job.get("cancel"):                                     # the client left while it waited
+            job["out"].put(None)
+            return None
         STATE["running"] = STATE.get("running", 0) + 1
         STATE["busy"] = True
 
@@ -383,7 +411,8 @@ def _pp_main(a, device):
                   f"{s['t_prefill']:.1f}s, {s['steps']} steps" +
                   (f", accepted {s['accepted']}/{s['proposed']}" if drafter else "") + ")", flush=True)
         return {"ids": ids, "max_new": max_new, "on_tokens": job["out"].put, "done": done,
-                "temperature": job["temperature"], "top_k": job["top_k"], "top_p": job["top_p"]}
+                "temperature": job["temperature"], "top_k": job["top_k"], "top_p": job["top_p"],
+                "stop": lambda: job.get("cancel")}
 
     try:
         drv.serve(get_job)
@@ -426,6 +455,9 @@ def _fit_check(a, device, rank: int, world: int, weights):
 # ------------------------------------------------------------------------------------------------ every card
 def main():
     global TOK, ARGS, MODEL_ID
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)      # kill -USR1 <pid>: every thread's stack in the log
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--draft", default=None, help="DFlash drafter (dir or qvb8 pack)")
@@ -434,7 +466,8 @@ def main():
     ap.add_argument("--think", dest="think", action="store_true", default=True,
                     help="reason before answering unless a request says otherwise (default; as llm_server)")
     ap.add_argument("--no-think", dest="think", action="store_false", help="answer directly unless a request asks to think")
-    ap.add_argument("--max-len", type=int, default=16384, help="context per request (static KV per card)")
+    ap.add_argument("--max-len", type=int, default=None,
+                    help="context per request (static KV per card); default: the model's context window")
     ap.add_argument("--tp-weights", default=None, help="share per card, e.g. 0.55,0.45 (default even)")
     ap.add_argument("--draft-split", action="store_true", help="split the drafter too (default: whole on each card)")
     ap.add_argument("--kv-window", type=int, default=None,
@@ -448,6 +481,10 @@ def main():
                     help="pipeline stages across machines (one stage per machine, TP inside it; for slow links). "
                          "The HTTP endpoint is on the LAST machine. Layers per stage: QV_TP_PP_LAYERS=20,44")
     ARGS = a = ap.parse_args()
+    if a.max_len is None:
+        from qv_band.run.tp_qwen35 import load_config
+        c = load_config(a.model)
+        a.max_len = int(getattr(c, "text_config", c).max_position_embeddings)
     global DEFAULT_THINK
     DEFAULT_THINK = a.think
 
@@ -542,9 +579,9 @@ def main():
     if tp.world > 1:
         torch.distributed.barrier()
 
-    def run(ids, max_new, on_tokens, vis=None, mark=0, sp=(0.0, 0, 1.0)):
+    def run(ids, max_new, on_tokens, vis=None, mark=0, sp=(0.0, 0, 1.0), stop=None):
         dec.prefix.marks = {mark} if mark else set()              # one more checkpoint: the end of the last turn
-        samp = dict(temperature=sp[0], top_k=int(sp[1]), top_p=sp[2])
+        samp = dict(temperature=sp[0], top_k=int(sp[1]), top_p=sp[2], stop=stop)
         if os.environ.get("QV_TP_KPROF") == "1" and tp.rank == 0 and max_new >= 100 and not getattr(run, "_done", False):
             run._done = True                                      # QV_TP_KPROF=1: where the GPU time of the first long request goes
             from torch.profiler import profile, ProfilerActivity
@@ -607,6 +644,12 @@ def main():
     try:
         while True:
             job = JOBS.get()
+            if job.get("cancel"):                                 # the client left while it waited
+                STATE["queue"] -= 1
+                STATE["queued_prompt"] -= job.get("q_prompt", 0)
+                STATE["queued_decode"] -= job.get("q_decode", 0)
+                job["out"].put(None)
+                continue
             vis = None
             if job.get("vision") is not None:                     # an image chat: prompt + embeddings on card 0
                 try:
@@ -640,7 +683,7 @@ def main():
             t0 = time.time()
             try:
                 out, st = run(ids, max_new, job["out"].put, vis, job.get("mark", 0),
-                              (job["temperature"], job["top_k"], job["top_p"]))
+                              (job["temperature"], job["top_k"], job["top_p"]), stop=lambda: job.get("cancel"))
             except torch.OutOfMemoryError as e:                   # this request only; the next one runs normally
                 if tp.world > 1:                                  # the other cards are out of step now (see above)
                     print(f"[tp-server] card 0 out of memory during a request ({len(ids)} prompt tokens, {e}); "
@@ -660,7 +703,7 @@ def main():
             STATE["served"] += 1
             STATE["tokens"] += len(out)
             STATE.update(busy=False, running_prompt=0, running_decode=0)
-            print(f"[tp-server] {len(ids)} prompt + {len(out)} tokens in {dt:.1f}s "
+            print(f"[tp-server] {len(ids)} prompt + {len(out)} tokens{' (client left: stopped)' if job.get('cancel') else ''} in {dt:.1f}s "
                   f"(cached {st.get('cached', 0)}, prefill {len(ids) - st.get('cached', 0)} in {st.get('t_prefill', 0):.1f}s, "
                   f"host prefix {dec.prefix.nbytes() / 1e9:.2f} GB, decode {len(out) / max(1e-6, dt - st.get('t_prefill', 0)):.1f} tok/s"
                   + (f", accepted {st['accepted']}/{st['proposed']}" if drafter else "") + ")", flush=True)

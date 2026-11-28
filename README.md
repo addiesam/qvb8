@@ -55,6 +55,13 @@ You pick τ. A small τ keeps the model almost the same as the original. A bigge
   - **End-to-end media pipelines:** script, images, video and voice on limited hardware, because every model in the chain is compressed.
   - **Long history:** older history moves to system RAM, so a long session keeps going.
 
+## What's new in v1.3.1
+
+- **No server output limit:** a request may generate up to the model's context window; the client's `max_tokens` sets the length. Context defaults to the model's own window in every launcher (`CTX` / `MAX_OUT` override it). The server's memory controls (`MAX_MEM`, `MAX_LIVE_TOKENS`) are unchanged.
+- **Long answers no longer block the queue:** a request reserves at most 4096 output tokens at admission (`--clip-max-new-tokens`, as SGLang does). When the live batch runs out of token budget or VRAM, the request admitted last pauses and goes back to the head of the queue, then continues where it stopped. Its stream only pauses.
+- **Stop when the client leaves:** every server and the router stop a request within a few seconds of its client disconnecting, streamed or not, including during reasoning. A request whose client left while it was queued never starts.
+- **Fixes:** a batch with two or more live requests failed in speculative decoding since v1.3.0. Tensor parallel with a split drafter could hang when the cards disagreed on drafting. The tensor-parallel batch mode reported a load that only grew, which steered the router away from it.
+
 ## What's new in v1.3.0
 
 - **Two more model families:** [SenseNova-Loop-9B](scripts/sensenova_server.sh) (a looped hybrid: layers run twice with two mixed residual streams) with its DFlash2 drafter, and [Inkling-2-Mini](scripts/inkling_server.sh) (a looped mixture-of-experts model, experts in their published NVFP4 / MXFP8 form, bit-exact) with the DSpark drafter bundled in its checkpoint (`--drafter dspark`).

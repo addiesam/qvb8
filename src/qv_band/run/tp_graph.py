@@ -896,8 +896,9 @@ def _agree(tp, vals, dev):
 
 
 def generate(dec, ids, new, drafter=None, tp=None, eos=(), on_tokens=None, prefill="graph", vis=None,
-             temperature=0.0, top_k=0, top_p=1.0):
-    """Greedy, or sampled (temperature > 0, top_k, top_p); with a drafter speculative and exact either way (greedy:
+             temperature=0.0, top_k=0, top_p=1.0, stop=None):
+    """stop(): read on the group's first card every few steps (the client left) and agreed by every card, so all
+    cards end the request together. Greedy, or sampled (temperature > 0, top_k, top_p); with a drafter speculative and exact either way (greedy:
     the target's own greedy text; sampled: speculative sampling, the target's own distribution -- engine/spec.py).
     A sampled decision is made on the group's first card and broadcast. on_tokens(list): called with each step's new
     tokens (streaming). prefill: "graph" (8 tokens per replay) or "hf" (chunked HF forward, for long prompts)."""
@@ -942,11 +943,20 @@ def generate(dec, ids, new, drafter=None, tp=None, eos=(), on_tokens=None, prefi
     if plan is None:
         plan = dec.spec_planner = SpecPlanner()
     plan.forget(0)                                         # a new request
+    multi = tp is not None and tp.world > 1
     while len(out) < new and out[-1] not in eos:
         drafts, dl = [], None
         torch.cuda.synchronize(dec.dev)
         t0 = time.time()
         drafting = drafter is not None and plan.plan_k([(0, k)], whole=True)[0] > 0
+        want = bool(stop()) if (stop is not None and steps % 4 == 0 and _group_first(tp)) else False
+        if multi:
+            # card 0's decisions on every card: stop (the client left) and draft-or-not. The planner times each card
+            # on its own clock, so the cards may disagree, and a split drafter's propose() is a collective: one card
+            # drafting alone hung both (seen 2026-11-28, V100 pair, 100% at 60 W).
+            want, drafting = (bool(v) for v in _agree(tp, [int(want), int(drafting)], dec.dev))
+        if want:
+            break
         if drafter is not None:
             if drafting:
                 drafts, dl = drafter.propose(out[-1], k, temperature, top_k, top_p)

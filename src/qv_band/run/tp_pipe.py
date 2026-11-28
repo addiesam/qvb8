@@ -423,14 +423,14 @@ class Driver:
         self.wake[slot].acquire()
         return self.mail[slot]
 
-    def _job(self, slot, ids, max_new, on_tokens, done, sp=(0.0, 0, 1.0)):
+    def _job(self, slot, ids, max_new, on_tokens, done, sp=(0.0, 0, 1.0), stop=None):
         from qv_band.run.tp_graph import generate
         torch.cuda.set_device(self.dev)
         try:
             with torch.no_grad():
                 out, s = generate(self.pds[slot], ids, max_new, self.drafters[slot], self.tp, self.eos,
                                   on_tokens=on_tokens, prefill=self.mode, temperature=sp[0], top_k=int(sp[1]),
-                                  top_p=sp[2])
+                                  top_p=sp[2], stop=stop)
             if done is not None:
                 done(out, s)
         except Exception as e:                                        # noqa: BLE001
@@ -497,8 +497,8 @@ class Driver:
                 ids = self._ids(job["ids"] if job else None, ev[2])
                 sp = self._sp(job)
                 self.busy[slot] = True
-                on_t, done = (job["on_tokens"], job.get("done")) if job else (None, None)
-                threading.Thread(target=self._job, args=(slot, ids, ev[3], on_t, done, sp), daemon=True).start()
+                on_t, done, stp = (job["on_tokens"], job.get("done"), job.get("stop")) if job else (None, None, None)
+                threading.Thread(target=self._job, args=(slot, ids, ev[3], on_t, done, sp, stp), daemon=True).start()
                 self.back.acquire()
                 continue
             if self.p.n == 1:

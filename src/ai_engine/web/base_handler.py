@@ -60,6 +60,34 @@ def _cors_allowlist() -> tuple[bool, set[str]]:
     return False, {o.strip().rstrip("/") for o in raw.split(",") if o.strip()}
 
 
+def peer_closed(sock) -> bool:
+    """True when the client has closed its side of `sock`; never blocks. The one check for every server and the
+    router (generation stops on it). poll() with POLLRDHUP (Linux) sees the close even with unread bytes still in
+    the socket; a plain select + recv(MSG_PEEK) then reads those bytes, never end-of-file (seen 2026-11-28: a
+    one-byte rest kept a left request running). Elsewhere: the peek."""
+    import select
+    import socket
+    try:
+        rdhup = getattr(select, "POLLRDHUP", 0)
+        if hasattr(select, "poll"):
+            pl = select.poll()
+            pl.register(sock, select.POLLIN | rdhup)
+            ev = pl.poll(0)
+            if not ev:
+                return False
+            if ev[0][1] & (rdhup | select.POLLHUP | select.POLLERR):
+                return True
+        else:
+            r, _, _ = select.select([sock], [], [], 0)
+            if not r:
+                return False
+        return sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except (OSError, ValueError):
+        return True
+
+
 class QVHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that reports a client which hung up before the reply was written (a health check that timed
     out, a closed browser tab) as ONE log line, not a traceback. Any other error still prints its full traceback."""
@@ -113,6 +141,9 @@ class QVHTTPHandler(BaseHTTPRequestHandler):
             print(f"[http] client {self.client_address[0]}:{self.client_address[1]} hung up before the reply to "
                   f"\"{what}\" was sent ({type(e).__name__}); nothing wrong on the server", flush=True)
     FORCE_CLOSE = True
+
+    def peer_closed(self) -> bool:
+        return peer_closed(self.connection)
 
     def _end_close(self):
         if self.FORCE_CLOSE:

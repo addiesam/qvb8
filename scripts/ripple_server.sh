@@ -6,7 +6,7 @@
 #   Extra flags come last, so they win (e.g. --no-think, --dtype bf16).
 #   More than one card: add --pipeline cuda:0,cuda:1 (the cards, in layer order; the last is the main card) --
 #   one process, each card holds a contiguous range of layers (qv_band/run/placement.py).
-# Env: MODEL, DRAFT (required for start), PORT, PYTHON (default: python)
+# Env: MODEL, DRAFT (required for start), PORT, PYTHON (default: python), MAX_OUT (default: none, the client's max_tokens)
 
 NAME=Ripple-65B; DEF_PORT=8080
 launch() {
@@ -14,7 +14,7 @@ launch() {
   : "${DRAFT:?set DRAFT to the DFlash2 drafter pack dir}"
   export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   exec "${PYTHON:-python}" -m ai_engine.cli.serve "$MODEL" \
-    --host 0.0.0.0 --port "$PORT" --device auto --max-memory-gb 100 --max-output-tokens 32767 \
+    --host 0.0.0.0 --port "$PORT" --device auto --max-memory-gb 100 ${MAX_OUT:+--max-output-tokens "$MAX_OUT"} \
     --kv-cache qvb8 --kv-tau-threshold 0.2 --kv-residual 256 --kv-shadow 512MB \
     --prefill-chunk 8192 --prefill-linear qvb8 \
     --drafter dflash --draft-model "$DRAFT" --draft-pack dense --draft 15 --draft-ctx 4 \

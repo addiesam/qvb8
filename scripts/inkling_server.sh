@@ -7,7 +7,7 @@
 # Cards: one card by default. Several cards in one process: QV_TP_DEVICES=cuda:0,cuda:1 (heads split, experts split).
 #   A card too small for the experts: QV_EXPERTS=host (the experts in host RAM, QV_EXPERT_CACHE_GB of them on the card).
 # EFFORT: reasoning effort (none / minimal / low / medium / high / xhigh, or 0..0.99), default low.
-# Env: MODEL (required for start), EFFORT, MAX_MEM (GB, default 64), CTX (131072), MAX_LIVE (4), MAX_QUEUE (32),
+# Env: MODEL (required for start), EFFORT, MAX_MEM (GB, default 64), CTX (default: the model's context), MAX_LIVE (4), MAX_QUEUE (32),
 #      QUEUE_WAIT (600), PORT, PYTHON (default: python)
 
 NAME=Inkling; DEF_PORT=8080
@@ -16,7 +16,7 @@ launch() {
   export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1
   export QV_INKLING_EFFORT="${EFFORT-low}"
   exec "${PYTHON:-python}" -m ai_engine.cli.serve "$MODEL" \
-    --host 0.0.0.0 --port "$PORT" --device cuda --max-memory-gb "${MAX_MEM:-64}" --ctx-size "${CTX:-131072}" \
+    --host 0.0.0.0 --port "$PORT" --device cuda --max-memory-gb "${MAX_MEM:-64}" ${CTX:+--ctx-size "$CTX"} \
     --kv-cache qvb8 --kv-shadow 0 --prefill-chunk 2048 --drafter dspark --draft 7 --vision on --think \
     --max-live "${MAX_LIVE:-4}" --max-queue "${MAX_QUEUE:-32}" --queue-wait "${QUEUE_WAIT:-600}" \
     --dtype fp16 "${EXTRA[@]}"

@@ -63,6 +63,7 @@ import http.client
 import json
 import os
 import sys
+import socket
 import threading
 import time
 import urllib.parse
@@ -840,8 +841,33 @@ class Handler(BaseHTTPRequestHandler):
         try:
             c = r.conn(timeout=3600)
             c.request("POST", path, raw, {"Content-Type": "application/json", "Content-Length": str(len(raw))})
+        except Exception:                           # noqa: BLE001 - nothing sent yet
+            return None
+        done, left = threading.Event(), threading.Event()
+        up = c.sock                                 # now: a Connection-close answer sets c.sock = None in getresponse()
+
+        def watch():                                # the client left: close the replica link, the replica sees it
+            from ai_engine.web.base_handler import peer_closed      # and stops generating (its own peer check)
+            while not done.wait(1.0):
+                if peer_closed(self.connection):
+                    left.set()
+                    try:
+                        up.shutdown(socket.SHUT_RDWR)
+                    except (OSError, AttributeError):
+                        pass
+                    return
+        threading.Thread(target=watch, daemon=True).start()
+        try:
+            res = self._relay(r, c)
+        finally:
+            done.set()
+        return True if left.is_set() else res      # the client left: nobody to retry for
+
+    def _relay(self, r: Replica, c):
+        try:
             resp = c.getresponse()
         except Exception:                           # noqa: BLE001 - nothing sent yet
+            c.close()
             return None
         if resp.status == 429 or (resp.status == 503 and resp.getheader("Retry-After")):
             # the replica has no room now (its admission control): nothing reached the client, try the next one

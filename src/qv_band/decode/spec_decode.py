@@ -3120,7 +3120,7 @@ def _run_linear_attn_per_slot(module, hidden_states, cache_params, real_lens,
         groups.setdefault((rl, cold), []).append(bi)
     for (rl, cold), rows in groups.items():
         idx = torch.tensor(rows, device=hidden_states.device)
-        hs_i = hidden_states.indexsample_token(0, idx)[:, seq_max - rl:, :]
+        hs_i = hidden_states.index_select(0, idx)[:, seq_max - rl:, :]
         if layer is None:
             out[idx, seq_max - rl:, :] = orig_forward(
                 hidden_states=hs_i, cache_params=None, attention_mask=None, **kwargs)
@@ -3135,8 +3135,8 @@ def _run_linear_attn_per_slot(module, hidden_states, cache_params, real_lens,
         # group-sized tensors.
         cs_full = layer.conv_states.get(0) if layer.conv_states else None
         rs_full = layer.recurrent_states.get(0) if layer.recurrent_states else None
-        cs_rows = cs_full.indexsample_token(0, idx) if cs_full is not None else None
-        rs_rows = rs_full.indexsample_token(0, idx) if rs_full is not None else None
+        cs_rows = cs_full.index_select(0, idx) if cs_full is not None else None
+        rs_rows = rs_full.index_select(0, idx) if rs_full is not None else None
         if cs_rows is not None:
             layer.conv_states[0] = cs_rows
         if rs_rows is not None:
@@ -3216,15 +3216,15 @@ def _run_mamba_per_slot(module, hidden_states, cache_params, real_lens,
         groups.setdefault(rl, []).append(bi)
     for rl, rows in groups.items():
         idx = torch.tensor(rows, device=hidden_states.device)
-        hs_i = hidden_states.indexsample_token(0, idx)[:, seq_max - rl:, :]
+        hs_i = hidden_states.index_select(0, idx)[:, seq_max - rl:, :]
         if layer is None:
             out[idx, seq_max - rl:, :] = orig_forward(
                 hs_i, cache_params=None, attention_mask=None, **kwargs)
             continue
         cs_full = layer.conv_states[0]
         rs_full = layer.recurrent_states[0]
-        layer.conv_states[0] = cs_full.indexsample_token(0, idx)
-        layer.recurrent_states[0] = rs_full.indexsample_token(0, idx)
+        layer.conv_states[0] = cs_full.index_select(0, idx)
+        layer.recurrent_states[0] = rs_full.index_select(0, idx)
         try:
             out_i = orig_forward(hs_i, cache_params=cache_params,
                                  attention_mask=None, **kwargs)

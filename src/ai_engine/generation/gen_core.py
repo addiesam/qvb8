@@ -66,14 +66,9 @@ from typing import Any, Callable
 class DEFAULTS:
     CTX_SIZE = 262144
 
-    # Default OUTPUT length when a request gives none. An OUTPUT budget,
-    # unrelated to CTX_SIZE. This checkpoint's <think> block routinely runs
-    # 1200-5700+ tokens with no internal awareness of any cap, so a low
-    # default truncates mid-thought and the model never reaches its answer.
-    # Still a real ceiling, so a model that never emits EOS stops on its own
-    # instead of growing the KV cache and replay scratch until it exhausts
-    # VRAM.
-    MAX_OUTPUT_TOKENS = 32767
+    # Default OUTPUT length when a request gives none: no limit of the engine's own. GenParams clamps it to ctx_size
+    # (the model's window), so the CLIENT's max_tokens is what limits a reply; memory is limited by the server's flags.
+    MAX_OUTPUT_TOKENS = 1 << 30
 
     MEMORY_LIMIT_GB = 48.0
 
@@ -652,8 +647,8 @@ def add_generation_args(ap, *, include_device_mem: bool = True) -> None:
     ap.add_argument(
         "--max-output-tokens", dest="max_output_tokens", type=int,
         default=None, metavar="N",
-        help=f"tokens the model may generate in its reply (default "
-             f"{DEFAULTS.MAX_OUTPUT_TOKENS}; also stops at EOS). This is the "
+        help=f"tokens the model may generate in its reply (default: the "
+             f"model's context window; also stops at EOS). This is the "
              f"OUTPUT limit -- --ctx-size is the separate PROMPT limit.")
     ap.add_argument(
         "--ctx-size", type=int, default=None, metavar="N",

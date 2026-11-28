@@ -298,15 +298,7 @@ class _SSEOut:
         if not force and now - self._peer[0] < self.PEER_POLL_S:
             return self._peer[1]
         self._peer[0] = now
-        try:
-            import select
-            sock = self.h.connection
-            r, _, _ = select.select([sock], [], [], 0)
-            g = bool(r) and sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-        except (BlockingIOError, InterruptedError):
-            g = False
-        except OSError:
-            g = True
+        g = self.h.peer_closed()                        # web/base_handler.py: the one check
         self._peer[1] = g
         return g
 
@@ -741,7 +733,7 @@ class StreamMixin:
                 sse_out.error(e)
                 return
             dt = time.time() - t0
-            out = st.emitted if st else n_recv
+            out = n_recv                 # every token sent (a retracted request's stats cover only its last run)
             S.STATE["served"] += 1
             S.STATE["tokens"] += out
             ss.finish(out, rp.max_output_tokens, int(ids.shape[1]), include_usage)

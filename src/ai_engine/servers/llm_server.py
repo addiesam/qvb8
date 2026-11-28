@@ -108,12 +108,6 @@ def _next_req_id() -> int:
         STATE["req_seq"] += 1
         return STATE["req_seq"]
 
-# Largest non-streaming response served. A non-streaming request holds an
-# idle socket for the whole generation, and most HTTP clients apply a read
-# timeout well under that; past this size the client is told to stream
-# instead. Streaming has no such limit -- it is bounded by
-# --max-output-tokens like any other request.
-NONSTREAM_MAX_TOKENS = DEFAULTS.MAX_OUTPUT_TOKENS
 
 # Seconds of scheduler idleness before the CUDA allocator cache is returned
 # to the driver (once per idle period). 30 min by default so a pause between
@@ -301,20 +295,28 @@ class Limits:
 
       max_live         requests decoding / prefilling together (slots). One request's speed falls as slots are added
                        (each verify step covers every live slot), and a one-card V100 cannot prefill two long prompts.
-      max_live_tokens  sum over the live requests of prompt tokens + max output tokens: what their KV cache can grow
-                       to. This is the memory bound (KV bytes are proportional to tokens), stated in the unit a
-                       request is known by BEFORE it runs.
+      max_live_tokens  token budget of the live batch (the KV cache grows with tokens). As SGLang: a live request
+                       counts prompt + generated so far + min(output still allowed, clip_new) -- a client's large
+                       max_tokens is NOT reserved whole. When the real tokens (prompt + generated) of the live
+                       requests pass the budget, the request admitted last is RETRACTED: its slot is freed and it
+                       goes back to the head of the queue with what it generated, and continues later (prefill of
+                       prompt + generated, the saved prefix restores most of it). The client's stream just pauses.
+      clip_new         output tokens reserved per request at most (SGLang SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                       4096); 0 = reserve the whole max_tokens.
       max_queue        requests waiting for admission; one more is refused at once with 429 + Retry-After (a client
                        or router can go elsewhere instead of holding a socket open on a server that is hours behind).
       queue_wait_s     a request that waited this long without being admitted gets 503 + Retry-After.
 
     Order is strict first-in first-out: the head of the queue is admitted when it fits, nothing overtakes it (a short
     request never starves a long one). An EMPTY batch always admits the head, whatever its size, so a request larger
-    than max_live_tokens still runs -- alone."""
+    than max_live_tokens still runs -- alone (it is never retracted: it is the only one).
+    At the --max-memory-gb ceiling the engine stops the request admitted last; with other requests still live it is
+    retracted the same way instead of ending."""
     max_live: int = 0
     max_live_tokens: int = 0
     max_queue: int = 0
     queue_wait_s: float = 0.0
+    clip_new: int = 4096
 
     def any(self) -> bool:
         return bool(self.max_live or self.max_live_tokens or self.max_queue or self.queue_wait_s)
@@ -336,7 +338,12 @@ class _PendingRequest:
     # admission -- used only to report its own tok/s when it finishes.
     t_admitted: float = 0.0
     t_submitted: float = 0.0        # entered the waiting queue (Limits.queue_wait_s counts from here)
-    cost: int = 0                   # prompt tokens + max_new: what this request can add to the live KV
+    cost: int = 0                   # admission estimate: prompt + min(max_new, clip_new) (Limits)
+    n_prompt: int = 0               # the client's prompt (ids grows by the generated tokens on a retraction)
+    max_new0: int = 0               # the client's output limit
+    out_tokens: list = field(default_factory=list)   # every token sent to the client so far
+    retracted: int = 0              # times its slot was freed and it went back to the queue
+    ids0: object = None             # the client's prompt ids
 
 
 class _StreamDone:
@@ -564,7 +571,8 @@ class BatchScheduler:
         req = _PendingRequest(ids=ids, max_new=max_new, temperature=temperature,
                               top_k=top_k, top_p=top_p, req_id=req_id)
         req.t_submitted = time.time()
-        req.cost = int(ids.shape[-1]) + int(max_new)
+        req.ids0, req.n_prompt, req.max_new0 = ids, int(ids.shape[-1]), int(max_new)
+        req.cost = self._reserve(req)
         self.check_queue()                       # Overloaded when the waiting queue is full
         if self.dead is not None:                # nobody would ever read the queue
             req.out_q.put(RuntimeError(f"the server's scheduler stopped ({self.dead}): restart the server"))
@@ -596,8 +604,56 @@ class BatchScheduler:
         ahead += sum(max(0, r.max_new) for r in list(self._pending.values()))
         return int(min(120, max(1, ahead / tps / max(1, self.limits.max_live or len(self._pending) or 1))))
 
+    def _reserve(self, r: "_PendingRequest") -> int:
+        """Tokens a request holds in the budget: prompt + generated + min(output still allowed, clip_new)."""
+        n = len(r.out_tokens)
+        left = max(0, r.max_new0 - n)
+        clip = self.limits.clip_new
+        return r.n_prompt + n + (min(left, clip) if clip > 0 else left)
+
     def live_tokens(self) -> int:
-        return sum(r.cost for r in list(self._pending.values()))
+        return sum(self._reserve(r) for r in list(self._pending.values()))
+
+    def _requeue(self, req: "_PendingRequest", why: str) -> None:
+        """Retraction: the request (its slot already freed) goes back to the HEAD of the queue and continues from what
+        it generated: its prompt becomes prompt + generated, its limit what is left. Nothing is sent to the client."""
+        import torch
+        n = len(req.out_tokens)
+        if n >= req.max_new0:                    # nothing left to generate: it is done
+            req.out_q.put(_StreamDone(None))
+            return
+        req.ids = torch.cat([req.ids0.reshape(1, -1),
+                             torch.tensor([req.out_tokens], dtype=req.ids0.dtype, device=req.ids0.device)], dim=1) if n else req.ids0
+        req.max_new = req.max_new0 - n
+        req.retracted += 1
+        req.cost = self._reserve(req)
+        req.t_submitted = time.time()
+        with self._cancel_lock:
+            self._queued_ids.add(req.req_id)
+        with self._q.mutex:
+            self._q.queue.appendleft(req)
+            self._q.unfinished_tasks += 1
+            self._q.not_empty.notify()
+        print(f"[scheduler] req #{req.req_id} retracted ({why}) after {n} generated tokens: back at the head of the "
+              f"queue, continues with {int(req.ids.shape[-1])} tokens of context", file=sys.__stdout__, flush=True)
+
+    def _retract_over_budget(self) -> None:
+        """Real tokens of the live batch past max_live_tokens: free the request admitted last, while more than one runs."""
+        lim, eng = self.limits, self._engine
+        if not lim.max_live_tokens or eng is None:
+            return
+        while len(self._pending) > 1:
+            real = sum(r.n_prompt + len(r.out_tokens) for r in self._pending.values())
+            if real <= lim.max_live_tokens:
+                return
+            req = max(self._pending.values(), key=lambda r: r.t_admitted)
+            for bi, slot in enumerate(eng.slots):
+                if slot is not None and slot.req_id == req.req_id:
+                    eng._drop(bi)
+                    break
+            eng.finished.pop(req.req_id, None)
+            self._pending.pop(req.req_id, None)
+            self._requeue(req, f"live batch {real} tokens > --max-live-tokens {lim.max_live_tokens}")
 
     def _fits(self, req: "_PendingRequest") -> bool:
         """May `req` enter the live batch now? (Limits.) An empty batch always admits."""
@@ -649,7 +705,9 @@ class BatchScheduler:
             with self._cancel_lock:
                 cancelled = head.req_id in self._cancel_ids
             waited = time.time() - head.t_submitted
-            expired = bool(self.limits.queue_wait_s and waited > self.limits.queue_wait_s and self._pending)
+            # a retracted request has already streamed tokens: it waits, it is never refused
+            expired = bool(self.limits.queue_wait_s and waited > self.limits.queue_wait_s and self._pending
+                           and not head.out_tokens)
             if not cancelled and not expired and not self._fits(head):
                 if not getattr(head, "_held_logged", False):
                     head._held_logged = True
@@ -684,6 +742,7 @@ class BatchScheduler:
 
             def _make_on_token(rq):
                 def _on_token(tok_id):
+                    rq.out_tokens.append(tok_id)
                     rq.out_q.put(tok_id)
                 return _on_token
 
@@ -846,6 +905,7 @@ class BatchScheduler:
             # by req_id (stable across bi shifts, see _pending's own
             # comment) no longer appearing among the engine's live slots.
             self._reap_finished()
+            self._retract_over_budget()
 
     def _reap_finished(self) -> None:
         """Push _StreamDone (carrying the request's final Stats) for any
@@ -856,6 +916,10 @@ class BatchScheduler:
         for req_id, (_, _out_ids, stats) in list(engine.finished.items()):
             req = self._pending.pop(req_id, None)
             del engine.finished[req_id]
+            if (req is not None and getattr(stats, "vram_stop", False) and self._pending
+                    and len(req.out_tokens) < req.max_new0):
+                self._requeue(req, "VRAM ceiling")       # others keep running; it continues when there is room
+                continue
             if req is not None:
                 req.out_q.put(_StreamDone(stats))
                 dt = time.time() - getattr(req, "t_admitted", time.time())
@@ -1526,17 +1590,7 @@ class Handler(StreamMixin, QVHTTPHandler):
         self.wfile.write(raw)
 
     def _peer_closed(self) -> bool:
-        """True when the client has closed its side (a peek that reads end-of-stream); never blocks."""
-        try:
-            import select
-            # select first: the connection has a timeout, and a bare recv on it WAITS for that timeout (then raises a
-            # timeout, which is an OSError) -- an open, silent client must read as "still there", at once
-            r, _, _ = select.select([self.connection], [], [], 0)
-            return bool(r) and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-        except (BlockingIOError, InterruptedError):
-            return False
-        except OSError:
-            return True
+        return self.peer_closed()                       # web/base_handler.py: the one check
 
     def _body_too_large_message(self, n: int, max_body: int) -> str:
         return (f"request body is {n} bytes, over the {max_body}-byte limit "
@@ -1860,21 +1914,6 @@ class Handler(StreamMixin, QVHTTPHandler):
                                     temperature=temperature, top_k=top_k,
                                     top_p=top_p, req_id=req_id,
                                     include_usage=stream_opts.get("include_usage", True))
-            # A non-streaming response holds a fully idle socket until the
-            # whole generation finishes, and most HTTP clients (Cline
-            # included) give up on a read timeout before that, showing a
-            # spinner that never resolves rather than an error. Pinging the
-            # client from a background thread was tried and is worse: that
-            # thread and the handler both write to self.wfile with no
-            # coordination, so the response can interleave and become
-            # unparseable. Past NONSTREAM_MAX_TOKENS the request is refused
-            # with a pointer to streaming, which works at any length.
-            if max_tokens > NONSTREAM_MAX_TOKENS:
-                return self._send(400, {"error": (
-                    f"non-streaming requests over {NONSTREAM_MAX_TOKENS} "
-                    f"tokens are rejected -- the socket would sit idle long "
-                    f"enough to trip client read timeouts. Set "
-                    f"\"stream\": true instead.")})
             # "arrived" for the non-streaming text route. The streaming route
             # printed this; this one did not, so a long non-streaming answer
             # produced no console output at all until it finished.
@@ -1986,14 +2025,19 @@ def main():
                     help="admission: at most N requests in the live batch (0 = no limit); the others wait in order")
     ap.add_argument("--max-live-tokens", type=int, default=0, metavar="T",
                     help="admission: sum of prompt + max output tokens over the live requests (0 = no limit): the bound "
-                         "on what their KV cache can grow to. A request larger than T still runs, alone")
+                         "on what their KV cache can grow to: each live request counts prompt + generated + "
+                         "min(output left, --clip-max-new-tokens); past T the request admitted last is retracted (back "
+                         "to the queue, continues later). A request larger than T still runs, alone")
+    ap.add_argument("--clip-max-new-tokens", type=int, default=4096, metavar="N",
+                    help="admission: output tokens reserved per request at most (as SGLang, default 4096; 0 = the "
+                         "whole max_tokens)")
     ap.add_argument("--max-queue", type=int, default=0, metavar="N",
                     help="admission: at most N requests waiting; one more gets 429 + Retry-After (0 = no limit)")
     ap.add_argument("--queue-wait", type=float, default=0.0, metavar="S",
                     help="admission: a request not admitted after S seconds gets 503 + Retry-After (0 = waits for ever)")
     args = ap.parse_args()
     STATE["limits"] = Limits(max(0, args.max_live), max(0, args.max_live_tokens), max(0, args.max_queue),
-                             max(0.0, args.queue_wait))
+                             max(0.0, args.queue_wait), max(0, args.clip_max_new_tokens))
     _set_scheduler(args.scheduler)
 
     args.temperature, args.top_k, args.top_p = resolve_sampling(
